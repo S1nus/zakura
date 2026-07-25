@@ -2701,11 +2701,22 @@ impl HeaderSyncReactor {
     }
 
     async fn reanchor_to_durable_header_tip(&mut self, height: block::Height, hash: block::Hash) {
+        if (height, hash) == (self.state.best_header_tip, self.state.best_header_hash) {
+            // The durable tip is the anchor forward work already links to, so
+            // clearing and re-requesting that work would fetch the same headers
+            // from the same anchor. Reset the link-failure counter so a genuine
+            // stale anchor still gets the usual failure budget before retrying.
+            metrics::counter!("sync.header.stale_anchor.reanchor_unchanged").increment(1);
+            self.state.stale_anchor.reset();
+            return;
+        }
+
         metrics::counter!("sync.header.stale_anchor.reanchored").increment(1);
 
         self.state.stale_anchor.reset();
         self.state.schedule.clear_forward();
-        self.state.clear_retained_roots("verified_tip_reanchor");
+        self.state
+            .clear_unowned_retained_roots("verified_tip_reanchor");
         self.state
             .buffered
             .retain(|(priority, _), _| *priority != RangePriority::Forward);
