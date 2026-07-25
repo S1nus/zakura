@@ -14,19 +14,17 @@ pub(crate) const UPGRADE_VERSION: Version = Version::new(28, 0, 2);
 /// The verified header-root persistence boundary upgrade.
 pub struct Upgrade;
 
-impl Upgrade {
-    fn run_cutover(&self, db: &ZakuraDb) -> Result<(), HeaderRootAuthFrontierError> {
-        let mut batch = DiskWriteBatch::new();
-        if let Some(body_tip) = db.finalized_tip_height() {
-            batch.truncate_commitment_roots_after(db, body_tip);
-            db.prepare_header_root_auth_frontier_from_body_tip(&mut batch)?;
-        } else {
-            batch.truncate_all_commitment_roots(db);
-            batch.delete_header_root_auth_frontier(db);
-        }
-        db.write_batch(batch)?;
-        Ok(())
+pub(super) fn rebase_to_body_tip(db: &ZakuraDb) -> Result<(), HeaderRootAuthFrontierError> {
+    let mut batch = DiskWriteBatch::new();
+    if let Some(body_tip) = db.finalized_tip_height() {
+        batch.truncate_commitment_roots_after(db, body_tip);
+        db.prepare_header_root_auth_frontier_from_body_tip(&mut batch)?;
+    } else {
+        batch.truncate_all_commitment_roots(db);
+        batch.delete_header_root_auth_frontier(db);
     }
+    db.write_batch(batch)?;
+    Ok(())
 }
 
 impl DiskFormatUpgrade for Upgrade {
@@ -45,7 +43,7 @@ impl DiskFormatUpgrade for Upgrade {
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), CancelFormatChange> {
         check_cancelled(cancel_receiver)?;
-        if let Err(error) = self.run_cutover(db) {
+        if let Err(error) = rebase_to_body_tip(db) {
             panic!("header-root authentication cutover failed closed: {error}");
         }
         check_cancelled(cancel_receiver)?;
@@ -112,9 +110,7 @@ mod tests {
         .expect("legacy root fixture writes");
         assert!(db.tip().is_none());
 
-        Upgrade
-            .run_cutover(&db)
-            .expect("no-tip cutover purges unauthenticated roots");
+        rebase_to_body_tip(&db).expect("no-tip cutover purges unauthenticated roots");
 
         assert!(!db.has_commitment_root_rows());
         assert!(!db.has_header_root_auth_frontier_row());

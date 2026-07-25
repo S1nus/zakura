@@ -118,8 +118,8 @@ pub use vct::{
 #[allow(unused_imports)]
 pub use zakura_db::commitment_roots_db::{
     AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
-    HeaderRootAuthFrontier, HeaderRootAuthFrontierError, HeaderRootAuthState,
-    COMMITMENT_ROOTS_BY_HEIGHT, HEADER_ROOT_AUTH_FRONTIER,
+    HeaderRootAuthFrontier, HeaderRootAuthFrontierError, HeaderRootAuthState, HeaderRootAuthUpdate,
+    HeaderWitnessState, COMMITMENT_ROOTS_BY_HEIGHT, HEADER_ROOT_AUTH_FRONTIER,
 };
 pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;
@@ -1188,17 +1188,24 @@ impl FinalizedState {
             return None;
         }
 
-        let roots = self
+        let auth_data_root = self
             .db
             .commitment_roots_by_height_range(successor_height..=successor_height)
             .into_iter()
             .next()
-            .filter(|roots| roots.height == successor_height)?;
+            .filter(|roots| roots.height == successor_height)
+            .map(|roots| roots.auth_data_root)
+            .or_else(|| {
+                self.db.header_witness_auth_data_root(
+                    successor_height,
+                    block::Hash::from(header.as_ref()),
+                )
+            })?;
 
         Some(NextVctBlock::from_header(
             header,
             successor_height,
-            roots.auth_data_root,
+            auth_data_root,
         ))
     }
 

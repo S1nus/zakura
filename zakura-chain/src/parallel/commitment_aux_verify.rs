@@ -23,7 +23,46 @@ use crate::{
 pub struct VerifiedHeaderCommitmentRoots {
     confirmed_roots: Vec<BlockCommitmentRoots>,
     confirmed_hashes: Vec<block::Hash>,
+    /// The final supplied header, present for every non-empty verified delivery.
+    ///
+    /// It is retained as the successor witness for the confirmed roots, including for a
+    /// one-item delivery that only recovers a missing witness and confirms no new roots.
+    header_witness: Option<HeaderWitness>,
     history_tree: HistoryTree,
+}
+
+/// The final header's authenticated metadata retained for the one-block-lag handoff.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderWitness {
+    height: Height,
+    hash: block::Hash,
+    auth_data_root: AuthDataRoot,
+}
+
+impl HeaderWitness {
+    /// Constructs retained header witness metadata.
+    pub fn from_parts(height: Height, hash: block::Hash, auth_data_root: AuthDataRoot) -> Self {
+        Self {
+            height,
+            hash,
+            auth_data_root,
+        }
+    }
+
+    /// Returns the witness header's height.
+    pub fn height(&self) -> Height {
+        self.height
+    }
+
+    /// Returns the witness header's hash.
+    pub fn hash(&self) -> block::Hash {
+        self.hash
+    }
+
+    /// Returns the authorizing-data root authenticated by the witness header.
+    pub fn auth_data_root(&self) -> AuthDataRoot {
+        self.auth_data_root
+    }
 }
 
 impl VerifiedHeaderCommitmentRoots {
@@ -40,6 +79,13 @@ impl VerifiedHeaderCommitmentRoots {
     /// Returns the header hash at the confirmed tip, if any roots were confirmed.
     pub fn confirmed_hash(&self) -> Option<block::Hash> {
         self.confirmed_hashes.last().copied()
+    }
+
+    /// Returns the final header's authenticated witness metadata.
+    ///
+    /// The witness's note-commitment roots require a later successor and are not retained.
+    pub fn header_witness(&self) -> Option<HeaderWitness> {
+        self.header_witness
     }
 
     /// Returns the history tree after folding the confirmed roots.
@@ -153,6 +199,13 @@ where
     Ok(VerifiedHeaderCommitmentRoots {
         confirmed_roots,
         confirmed_hashes,
+        header_witness: items.last().map(|(header, roots)| {
+            HeaderWitness::from_parts(
+                roots.height,
+                block::Hash::from(*header),
+                roots.auth_data_root,
+            )
+        }),
         history_tree: tree,
     })
 }
@@ -840,6 +893,15 @@ mod tests {
             Some(block::Hash::from(act_block.header.as_ref())),
         );
         assert_eq!(
+            verified.header_witness(),
+            Some(HeaderWitness {
+                height: next_roots.height,
+                hash: block::Hash::from(next_block.header.as_ref()),
+                auth_data_root: next_roots.auth_data_root,
+            }),
+            "only the final header's authenticated witness metadata is retained"
+        );
+        assert_eq!(
             verified.history_tree().hash(),
             HistoryTree::from_block(
                 &Mainnet,
@@ -852,6 +914,75 @@ mod tests {
             .hash(),
             "the returned tree is folded through the confirmed root tip"
         );
+    }
+
+    #[test]
+    fn one_item_delivery_recovers_only_the_authenticated_header_witness() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let parent = mainnet_block_at(1);
+        let witness_block = mainnet_block_at(2);
+        let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+        let parent_tree = HistoryTree::from_block(
+            &network,
+            parent,
+            &empty_sapling_root,
+            &empty_orchard_root,
+            &empty_ironwood_root(),
+        )
+        .expect("the parent history tree builds");
+        let witness_roots =
+            roots_from_block(&witness_block, empty_sapling_root, empty_orchard_root);
+        let mut witness_header = *witness_block.header;
+        witness_header.commitment_bytes =
+            <[u8; 32]>::from(ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &parent_tree.hash().expect("the parent tree has a root"),
+                &witness_roots.auth_data_root,
+            ))
+            .into();
+
+        let verified = verify_supplied_roots_from_parts(
+            &network,
+            parent_tree.clone(),
+            [(&witness_header, &witness_roots)],
+        )
+        .expect("the one-item witness verifies");
+
+        assert!(verified.confirmed_roots().is_empty());
+        assert!(verified.confirmed_hashes().is_empty());
+        assert_eq!(verified.history_tree(), &parent_tree);
+        assert_eq!(
+            verified.header_witness(),
+            Some(HeaderWitness::from_parts(
+                witness_roots.height,
+                block::Hash::from(&witness_header),
+                witness_roots.auth_data_root,
+            ))
+        );
+
+        let mut wrong_roots = witness_roots;
+        let mut wrong_auth_data_root = <[u8; 32]>::from(wrong_roots.auth_data_root);
+        wrong_auth_data_root[0] ^= 1;
+        wrong_roots.auth_data_root = AuthDataRoot::from(wrong_auth_data_root);
+        let error = verify_supplied_roots_from_parts(
+            &network,
+            parent_tree,
+            [(&witness_header, &wrong_roots)],
+        )
+        .expect_err("a wrong witness auth-data root is rejected");
+        assert_eq!(error.0, wrong_roots.height);
+        assert!(matches!(
+            error.1,
+            SuppliedRootsError::InvalidHeaderCommitment(
+                CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+            )
+        ));
     }
 
     #[test]

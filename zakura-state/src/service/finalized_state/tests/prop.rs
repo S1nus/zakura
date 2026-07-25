@@ -8,7 +8,9 @@ use tokio::sync::oneshot;
 use zakura_chain::{
     amount::Amount,
     block::{Block, Height},
+    history_tree::HistoryTree,
     parallel::commitment_aux::BlockCommitmentRoots,
+    parallel::commitment_aux_verify::verify_supplied_roots_from_parts,
     parameters::{
         testnet::{ConfiguredActivationHeights, ParametersBuilder},
         NetworkUpgrade,
@@ -30,7 +32,8 @@ use crate::{
 
 use super::super::{
     commitment_aux, serve_block_roots, vct::validate_final_frontiers_bytes,
-    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, NextVctBlock,
+    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, HeaderRootAuthUpdate,
+    HeaderWitnessState, HighestCompletedCheckpoint, NextVctBlock,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -110,7 +113,7 @@ fn next_vct_block(block: Arc<Block>) -> Option<NextVctBlock> {
 }
 
 #[test]
-fn vct_successor_witness_uses_stored_header_without_body() {
+fn vct_header_witness_uses_stored_header_without_body() {
     let _init_guard = zakura_test::init();
     let network = zakura_chain::parameters::Network::Mainnet;
     let mut state = FinalizedState::new(&Config::ephemeral(), &network)
@@ -121,6 +124,11 @@ fn vct_successor_witness_uses_stored_header_without_body() {
     let block1 = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("block 1 deserializes");
+    let block2 = zakura_test::vectors::MAINNET_BLOCKS
+        .get(&2)
+        .expect("mainnet block 2 test vector exists")
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 2 deserializes");
 
     state
         .commit_finalized_direct(
@@ -131,7 +139,7 @@ fn vct_successor_witness_uses_stored_header_without_body() {
         )
         .expect("genesis commits");
 
-    let roots = BlockCommitmentRoots {
+    let block1_roots = BlockCommitmentRoots {
         height: Height(1),
         sapling_root: zakura_chain::sapling::tree::NoteCommitmentTree::default().root(),
         orchard_root: zakura_chain::orchard::tree::NoteCommitmentTree::default().root(),
@@ -141,36 +149,107 @@ fn vct_successor_witness_uses_stored_header_without_body() {
         ironwood_tx: 0,
         auth_data_root: block1.auth_data_root(),
     };
+    let block2_roots = BlockCommitmentRoots {
+        height: Height(2),
+        auth_data_root: block2.auth_data_root(),
+        ..block1_roots.clone()
+    };
     let mut batch = DiskWriteBatch::new();
     batch
         .prepare_header_range_batch_with_roots(
             &state.db,
             genesis.hash(),
-            std::slice::from_ref(&block1.header),
-            &[0],
-            std::slice::from_ref(&roots),
+            &[block1.header.clone(), block2.header.clone()],
+            &[0, 0],
+            &[block1_roots.clone(), block2_roots.clone()],
         )
-        .expect("block 1 header is contextually valid");
+        .expect("block 1 and 2 headers are contextually valid");
     state
         .db
         .write_batch(batch)
         .expect("header range batch writes");
+    let verified = verify_supplied_roots_from_parts(
+        &network,
+        HistoryTree::default(),
+        [
+            (block1.header.as_ref(), &block1_roots),
+            (block2.header.as_ref(), &block2_roots),
+        ],
+    )
+    .expect("header roots verify");
     state
         .db
-        .insert_zakura_header_commitment_roots([roots])
-        .expect("authenticated-root fixture writes");
+        .write_verified_header_commitment_roots(verified)
+        .expect("verified roots and their header witness write");
+    let mut affected_batch = DiskWriteBatch::new();
+    affected_batch
+        .rebase_header_root_auth_frontier(
+            &state.db,
+            Height(1),
+            block1.hash(),
+            &HistoryTree::default(),
+        )
+        .expect("the affected frontier remains coherent without its witness");
+    state
+        .db
+        .write_batch(affected_batch)
+        .expect("the affected frontier writes");
+    let completed = HighestCompletedCheckpoint {
+        height: Height(2),
+        hash: block2.hash(),
+    };
+    let affected = state
+        .db
+        .load_header_root_auth_frontier()
+        .expect("the affected frontier loads")
+        .expect("the affected frontier exists")
+        .state(completed);
+    let recovered = state
+        .db
+        .authenticate_header_roots(
+            completed,
+            affected,
+            affected.authenticated_hash,
+            Height(2),
+            std::slice::from_ref(&block2.header),
+            std::slice::from_ref(&block2_roots),
+        )
+        .expect("the one-record delivery recovers the witness");
+    assert_eq!(
+        recovered.update,
+        HeaderRootAuthUpdate::WitnessRecovered {
+            witness: HeaderWitnessState {
+                height: Height(2),
+                hash: block2.hash(),
+            }
+        }
+    );
 
     assert!(
-        state.db.block(Height(1).into()).is_none(),
+        state.db.block(Height(2).into()).is_none(),
         "the successor body must remain absent"
     );
+    assert_eq!(
+        state.db.commitment_roots(Height(2)),
+        None,
+        "the witness's note roots must remain unconfirmed"
+    );
     let witness = state
-        .vct_successor_from_header_store(Height(0), genesis.hash())
+        .vct_successor_from_header_store(Height(1), block1.hash())
         .expect("the stored header and auth-data root form a successor witness");
-    assert_eq!(witness.header, block1.header);
-    assert_eq!(witness.height, Height(1));
-    assert_eq!(witness.hash, block1.hash());
-    assert_eq!(witness.auth_data_root, Some(block1.auth_data_root()));
+    assert_eq!(witness.header, block2.header);
+    assert_eq!(witness.height, Height(2));
+    assert_eq!(witness.hash, block2.hash());
+    assert_eq!(witness.auth_data_root, Some(block2.auth_data_root()));
+
+    state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(block1).into(),
+            None,
+            Some(witness),
+            "recovered header-only VCT successor test",
+        )
+        .expect("the C-1 body commits through the recovered witness");
 }
 
 /// A handoff frontier over empty trees at `height`, for sources whose test does not
