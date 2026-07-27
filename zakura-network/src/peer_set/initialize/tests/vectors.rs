@@ -41,7 +41,9 @@ use crate::{
     peer_set::{
         initialize::{
             accept_inbound_connections, add_initial_peers, crawl_and_dial, open_listener,
-            DiscoveredPeer,
+            outbound_peer_replenishment_demand, DiscoveredPeer,
+            OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR,
+            OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR,
         },
         set::MorePeers,
         ActiveConnectionCounter, CandidateSet, ConnectionTracker,
@@ -61,6 +63,19 @@ const PEER_CACHE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// A crawler peer limit large enough to exercise multi-peer behavior without
 /// flooding the test runtime with hundreds of immediate fake handshakes.
 const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;
+
+/// A small peer target that keeps replenishment race tests fast.
+const CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS: usize = 10;
+
+/// The outbound connection limit used by replenishment race tests.
+const CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS: usize =
+    CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS * constants::OUTBOUND_PEER_LIMIT_MULTIPLIER;
+
+/// The outbound connection target used by replenishment race tests.
+const CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS: usize =
+    CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS
+        .saturating_mul(OUTBOUND_PEER_REPLENISHMENT_TARGET_NUMERATOR)
+        .div_ceil(OUTBOUND_PEER_REPLENISHMENT_TARGET_DENOMINATOR);
 
 /// The maximum time to wait for the listener tests to make expected progress.
 const LISTENER_TEST_DURATION: Duration = Duration::from_secs(10);
@@ -445,6 +460,128 @@ fn add_cacheable_peer(address_book: &Arc<std::sync::Mutex<AddressBook>>) -> Peer
         .expect("test peer is valid for the mainnet address book");
 
     peer
+}
+
+#[test]
+fn crawler_replenishes_outbound_peers_below_twenty_seven_percent_limit() {
+    let cases = [
+        (0, 0, 0),
+        (0, 1, 1),
+        (1, 1, 0),
+        (0, 2, 1),
+        (1, 2, 0),
+        (0, 3, 1),
+        (1, 3, 0),
+        (0, 4, 2),
+        (1, 4, 1),
+        (2, 4, 0),
+        (0, 10, 3),
+        (2, 10, 1),
+        (3, 10, 0),
+        (0, 300, 81),
+        (80, 300, 1),
+        (81, 300, 0),
+        (100, 300, 0),
+    ];
+
+    for (active, limit, expected) in cases {
+        assert_eq!(
+            outbound_peer_replenishment_demand(active, limit),
+            expected,
+            "unexpected replenishment decision for {active} active peers and limit {limit}",
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn crawler_startup_demand_satisfies_replenishment() {
+    let mut harness = spawn_replenishment_crawler(
+        0,
+        CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS,
+        constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+    )
+    .await;
+
+    harness.wait_for_crawl_start().await;
+    harness.release_crawl();
+    harness
+        .assert_connection_attempts(CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS)
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crawler_partial_queued_demand_is_completed_to_target() {
+    let mut harness =
+        spawn_replenishment_crawler(0, 3, constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL).await;
+
+    harness.wait_for_crawl_start().await;
+    harness.release_crawl();
+    harness
+        .assert_connection_attempts(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS)
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crawler_demand_arriving_during_crawl_counts_toward_target() {
+    let mut harness =
+        spawn_replenishment_crawler(0, 0, constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL).await;
+
+    harness.wait_for_crawl_start().await;
+    harness.queue_demand(4);
+    harness.release_crawl();
+    harness
+        .assert_connection_attempts(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS)
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crawler_disconnects_during_crawl_are_replenished() {
+    let mut harness = spawn_replenishment_crawler(
+        CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS,
+        0,
+        constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+    )
+    .await;
+
+    harness.wait_for_crawl_start().await;
+    harness.drop_initial_connections(4);
+    harness.release_crawl();
+    harness.assert_connection_attempts(4).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crawler_overlapping_timer_crawls_do_not_duplicate_replenishment() {
+    let mut harness = spawn_replenishment_crawler(0, 0, Duration::from_secs(1)).await;
+
+    harness.wait_for_crawl_start().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    harness.release_crawl();
+    harness
+        .assert_connection_attempts(CRAWLER_REPLENISHMENT_CONNECTION_TARGET_FOR_TESTS)
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crawler_excess_queued_demand_is_preserved() {
+    let mut harness =
+        spawn_replenishment_crawler(0, 12, constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL).await;
+
+    harness.wait_for_crawl_start().await;
+    harness.release_crawl();
+    harness.assert_connection_attempts(12).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crawler_replenishment_respects_hard_outbound_limit() {
+    let mut harness =
+        spawn_replenishment_crawler(0, 40, constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL).await;
+
+    harness.wait_for_crawl_start().await;
+    harness.release_crawl();
+    harness
+        .assert_connection_attempts(CRAWLER_REPLENISHMENT_OUTBOUND_LIMIT_FOR_TESTS)
+        .await;
 }
 
 /// Test the crawler with an outbound peer limit of zero peers, and a connector that panics.
@@ -1859,6 +1996,248 @@ where
     .await;
 
     address_book
+}
+
+struct ReplenishmentCrawlerTestHarness {
+    config: Config,
+    demand_tx: mpsc::Sender<MorePeers>,
+    crawl_started_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    crawl_release_tx: tokio::sync::watch::Sender<bool>,
+    connection_tracker_rx: tokio::sync::mpsc::UnboundedReceiver<ConnectionTracker>,
+    crawl_task_handle: JoinHandle<Result<(), BoxError>>,
+    address_book_updater_guard: JoinHandle<Result<(), BoxError>>,
+    _peerset_rx: mpsc::Receiver<DiscoveredPeer>,
+    initial_connection_trackers: Vec<ConnectionTracker>,
+}
+
+impl ReplenishmentCrawlerTestHarness {
+    async fn wait_for_crawl_start(&mut self) {
+        wait_for_crawler_events(
+            &mut self.crawl_started_rx,
+            1,
+            "periodic peer crawl should start before the timeout",
+        )
+        .await;
+    }
+
+    fn release_crawl(&self) {
+        self.crawl_release_tx
+            .send(true)
+            .expect("controlled crawl receiver remains open");
+    }
+
+    fn queue_demand(&mut self, demand_count: usize) {
+        for _ in 0..demand_count {
+            self.demand_tx
+                .try_send(MorePeers)
+                .expect("replenishment test demand channel has capacity");
+        }
+    }
+
+    fn drop_initial_connections(&mut self, connection_count: usize) {
+        assert!(
+            connection_count <= self.initial_connection_trackers.len(),
+            "cannot drop more initial connections than the harness holds"
+        );
+
+        let keep_count = self.initial_connection_trackers.len() - connection_count;
+        let dropped_connections = self.initial_connection_trackers.split_off(keep_count);
+        std::mem::drop(dropped_connections);
+    }
+
+    async fn assert_connection_attempts(mut self, expected_connection_attempts: usize) {
+        let mut connection_trackers = wait_for_crawler_events(
+            &mut self.connection_tracker_rx,
+            expected_connection_attempts,
+            "crawler should start the expected replenishment attempts",
+        )
+        .await;
+
+        self.demand_tx.close_channel();
+
+        let shutdown_deadline = Instant::now() + CRAWLER_TEST_TIMEOUT;
+        while !self.crawl_task_handle.is_finished() {
+            assert!(
+                Instant::now() < shutdown_deadline,
+                "crawler should shut down after its demand channel closes"
+            );
+            tokio::task::spawn_blocking(|| {})
+                .await
+                .expect("crawler test blocking-task synchronization should not panic");
+            tokio::task::yield_now().await;
+        }
+
+        let crawl_result = self.crawl_task_handle.await;
+        match crawl_result {
+            Ok(Err(error)) => assert!(
+                error.to_string().contains("demand stream closed"),
+                "unexpected peer crawler shutdown error: {error:?}"
+            ),
+            other => panic!("unexpected peer crawler shutdown result: {other:?}"),
+        }
+
+        let connection_deadline = Instant::now() + CRAWLER_TEST_TIMEOUT;
+        loop {
+            while let Ok(connection_tracker) = self.connection_tracker_rx.try_recv() {
+                connection_trackers.push(connection_tracker);
+            }
+
+            if self.connection_tracker_rx.is_closed() {
+                break;
+            }
+
+            assert!(
+                Instant::now() < connection_deadline,
+                "all spawned connection attempts should finish before the timeout"
+            );
+            tokio::time::advance(constants::MIN_OUTBOUND_PEER_CONNECTION_INTERVAL).await;
+            tokio::task::spawn_blocking(|| {})
+                .await
+                .expect("crawler test blocking-task synchronization should not panic");
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            connection_trackers.len(),
+            expected_connection_attempts,
+            "crawler started an unexpected number of connection attempts"
+        );
+        assert!(
+            connection_trackers.len() <= self.config.peerset_outbound_connection_limit(),
+            "crawler exceeded the hard outbound connection limit"
+        );
+
+        self.address_book_updater_guard.abort();
+    }
+}
+
+async fn spawn_replenishment_crawler(
+    initial_connection_count: usize,
+    initial_demand_count: usize,
+    crawl_new_peer_interval: Duration,
+) -> ReplenishmentCrawlerTestHarness {
+    let config = Config {
+        peerset_initial_target_size: CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS,
+        crawl_new_peer_interval,
+        ..Config::default()
+    };
+    let outbound_connection_limit = config.peerset_outbound_connection_limit();
+
+    assert!(initial_connection_count <= outbound_connection_limit);
+
+    let (
+        address_book,
+        _bans_receiver,
+        address_book_updater,
+        _address_metrics,
+        address_book_updater_guard,
+    ) = AddressBookUpdater::spawn(&config, config.listen_addr, PeerServices::NODE_NETWORK);
+
+    let candidate_count = outbound_connection_limit
+        .saturating_mul(2)
+        .saturating_add(1);
+    for address_number in 0..candidate_count {
+        let address_number =
+            u32::try_from(address_number).expect("small replenishment test address count fits u32");
+        let ip =
+            Ipv4Addr::from(u32::from(Ipv4Addr::new(127, 2, 0, 0)).saturating_add(address_number));
+        let addr = MetaAddr::new_gossiped_meta_addr(
+            SocketAddr::new(ip.into(), 8233).into(),
+            PeerServices::NODE_NETWORK,
+            DateTime32::now(),
+        )
+        .new_gossiped_change()
+        .expect("replenishment test peer has valid gossiped address fields");
+
+        address_book
+            .lock()
+            .expect("previous test thread panicked while holding the address book")
+            .update(addr)
+            .expect("replenishment test peer is valid");
+    }
+
+    let (crawl_started_tx, crawl_started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (crawl_release_tx, crawl_release_rx) = tokio::sync::watch::channel(false);
+    let controlled_peer_set = service_fn(move |request| {
+        let crawl_started_tx = crawl_started_tx.clone();
+        let mut crawl_release_rx = crawl_release_rx.clone();
+
+        async move {
+            assert!(
+                matches!(request, Request::Peers),
+                "crawler should only request peer addresses"
+            );
+            crawl_started_tx
+                .send(())
+                .expect("replenishment test crawl observer remains open");
+            crawl_release_rx
+                .wait_for(|crawl_released| *crawl_released)
+                .await
+                .expect("replenishment test crawl controller remains open");
+
+            Err::<Response, BoxError>("controlled peer crawl returns no addresses".into())
+        }
+    });
+    let candidates = CandidateSet::new(address_book, controlled_peer_set);
+
+    let channel_capacity = candidate_count.max(initial_demand_count);
+    let (peerset_tx, peerset_rx) = mpsc::channel::<DiscoveredPeer>(channel_capacity);
+    let (mut demand_tx, demand_rx) = mpsc::channel::<MorePeers>(channel_capacity);
+    for _ in 0..initial_demand_count {
+        demand_tx
+            .try_send(MorePeers)
+            .expect("initial replenishment test demand channel has capacity");
+    }
+
+    let mut active_outbound_connections = ActiveConnectionCounter::new_counter_with(
+        outbound_connection_limit,
+        "Replenishment Test Outbound Connections",
+    );
+    let initial_connection_trackers = (0..initial_connection_count)
+        .map(|_| active_outbound_connections.track_connection())
+        .collect();
+
+    let (connection_tracker_tx, connection_tracker_rx) = tokio::sync::mpsc::unbounded_channel();
+    let outbound_connector = service_fn(move |request: OutboundConnectorRequest| {
+        let connection_tracker_tx = connection_tracker_tx.clone();
+
+        async move {
+            let OutboundConnectorRequest {
+                addr,
+                connection_tracker,
+            } = request;
+            let (fake_client, _harness) = ClientTestHarness::build().finish();
+
+            connection_tracker_tx
+                .send(connection_tracker)
+                .expect("replenishment connection observer remains open");
+
+            Ok((addr, fake_client))
+        }
+    });
+
+    let crawl_task_handle = tokio::spawn(crawl_and_dial(
+        config.clone(),
+        demand_tx.clone(),
+        demand_rx,
+        candidates,
+        outbound_connector,
+        peerset_tx,
+        active_outbound_connections,
+        address_book_updater,
+    ));
+
+    ReplenishmentCrawlerTestHarness {
+        config,
+        demand_tx,
+        crawl_started_rx,
+        crawl_release_tx,
+        connection_tracker_rx,
+        crawl_task_handle,
+        address_book_updater_guard,
+        _peerset_rx: peerset_rx,
+        initial_connection_trackers,
+    }
 }
 
 /// The number of connector calls a crawler peer-limit test expects to observe.
