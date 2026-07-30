@@ -20,8 +20,12 @@ inputs:
     description: "Attach a clone of the newest zakura-pr-state-<network>-* snapshot (mainnet/testnet). Empty starts with no state volume."
     required: false
     default: ""
+  state_snapshot_id:
+    description: "Attach this exact volume snapshot instead of resolving the newest snapshot for state_network."
+    required: false
+    default: ""
   volume_name:
-    description: "Name for the cloned state volume. Required with state_network, and must start with zakura-pr- so the reaper sweeps it if it leaks."
+    description: "Name for the cloned state volume. Required with state_network or state_snapshot_id, and must start with zakura-pr- so the reaper sweeps it if it leaks."
     required: false
     default: ""
 
@@ -36,10 +40,10 @@ outputs:
     description: "Image the droplet was created from"
     value: ${{ steps.image.outputs.image_id }}
   volume_id:
-    description: "Cloned state volume ID, empty when state_network is unset"
+    description: "Cloned state volume ID, empty when no state snapshot is requested"
     value: ${{ steps.create.outputs.volume_id }}
   volume_name:
-    description: "Cloned state volume name, empty when state_network is unset"
+    description: "Cloned state volume name, empty when no state snapshot is requested"
     value: ${{ steps.create.outputs.volume_name }}
 
 runs:
@@ -50,6 +54,7 @@ runs:
       shell: bash
       env:
         STATE_NETWORK: ${{ inputs.state_network }}
+        STATE_SNAPSHOT_ID: ${{ inputs.state_snapshot_id }}
         VOLUME_NAME: ${{ inputs.volume_name }}
       run: |
         set -euo pipefail
@@ -62,13 +67,17 @@ runs:
         fi
         echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
 
-        if [ -z "${STATE_NETWORK}" ]; then
+        if [ -z "${STATE_NETWORK}" ] && [ -z "${STATE_SNAPSHOT_ID}" ]; then
           echo "vol_snap_id=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
         if [ -z "${VOLUME_NAME}" ]; then
-          echo "volume_name is required when state_network is set" >&2
+          echo "volume_name is required when state_network or state_snapshot_id is set" >&2
           exit 1
+        fi
+        if [ -n "${STATE_SNAPSHOT_ID}" ]; then
+          echo "vol_snap_id=${STATE_SNAPSHOT_ID}" >> "$GITHUB_OUTPUT"
+          exit 0
         fi
         SNAP=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
           awk -v pre="zakura-pr-state-${STATE_NETWORK}-" 'index($2, pre) == 1 {print $2, $1}' | \
