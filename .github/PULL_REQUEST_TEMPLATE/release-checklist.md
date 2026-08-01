@@ -176,6 +176,20 @@ Check that the release will work:
       warns when publishable crates changed since the latest release tag without
       a package version bump. This warning is local-only and advisory; unchanged
       crates are not bumped or published.
+- [ ] Confirm the crates.io publish graph resolves at workspace versions
+      (`./scripts/check-crate-publish-graph.sh`, step 5 of `make
+      pre-release`): crates already published at their workspace version are
+      skipped at publish time, and dependents resolve their index manifests.
+      A pinned prerelease fails resolution; a pinned old major resolves as a
+      silent duplicate — the check asserts on each packaged archive's
+      Cargo.lock to catch both. Any prerelease bump (and any new major)
+      forces a "cascade" republish of its dependent closure —
+      `prepare-release.sh` plans these automatically; review its `cascade`
+      rows and do not drop them. For a deliberately GitHub-only release
+      candidate, the documented override is
+      `ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1` locally and the
+      `allow_unpublishable_crate_graph` input on the Create release workflow;
+      note it in the release PR and do not publish crates.
 - [ ] Update (or install) `semver-checks`: `cargo +stable install cargo-semver-checks --locked`
 - [ ] Confirm the preparation workflow's `cargo public-api diff latest` reports
       completed successfully for every changed library being published.
