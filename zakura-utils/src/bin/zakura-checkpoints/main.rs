@@ -13,13 +13,13 @@ use std::{ffi::OsString, process::Stdio};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
+use clap::Parser;
 use color_eyre::{
     eyre::{ensure, eyre, Result},
     Help,
 };
 use itertools::Itertools;
 use serde_json::Value;
-use structopt::StructOpt;
 
 use zakura_chain::{
     block::{self, Block, Height, HeightDiff, TryIntoHeight},
@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
     init_tracing();
     color_eyre::install()?;
 
-    let args = args::Args::from_args();
+    let args = args::Args::parse();
 
     eprintln!("Command-line arguments: {args:?}");
 

@@ -4,7 +4,7 @@
 
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
-use structopt::StructOpt;
+use clap::Parser;
 use thiserror::Error;
 
 use zakura_chain::block::Height;
@@ -92,29 +92,30 @@ impl FromStr for Transport {
 pub struct InvalidTransportError(String);
 
 /// zakura-checkpoints arguments
-#[derive(Clone, Debug, Eq, PartialEq, StructOpt)]
+#[derive(Clone, Debug, Eq, PartialEq, Parser)]
+#[command(version)]
 pub struct Args {
     /// Backend type: the node we're connecting to.
-    #[structopt(default_value = "zakurad", short, long)]
+    #[arg(default_value = "zakurad", short, long)]
     pub backend: Backend,
 
     /// Transport type: the way we connect.
-    #[structopt(default_value = "cli", short, long)]
+    #[arg(default_value = "cli", short, long)]
     pub transport: Transport,
 
     /// Path or name of zcash-cli command.
     /// Only used if the transport is [`Cli`](Transport::Cli).
-    #[structopt(default_value = "zcash-cli", short, long)]
+    #[arg(default_value = "zcash-cli", short, long)]
     pub cli: String,
 
     /// Address and port for RPC connections.
     /// Used for all transports.
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub addr: Option<SocketAddr>,
 
     /// Start looking for checkpoints after this height.
     /// If there is no last checkpoint, we start looking at the Genesis block (height 0).
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub last_checkpoint: Option<Height>,
 
     /// Offline mode: read a quiesced Zakura state cache directory instead of
@@ -122,14 +123,14 @@ pub struct Args {
     ///
     /// See the "Mainnet release-state" section of
     /// `docs/design/verified-commitment-trees.md` for the pipeline this feeds.
-    #[structopt(long, parse(from_os_str))]
+    #[arg(long)]
     pub state_cache_dir: Option<PathBuf>,
 
     /// Offline mode: also write the VCT final-frontier artifact for the last
     /// emitted checkpoint height to this path.
     ///
     /// Requires `--state-cache-dir`.
-    #[structopt(long, parse(from_os_str))]
+    #[arg(long)]
     pub mainnet_frontier_output: Option<PathBuf>,
 
     /// Offline mode: print the embedded Mainnet checkpoint list before the
@@ -139,12 +140,12 @@ pub struct Args {
     /// Requires `--state-cache-dir` and `--mainnet-frontier-output` (a
     /// replacement list must ship with its coupled frontier); incompatible
     /// with `--last-checkpoint`.
-    #[structopt(long)]
+    #[arg(long)]
     pub full_list: bool,
 
     /// Passthrough args for `zcash-cli`.
     /// Only used if the transport is [`Cli`](Transport::Cli).
-    #[structopt(last = true)]
+    #[arg(last = true)]
     pub zcli_args: Vec<String>,
 }
 
@@ -210,6 +211,28 @@ mod tests {
             full_list: false,
             zcli_args: Vec::new(),
         }
+    }
+
+    #[test]
+    fn parses_defaults_and_zcash_cli_passthrough_args() {
+        let args = Args::try_parse_from(["zakura-checkpoints", "--", "-testnet", "-rpcwait"])
+            .expect("valid checkpoint CLI arguments");
+
+        assert_eq!(
+            args,
+            Args {
+                zcli_args: vec!["-testnet".to_string(), "-rpcwait".to_string()],
+                ..rpc_args()
+            }
+        );
+    }
+
+    #[test]
+    fn exposes_version_flag() {
+        let error = Args::try_parse_from(["zakura-checkpoints", "--version"])
+            .expect_err("--version exits after displaying version information");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 
     #[test]

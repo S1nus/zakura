@@ -121,7 +121,6 @@ zakura-script = { path = "../zakura-script", version = "3.0.0" }
 zakura-state = { path = "../zakura-state", version = "6.0.0-rc0" }
 rustls = "0.23.40"
 tokio-rustls = "0.26.4"
-rustls-pemfile = "2.2.0"
 
 [build-dependencies]
 openrpsee = { workspace = true }

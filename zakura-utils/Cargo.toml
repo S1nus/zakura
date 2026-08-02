@@ -31,6 +31,7 @@ default = []
 # Each binary has a feature that activates the extra dependencies it needs
 
 zakura-checkpoints = [
+    "clap",
     "itertools",
     "tokio",
     "zakura-chain/json-conversion",
@@ -56,7 +57,7 @@ reqwest = []
 [dependencies]
 color-eyre = { workspace = true }
 
-structopt = { workspace = true }
+clap = { workspace = true, features = ["derive"], optional = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 tracing-error = { workspace = true }

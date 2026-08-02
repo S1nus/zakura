@@ -7,14 +7,14 @@
 //! See the full list of
 //! [Differences between JSON-RPC 1.0 and 2.0.](https://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0)
 
-use std::{fmt, fs::File, io::BufReader, panic, sync::Arc};
+use std::{fmt, fs::File, io::Read, panic, sync::Arc};
 
 use cookie::Cookie;
 use jsonrpsee::server::{
     middleware::rpc::RpcServiceBuilder, serve_with_graceful_shutdown, stop_channel, Server,
     ServerHandle,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_rustls::{rustls::ServerConfig as RustlsServerConfig, TlsAcceptor};
 use tracing::*;
@@ -310,8 +310,7 @@ fn load_tls_config(
         )
     })?;
 
-    let cert_chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(cert_file)).collect::<Result<_, _>>()?;
+    let cert_chain = parse_tls_cert_chain(cert_file)?;
     if cert_chain.is_empty() {
         return Err(format!(
             "RPC TLS certificate file {} did not contain any certificates",
@@ -320,13 +319,12 @@ fn load_tls_config(
         .into());
     }
 
-    let private_key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut BufReader::new(key_file))?.ok_or_else(|| {
-            format!(
-                "RPC TLS private key file {} did not contain a usable private key",
-                tls.key_file.display()
-            )
-        })?;
+    let private_key = parse_tls_private_key(key_file)?.ok_or_else(|| {
+        format!(
+            "RPC TLS private key file {} did not contain a usable private key",
+            tls.key_file.display()
+        )
+    })?;
 
     let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let config = RustlsServerConfig::builder_with_provider(crypto_provider)
@@ -337,6 +335,20 @@ fn load_tls_config(
         .map_err(|error| format!("could not build RPC TLS server config: {error}"))?;
 
     Ok(Arc::new(config))
+}
+
+fn parse_tls_cert_chain(
+    cert_reader: impl Read,
+) -> Result<Vec<CertificateDer<'static>>, rustls::pki_types::pem::Error> {
+    CertificateDer::pem_reader_iter(cert_reader).collect()
+}
+
+fn parse_tls_private_key(
+    key_reader: impl Read,
+) -> Result<Option<PrivateKeyDer<'static>>, rustls::pki_types::pem::Error> {
+    PrivateKeyDer::pem_reader_iter(key_reader)
+        .next()
+        .transpose()
 }
 
 impl Drop for RpcServer {
