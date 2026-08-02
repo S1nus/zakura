@@ -239,7 +239,7 @@ where
     /// Stores requests that should be routed to peers once they are ready.
     queued_broadcast_all: Option<(
         Request,
-        tokio::sync::mpsc::Sender<ResponseFuture>,
+        tokio::sync::mpsc::UnboundedSender<ResponseFuture>,
         HashSet<D::Key>,
     )>,
 
@@ -1366,13 +1366,13 @@ where
     fn queue_broadcast_all_unready(
         &mut self,
         req: &Request,
-    ) -> Option<tokio::sync::mpsc::Receiver<ResponseFuture>> {
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<ResponseFuture>> {
         if !self.cancel_handles.is_empty() {
-            /// How many broadcast all futures to send to the channel until the peer set should wait for the channel consumer
-            /// to read a message before continuing to send the queued broadcast request to peers that were originally unready.
-            const QUEUED_BROADCAST_FUTS_CHANNEL_SIZE: usize = 3;
-
-            let (sender, receiver) = tokio::sync::mpsc::channel(QUEUED_BROADCAST_FUTS_CHANNEL_SIZE);
+            // Each original peer is removed after its delivery is queued, so the total
+            // number of futures in this channel is bounded by the peer snapshot below.
+            // An unbounded channel avoids stalling the peer set on capacity without a
+            // registered wakeup when several peer readiness waves happen close together.
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
             let unready_peers: HashSet<_> = self.cancel_handles.keys().cloned().collect();
             let queued = (req.clone(), sender, unready_peers);
 
@@ -1392,21 +1392,42 @@ where
             return;
         };
 
-        remaining_peers.retain(|addr| !self.bans.contains(canonical_ip(addr.ip())));
-
-        let Ok(reserved_send_slot) = sender.try_reserve() else {
-            self.queued_broadcast_all = Some((req, sender, remaining_peers));
+        if sender.is_closed() {
             return;
-        };
+        }
+
+        remaining_peers.retain(|addr| {
+            !self.bans.contains(canonical_ip(addr.ip()))
+                && (self.ready_services.contains_key(addr)
+                    || self.cancel_handles.contains_key(addr))
+        });
+
+        if remaining_peers.is_empty() {
+            return;
+        }
 
         let peers: Vec<_> = self
             .ready_services
             .keys()
-            .filter(|ready_peer| remaining_peers.remove(ready_peer))
+            .filter(|ready_peer| remaining_peers.contains(ready_peer))
             .copied()
             .collect();
 
-        reserved_send_slot.send(self.send_multiple(req.clone(), peers).boxed());
+        if peers.is_empty() {
+            self.queued_broadcast_all = Some((req, sender, remaining_peers));
+            return;
+        }
+
+        for peer in &peers {
+            remaining_peers.remove(peer);
+        }
+
+        if sender
+            .send(self.send_multiple(req.clone(), peers).boxed())
+            .is_err()
+        {
+            return;
+        }
 
         if !remaining_peers.is_empty() {
             self.queued_broadcast_all = Some((req, sender, remaining_peers));
@@ -1663,6 +1684,10 @@ where
         self.log_peer_set_size();
         self.update_metrics();
 
+        // This also drops queued peers that disconnected while they were unready,
+        // even if there are no ready peers left in the peer set.
+        self.broadcast_all_queued();
+
         if ready_peers.is_pending() {
             // # Correctness
             //
@@ -1687,7 +1712,6 @@ where
             return Poll::Pending;
         }
 
-        self.broadcast_all_queued();
         self.deliver_queued_sidecar_block_gossip();
 
         if self.ready_services.is_empty() {
