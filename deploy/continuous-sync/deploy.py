@@ -4,18 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import concurrent.futures
 import json
 import os
 import shlex
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = SCRIPT_DIR / "templates"
@@ -397,32 +399,72 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return summarize_parallel(nodes, work)
 
 
-def audit_problem(data: dict[str, Any], max_completion_age: int) -> str | None:
+class Problem(NamedTuple):
+    """One node's audit failure.
+
+    `kind` is the throttle identity: it must stay byte-identical for as long as
+    the same underlying failure persists, or every cycle looks like a brand-new
+    problem and pages again. `detail` is the line posted to Slack and may embed
+    volatile values -- free bytes, SSH stderr, an exception message -- that must
+    therefore stay out of `kind`.
+    """
+
+    kind: str
+    detail: str
+
+
+def audit_problem(data: dict[str, Any], max_completion_age: int) -> Problem | None:
     state = data.get("controller_state") or {}
     sample = data.get("sample") or {}
     if state.get("failed"):
-        return f"controller halted: {state.get('failure')}"
+        # The halt reason is latched by the controller, so it is stable while the
+        # halt lasts and a genuinely different halt should page again.
+        failure = state.get("failure")
+        return Problem(f"controller-halted:{failure}", f"controller halted: {failure}")
     if not data.get("service_active") and state.get("phase") == "syncing":
-        return "node service inactive while controller says syncing"
+        return Problem(
+            "service-inactive", "node service inactive while controller says syncing"
+        )
     if sample.get("metrics_status") != "ok" and state.get("phase") == "syncing":
-        return f"metrics unavailable: {sample.get('metrics_status')}"
+        # The status embeds the scrape exception, which varies between samples.
+        return Problem(
+            "metrics-unavailable", f"metrics unavailable: {sample.get('metrics_status')}"
+        )
     if int(data.get("disk_free_bytes") or 0) < 10 * 1024 * 1024 * 1024:
-        return f"low disk: {data.get('disk_free_bytes')} bytes free"
+        # Free bytes move on every sample, so they cannot be part of the identity.
+        return Problem("low-disk", f"low disk: {data.get('disk_free_bytes')} bytes free")
     last_success = state.get("last_success_at")
     if last_success and max_completion_age > 0:
         try:
             parsed = int(time_from_stamp(str(last_success)))
-            if int(__import__("time").time()) - parsed > max_completion_age:
-                return f"last successful run is older than {max_completion_age}s"
+            if now() - parsed > max_completion_age:
+                return Problem(
+                    "stale-success",
+                    f"last successful run is older than {max_completion_age}s",
+                )
         except ValueError:
-            return f"invalid last_success_at: {last_success}"
+            return Problem(
+                "invalid-last-success", f"invalid last_success_at: {last_success}"
+            )
     return None
 
 
 def time_from_stamp(stamp: str) -> float:
-    import time
+    # The controller writes UTC stamps, so interpret them as UTC. `time.mktime`
+    # would read the struct as local time and skew the age by the runner offset.
+    return calendar.timegm(time.strptime(stamp, "%Y%m%dT%H%M%SZ"))
 
-    return time.mktime(time.strptime(stamp, "%Y%m%dT%H%M%SZ"))
+
+def now() -> int:
+    return int(time.time())
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    if hours >= 24:
+        return f"{hours // 24}d{hours % 24}h"
+    return f"{hours}h{remainder // 60}m"
 
 
 def post_slack(text: str) -> bool:
@@ -450,27 +492,160 @@ def post_slack(text: str) -> bool:
     return 200 <= response.status < 300 and body == "ok"
 
 
+# Bump whenever a stored record's shape changes, so incompatible state is
+# discarded wholesale instead of being half-read. v2 replaced the single
+# `problem` string with the `kind`/`detail` pair.
+AUDIT_STATE_VERSION = 2
+
+
+def load_audit_state(path: Path | None) -> dict[str, Any]:
+    fresh: dict[str, Any] = {"version": AUDIT_STATE_VERSION, "problems": {}}
+    if path is None or not path.exists():
+        return fresh
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"audit state unreadable ({error}); starting fresh", file=sys.stderr)
+        return fresh
+    if not isinstance(data, dict) or data.get("version") != AUDIT_STATE_VERSION:
+        return fresh
+    problems = data.get("problems")
+    if not isinstance(problems, dict):
+        return fresh
+    return {"version": AUDIT_STATE_VERSION, "problems": problems}
+
+
+def save_audit_state(path: Path | None, state: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.replace(path)
+
+
+def audit_transitions(
+    problems: dict[str, Problem],
+    previous: dict[str, Any],
+    reminder_interval: int,
+    timestamp: int,
+) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
+    """Split current problems into new/reminder/recovered lines.
+
+    A problem alerts immediately the first time it is seen, and again only once
+    `reminder_interval` has elapsed, so a node that stays broken reminds on a slow
+    cadence instead of re-paging every audit cycle. Continuity is judged on
+    `Problem.kind`, never on the rendered detail, which changes between samples.
+    """
+    prior = previous.get("problems", {})
+    new_lines: list[str] = []
+    reminder_lines: list[str] = []
+    current: dict[str, Any] = {}
+
+    for name in sorted(problems):
+        problem = problems[name]
+        record = prior.get(name)
+        if not isinstance(record, dict) or record.get("kind") != problem.kind:
+            # First sighting, or the failure changed to a different one.
+            new_lines.append(f"{name}: {problem.detail}")
+            current[name] = {
+                "kind": problem.kind,
+                "detail": problem.detail,
+                "first_seen": timestamp,
+                "last_sent": timestamp,
+            }
+            continue
+        first_seen = int(record.get("first_seen", timestamp))
+        last_sent = int(record.get("last_sent", timestamp))
+        if timestamp - last_sent >= reminder_interval:
+            reminder_lines.append(
+                f"{name}: {problem.detail} "
+                f"(unresolved for {format_duration(timestamp - first_seen)})"
+            )
+            last_sent = timestamp
+        current[name] = {
+            "kind": problem.kind,
+            "detail": problem.detail,
+            "first_seen": first_seen,
+            "last_sent": last_sent,
+        }
+
+    recovered_lines = [
+        f"{name}: was {prior[name].get('detail')}"
+        for name in sorted(prior)
+        if name not in problems and isinstance(prior.get(name), dict)
+    ]
+    return new_lines, reminder_lines, recovered_lines, {
+        "version": AUDIT_STATE_VERSION,
+        "problems": current,
+    }
+
+
+def audit_message(
+    new_lines: list[str], reminder_lines: list[str], recovered_lines: list[str]
+) -> str:
+    sections = []
+    if new_lines:
+        sections.append(":rotating_light: Zakura continuous sync audit failed\n" + "\n".join(new_lines))
+    if reminder_lines:
+        sections.append(":alarm_clock: Zakura continuous sync still failing\n" + "\n".join(reminder_lines))
+    if recovered_lines:
+        sections.append(":white_check_mark: Zakura continuous sync recovered\n" + "\n".join(recovered_lines))
+    return "\n\n".join(sections)
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     nodes = load_nodes(args.config, args.node)
-    failures = []
+    problems: dict[str, Problem] = {}
     for node in nodes:
         ok, data = remote_json(node, "/usr/local/sbin/zakura-continuous-sync.py status")
         if not ok:
-            failures.append(f"{node.name}: unreachable or invalid status: {data}")
+            # `data` is raw ssh stderr, which differs between attempts at the same
+            # outage, so only the category identifies the problem.
+            problems[node.name] = Problem(
+                "unreachable", f"unreachable or invalid status: {data}"
+            )
             continue
         assert isinstance(data, dict)
         problem = audit_problem(data, args.max_completion_age)
         if problem:
-            failures.append(f"{node.name}: {problem}")
+            problems[node.name] = problem
 
-    if failures:
-        text = ":rotating_light: Zakura continuous sync audit failed\n" + "\n".join(failures)
+    state_file = Path(args.state_file) if args.state_file else None
+    previous = load_audit_state(state_file)
+    timestamp = now()
+    new_lines, reminder_lines, recovered_lines, state = audit_transitions(
+        problems, previous, args.reminder_interval, timestamp
+    )
+    text = audit_message(new_lines, reminder_lines, recovered_lines)
+
+    posted = True
+    if text:
         if not args.dry_run:
-            post_slack(text)
+            posted = post_slack(text)
         print(text)
-        return 1
-    print(f"audit ok: {len(nodes)} node(s)")
-    return 0
+    elif problems:
+        print(
+            f"audit failing on {len(problems)} node(s); alert throttled "
+            f"(reminder every {format_duration(args.reminder_interval)})"
+        )
+    else:
+        print(f"audit ok: {len(nodes)} node(s)")
+
+    if args.dry_run:
+        pass
+    elif posted:
+        save_audit_state(state_file, state)
+    else:
+        # Advancing `last_sent` here would record an undelivered page as sent and
+        # stay silent until the reminder interval elapsed. Leave the old state so
+        # the next audit re-derives these same lines and retries.
+        print(
+            "slack post failed; leaving alert state unchanged so the next audit retries",
+            file=sys.stderr,
+        )
+
+    return 1 if problems else 0
 
 
 def summarize_parallel(nodes: list[Node], fn) -> int:
@@ -509,6 +684,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="alert if last successful cycle is older than this many seconds; 0 disables",
+    )
+    audit.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help="persist alert state here so an unchanged failure is not re-sent every cycle",
+    )
+    audit.add_argument(
+        "--reminder-interval",
+        type=int,
+        default=21600,
+        help="re-send an unresolved failure at most this often, in seconds (default 6h)",
     )
     return parser.parse_args()
 
