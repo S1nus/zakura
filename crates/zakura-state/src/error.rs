@@ -10,7 +10,9 @@ use zakura_chain::{
     amount::{self, NegativeAllowed, NonNegative},
     block,
     history_tree::HistoryTreeError,
-    ironwood, orchard, sapling, sprout, transaction, transparent,
+    ironwood, orchard, sapling, sprout,
+    subtree::NoteCommitmentSubtreeIndex,
+    transaction, transparent,
     value_balance::{ValueBalance, ValueBalanceError},
     work::difficulty::CompactDifficulty,
 };
@@ -51,6 +53,79 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub struct MissingSproutTipTree {
     /// The finalized tip whose Sprout frontier is missing.
     pub tip: block::Height,
+}
+
+/// The per-height note commitment tree for a historical block was never written, because this
+/// database was built by the verified-commitment-trees fast-sync path.
+///
+/// Fast sync skips per-height trees across the half-open band `[U, H)`, where `U` is the first
+/// height this binary committed and `H` is the last checkpoint. Read handlers return this
+/// instead of an absent tree so the RPC boundary reports a diagnosable archive-mode failure:
+/// clients following the lightwalletd contract read an absent treestate as the *empty* tree, and
+/// would silently derive a wallet birthday anchor asserting an empty commitment tree deep in the
+/// chain.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error(
+    "historical note commitment tree at {hash_or_height} is unavailable: this node was fast-synced \
+     with verified commitment trees, so per-height trees below the last checkpoint \
+     {last_checkpoint:?} \
+     were never written"
+)]
+pub struct HistoricalTreeUnavailable {
+    /// The block whose per-height tree was requested.
+    pub hash_or_height: HashOrHeight,
+
+    /// The last checkpoint height `H`: the exclusive upper bound of the absent band.
+    pub last_checkpoint: block::Height,
+}
+
+/// A completed note commitment subtree root was never recorded, because this database was built
+/// by the verified-commitment-trees fast-sync path.
+///
+/// Subtree roots are a by-product of the per-height tree maintenance the fast path skips, so
+/// every subtree that completed at or below the last checkpoint is missing. Read handlers
+/// return this instead of an empty subtree list, which a client would otherwise read as "this
+/// chain has no subtrees here" and seed nothing, failing later without a clear cause.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error(
+    "historical {pool} note commitment subtree {index:?} is unavailable at last checkpoint \
+     {last_checkpoint:?}: {reason}"
+)]
+pub struct HistoricalSubtreeUnavailable {
+    /// The shielded pool whose subtree was requested, in `z_getsubtreesbyindex` spelling.
+    pub pool: &'static str,
+
+    /// The requested starting subtree index.
+    pub index: NoteCommitmentSubtreeIndex,
+
+    /// The last checkpoint height `H`, below which no subtree roots were recorded.
+    pub last_checkpoint: block::Height,
+
+    /// What this node knows about the subtree's availability.
+    pub reason: HistoricalSubtreeUnavailableReason,
+}
+
+/// Why a requested historical subtree is currently unavailable.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum HistoricalSubtreeUnavailableReason {
+    /// The node has not reached the fast-sync last checkpoint, so it cannot yet tell a
+    /// subtree the fast path skipped from one the chain has not reached.
+    ///
+    /// This is not a promise of recovery. Deciding between the two needs the pool's leaf count
+    /// at the last checkpoint, which only exists once sync gets there; every subtree that completed
+    /// below the last checkpoint is skipped, and turns into [`Self::NotStored`] rather than appearing.
+    #[error(
+        "this node has not reached the last checkpoint, so it cannot yet tell whether the \
+         subtree was skipped; subtrees completed below the last checkpoint are never recorded"
+    )]
+    Indeterminate,
+
+    /// The node has passed the last checkpoint without recording the requested subtree.
+    #[error(
+        "this node did not record the subtree and continuing synchronization will not restore it; \
+         use another node"
+    )]
+    NotStored,
 }
 
 /// An error describing why opening the finalized state database failed.

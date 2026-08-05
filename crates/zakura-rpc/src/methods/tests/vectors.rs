@@ -1154,6 +1154,474 @@ async fn rpc_getblock_missing_error() {
     assert!(rpc_tx_queue_task_result.is_none());
 }
 
+/// Verbose `getblockheader` must preserve the typed historical-tree error from state.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblockheader_preserves_historical_tree_error() {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let height = Height(0);
+    let last_checkpoint = Height(3_418_406);
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 2),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let header_future =
+        tokio::spawn(async move { rpc.get_block_header(height.0.to_string(), Some(true)).await });
+
+    read_state
+        .expect_request(ReadRequest::BlockHeader(height.into()))
+        .await
+        .respond(ReadResponse::BlockHeader {
+            header: block.header.clone(),
+            hash,
+            height,
+            next_block_hash: None,
+        });
+    read_state
+        .expect_request(ReadRequest::SaplingTree(hash.into()))
+        .await
+        .respond_error(Box::new(zakura_state::HistoricalTreeUnavailable {
+            hash_or_height: hash.into(),
+            last_checkpoint,
+        }));
+
+    let error = header_future
+        .await
+        .expect("getblockheader future should not panic")
+        .expect_err("an absent historical tree must fail getblockheader");
+    assert!(error.message().contains("historical note commitment tree"));
+    assert!(!error.message().contains("missing Sapling tree"));
+
+    read_state.expect_no_requests().await;
+    assert!(rpc_tx_queue.now_or_never().is_none());
+}
+
+/// Verbose `getblock` must serve a pre-activation block from the empty frontier.
+///
+/// Below a pool's activation height the note commitment tree is the consensus-defined empty
+/// frontier, so a fast-synced node's absent per-height tree is not missing history: the read
+/// handler answers with the empty tree rather than the archive-mode error, exactly as a
+/// legacy node answers from its backward tree search. This pins the reported values, because
+/// the claim this behaviour rests on is equivalence with a legacy node, not merely "no error".
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblock_serves_pre_activation_empty_trees() {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let height = Height(0);
+    let tx_hashes = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.hash())
+        .collect::<Vec<_>>();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 8),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let block_future =
+        tokio::spawn(async move { rpc.get_block(height.0.to_string(), Some(1)).await });
+
+    read_state
+        .expect_request(ReadRequest::BlockHeader(height.into()))
+        .await
+        .respond(ReadResponse::BlockHeader {
+            header: block.header.clone(),
+            hash,
+            height,
+            next_block_hash: None,
+        });
+    // Genesis is below Sapling and NU5 activation, so both reads resolve to the empty frontier
+    // on a fast-synced node instead of returning the absent-band error.
+    read_state
+        .expect_request(ReadRequest::SaplingTree(hash.into()))
+        .await
+        .respond(ReadResponse::SaplingTree(Some(Arc::new(
+            zakura_chain::sapling::tree::NoteCommitmentTree::default(),
+        ))));
+    read_state
+        .expect_request(ReadRequest::Depth(hash))
+        .await
+        .respond(ReadResponse::Depth(Some(0)));
+    read_state
+        .expect_request(ReadRequest::TransactionIdsForBlock(hash.into()))
+        .await
+        .respond(ReadResponse::TransactionIdsForBlock(Some(Arc::from(
+            tx_hashes.into_boxed_slice(),
+        ))));
+    read_state
+        .expect_request(ReadRequest::OrchardTree(hash.into()))
+        .await
+        .respond(ReadResponse::OrchardTree(Some(Arc::new(
+            zakura_chain::orchard::tree::NoteCommitmentTree::default(),
+        ))));
+    read_state
+        .expect_request(ReadRequest::BlockInfo(
+            block.header.previous_block_hash.into(),
+        ))
+        .await
+        .respond(ReadResponse::BlockInfo(None));
+    read_state
+        .expect_request(ReadRequest::BlockInfo(hash.into()))
+        .await
+        .respond(ReadResponse::BlockInfo(None));
+
+    let response = block_future
+        .await
+        .expect("getblock future should not panic")
+        .expect("a pre-activation block is served, not reported as missing history");
+
+    let GetBlockResponse::Object(block_object) = response else {
+        panic!("verbosity 1 returns a block object");
+    };
+
+    let trees = block_object.trees;
+    assert_eq!(
+        trees.sapling(),
+        0,
+        "an empty Sapling frontier has no commitments"
+    );
+    assert_eq!(
+        trees.orchard(),
+        0,
+        "an empty Orchard frontier has no commitments"
+    );
+    // NU5 is inactive at genesis, so `getblock` omits the final Orchard root entirely rather
+    // than reporting the empty tree's root.
+    assert_eq!(block_object.final_orchard_root, None);
+
+    read_state.expect_no_requests().await;
+    assert!(rpc_tx_queue.now_or_never().is_none());
+}
+
+/// Verbose `getblock` must preserve the typed Orchard-tree error from state.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblock_preserves_historical_tree_error() {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let height = Height(0);
+    let last_checkpoint = Height(3_418_406);
+    let tx_hashes = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.hash())
+        .collect::<Vec<_>>();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 8),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let block_future =
+        tokio::spawn(async move { rpc.get_block(height.0.to_string(), Some(1)).await });
+
+    read_state
+        .expect_request(ReadRequest::BlockHeader(height.into()))
+        .await
+        .respond(ReadResponse::BlockHeader {
+            header: block.header.clone(),
+            hash,
+            height,
+            next_block_hash: None,
+        });
+    read_state
+        .expect_request(ReadRequest::SaplingTree(hash.into()))
+        .await
+        .respond(ReadResponse::SaplingTree(Some(Arc::new(
+            zakura_chain::sapling::tree::NoteCommitmentTree::default(),
+        ))));
+    read_state
+        .expect_request(ReadRequest::Depth(hash))
+        .await
+        .respond(ReadResponse::Depth(Some(0)));
+    read_state
+        .expect_request(ReadRequest::TransactionIdsForBlock(hash.into()))
+        .await
+        .respond(ReadResponse::TransactionIdsForBlock(Some(Arc::from(
+            tx_hashes.into_boxed_slice(),
+        ))));
+    read_state
+        .expect_request(ReadRequest::OrchardTree(hash.into()))
+        .await
+        .respond_error(Box::new(zakura_state::HistoricalTreeUnavailable {
+            hash_or_height: hash.into(),
+            last_checkpoint,
+        }));
+    read_state
+        .expect_request(ReadRequest::BlockInfo(
+            block.header.previous_block_hash.into(),
+        ))
+        .await
+        .respond(ReadResponse::BlockInfo(None));
+    read_state
+        .expect_request(ReadRequest::BlockInfo(hash.into()))
+        .await
+        .respond(ReadResponse::BlockInfo(None));
+
+    let error = block_future
+        .await
+        .expect("getblock future should not panic")
+        .expect_err("an absent historical tree must fail getblock");
+    assert!(error.message().contains("historical note commitment tree"));
+    assert!(!error.message().contains("missing Orchard tree"));
+
+    read_state.expect_no_requests().await;
+    assert!(rpc_tx_queue.now_or_never().is_none());
+}
+
+/// A `z_gettreestate` inside a fast-synced node's absent band must fail loudly.
+///
+/// Before this, an absent per-height tree became a JSON `null` treestate. Clients following
+/// the lightwalletd contract read that as the *empty* tree and derive a wallet birthday anchor
+/// asserting an empty commitment tree deep in the chain, with no error at the point of
+/// corruption. The read handler now returns [`zakura_state::HistoricalTreeUnavailable`], which
+/// the RPC surfaces as an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_get_treestate_absent_band_is_an_error() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let block_hash = block.hash();
+
+    // Sapling is active here and NU5 is not, so the Sapling tree is the only tree requested.
+    let height = Height(1_000_000);
+    let last_checkpoint = Height(3_418_406);
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let treestate_future =
+        tokio::spawn(async move { rpc.z_get_treestate(height.0.to_string()).await });
+
+    read_state
+        .expect_request(ReadRequest::Block(height.into()))
+        .await
+        .respond(ReadResponse::Block(Some(block)));
+
+    read_state
+        .expect_request(ReadRequest::SaplingTree(block_hash.into()))
+        .await
+        .respond_error(Box::new(zakura_state::HistoricalTreeUnavailable {
+            hash_or_height: block_hash.into(),
+            last_checkpoint,
+        }));
+
+    let treestate_response = treestate_future
+        .await
+        .expect("treestate future should not panic")
+        .expect_err("an absent-band treestate must be an error, not a null treestate");
+
+    assert_eq!(treestate_response.code(), ErrorCode::ServerError(-1).code());
+    assert!(
+        treestate_response.message().contains("fast-synced"),
+        "the error must name the cause, got: {}",
+        treestate_response.message()
+    );
+
+    read_state.expect_no_requests().await;
+
+    let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
+    assert!(rpc_tx_queue_task_result.is_none());
+}
+
+/// A `z_getsubtreesbyindex` inside a fast-synced node's absent band must fail loudly.
+///
+/// The subtree read path returns an empty list when the starting index is absent, which is
+/// indistinguishable from "this chain has no subtrees there". A client seeds nothing and fails
+/// later without a clear cause, so the read handler returns
+/// [`zakura_state::HistoricalSubtreeUnavailable`] instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_z_get_subtrees_by_index_absent_band_is_an_error() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let start_index = NoteCommitmentSubtreeIndex(0);
+    let subtrees_rpc = rpc.clone();
+    let subtrees_future = tokio::spawn(async move {
+        subtrees_rpc
+            .z_get_subtrees_by_index("sapling".to_string(), start_index, Some(1u16.into()))
+            .await
+    });
+
+    read_state
+        .expect_request(ReadRequest::SaplingSubtrees {
+            start_index,
+            limit: Some(1u16.into()),
+        })
+        .await
+        .respond_error(Box::new(zakura_state::HistoricalSubtreeUnavailable {
+            pool: "sapling",
+            index: start_index,
+            last_checkpoint: Height(3_418_406),
+            reason: zakura_state::HistoricalSubtreeUnavailableReason::NotStored,
+        }));
+
+    let subtrees_response = subtrees_future
+        .await
+        .expect("subtrees future should not panic")
+        .expect_err("an absent-band subtree list must be an error, not an empty list");
+
+    assert_eq!(subtrees_response.code(), ErrorCode::ServerError(-1).code());
+    assert!(
+        subtrees_response
+            .message()
+            .contains("continuing synchronization will not restore it"),
+        "the error must identify the failure as permanent, got: {}",
+        subtrees_response.message()
+    );
+
+    let subtrees_future = tokio::spawn(async move {
+        rpc.z_get_subtrees_by_index("sapling".to_string(), start_index, Some(1u16.into()))
+            .await
+    });
+
+    read_state
+        .expect_request(ReadRequest::SaplingSubtrees {
+            start_index,
+            limit: Some(1u16.into()),
+        })
+        .await
+        .respond_error(Box::new(zakura_state::HistoricalSubtreeUnavailable {
+            pool: "sapling",
+            index: start_index,
+            last_checkpoint: Height(3_418_406),
+            reason: zakura_state::HistoricalSubtreeUnavailableReason::Indeterminate,
+        }));
+
+    let indeterminate_response = subtrees_future
+        .await
+        .expect("subtrees future should not panic")
+        .expect_err("a subtree missing during sync must be an error, not an empty list");
+
+    assert_eq!(
+        indeterminate_response.code(),
+        ErrorCode::ServerError(-1).code()
+    );
+    assert!(
+        indeterminate_response
+            .message()
+            .contains("cannot yet tell whether the subtree was skipped"),
+        "the error must identify the availability as undecided, got: {}",
+        indeterminate_response.message()
+    );
+    assert!(
+        !indeterminate_response.message().contains("retry"),
+        "a subtree skipped below the last checkpoint never arrives, so the error must not advise a \
+         retry, got: {}",
+        indeterminate_response.message()
+    );
+    assert_ne!(
+        subtrees_response.message(),
+        indeterminate_response.message()
+    );
+
+    read_state.expect_no_requests().await;
+
+    let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
+    assert!(rpc_tx_queue_task_result.is_none());
+}
+
 /// Regression test for GHSA-x6v8-c2xp-928m — panics (aborts) before the fix.
 ///
 /// When `Depth` returns `None` (side-chain block), `get_block_header` sets

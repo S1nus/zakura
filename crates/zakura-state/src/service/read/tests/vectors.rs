@@ -8,7 +8,10 @@ use zakura_chain::{
     ironwood, orchard,
     parameters::Network::*,
     serialization::ZcashDeserializeInto,
-    subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
+    subtree::{
+        NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex,
+        TRACKED_SUBTREE_HEIGHT,
+    },
     transaction,
 };
 
@@ -24,9 +27,15 @@ use crate::{
     service::{
         finalized_state::{DiskWriteBatch, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
         non_finalized_state::Chain,
-        read::{ironwood_subtrees, orchard_subtrees, sapling_subtrees},
+        read::{
+            ironwood_subtrees, orchard_subtrees, sapling_subtrees,
+            tree::{
+                first_missing_subtree_index, is_syncing_below_last_checkpoint,
+                subtree_completed_by_last_checkpoint,
+            },
+        },
     },
-    Config, ReadRequest, ReadResponse,
+    Config, HistoricalSubtreeUnavailableReason, ReadRequest, ReadResponse,
 };
 
 /// Test that ReadStateService responds correctly when empty.
@@ -160,7 +169,7 @@ async fn test_read_subtrees() -> Result<()> {
     // There should be 10 entries in db and 2 in chain with no overlap
 
     // Unbounded range should start at 0
-    let all_subtrees = sapling_subtrees(Some(chain.clone()), &db, ..);
+    let all_subtrees = sapling_subtrees(Some(chain.clone()), &db, ..)?;
     assert_eq!(all_subtrees.len(), 12, "should have 12 subtrees in state");
 
     // Add a subtree to `chain` that overlaps and is not consistent with the db subtrees
@@ -169,14 +178,14 @@ async fn test_read_subtrees() -> Result<()> {
     let modified_chain = modify_chain(&chain, first_chain_index, end_height.0);
 
     // The inconsistent entry and any later entries should be omitted
-    let all_subtrees = sapling_subtrees(modified_chain.clone(), &db, ..);
+    let all_subtrees = sapling_subtrees(modified_chain.clone(), &db, ..)?;
     assert_eq!(all_subtrees.len(), 10, "should have 10 subtrees in state");
 
     let first_chain_index =
         NoteCommitmentSubtreeIndex(u16::try_from(first_chain_index).expect("should fit in u16"));
 
     // Entries should be returned without reading from disk if the chain contains the first subtree index in the range
-    let mut chain_subtrees = sapling_subtrees(modified_chain, &db, first_chain_index..);
+    let mut chain_subtrees = sapling_subtrees(modified_chain, &db, first_chain_index..)?;
     assert_eq!(chain_subtrees.len(), 3, "should have 3 subtrees in chain");
 
     let (index, subtree) = chain_subtrees
@@ -192,7 +201,7 @@ async fn test_read_subtrees() -> Result<()> {
 
     let start = 0.into();
     let range = (Excluded(start), Unbounded);
-    let subtrees = sapling_subtrees(Some(chain), &db, range);
+    let subtrees = sapling_subtrees(Some(chain), &db, range)?;
     assert_eq!(subtrees.len(), 11);
     assert!(
         !subtrees.contains_key(&start),
@@ -227,40 +236,40 @@ async fn test_sapling_subtrees() -> Result<()> {
     // the non-finalized state.
 
     // Retrieve only the first subtree and check its properties.
-    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..1.into());
+    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..1.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
 
     // Retrieve both subtrees using a limit and check their properties.
-    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..2.into());
+    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..2.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 2);
     assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve both subtrees without using a limit and check their properties.
-    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..);
+    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..)?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 2);
     assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve only the second subtree and check its properties.
-    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..2.into());
+    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..2.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve only the second subtree, using a limit that would allow for more trees if they were
     // present, and check its properties.
-    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..3.into());
+    let subtrees = sapling_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..3.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve only the second subtree, without using any limit, and check its properties.
-    let subtrees = sapling_subtrees(chain, &db, NoteCommitmentSubtreeIndex(1)..);
+    let subtrees = sapling_subtrees(chain, &db, NoteCommitmentSubtreeIndex(1)..)?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
@@ -293,40 +302,40 @@ async fn test_orchard_subtrees() -> Result<()> {
     // the non-finalized state.
 
     // Retrieve only the first subtree and check its properties.
-    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..1.into());
+    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..1.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
 
     // Retrieve both subtrees using a limit and check their properties.
-    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..2.into());
+    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..2.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 2);
     assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve both subtrees without using a limit and check their properties.
-    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..);
+    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..)?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 2);
     assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve only the second subtree and check its properties.
-    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..2.into());
+    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..2.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve only the second subtree, using a limit that would allow for more trees if they were
     // present, and check its properties.
-    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..3.into());
+    let subtrees = orchard_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..3.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve only the second subtree, without using any limit, and check its properties.
-    let subtrees = orchard_subtrees(chain, &db, NoteCommitmentSubtreeIndex(1)..);
+    let subtrees = orchard_subtrees(chain, &db, NoteCommitmentSubtreeIndex(1)..)?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
@@ -359,40 +368,40 @@ async fn test_ironwood_subtrees() -> Result<()> {
     // the non-finalized state.
 
     // Retrieve only the first subtree and check its properties.
-    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..1.into());
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..1.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
 
     // Retrieve both subtrees using a limit and check their properties.
-    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..2.into());
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..2.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 2);
     assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve both subtrees without using a limit and check their properties.
-    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..);
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..)?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 2);
     assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve only the second subtree and check its properties.
-    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..2.into());
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..2.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve only the second subtree, using a limit that would allow for more trees if they were
     // present, and check its properties.
-    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..3.into());
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..3.into())?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     // Retrieve only the second subtree, without using any limit, and check its properties.
-    let subtrees = ironwood_subtrees(chain, &db, NoteCommitmentSubtreeIndex(1)..);
+    let subtrees = ironwood_subtrees(chain, &db, NoteCommitmentSubtreeIndex(1)..)?;
     let mut subtrees = subtrees.iter();
     assert_eq!(subtrees.len(), 1);
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
@@ -408,7 +417,9 @@ fn excluded_max_subtree_range_is_empty() {
     let no_chain = Option::<Arc<Chain>>::None;
     let range = (Excluded(NoteCommitmentSubtreeIndex(u16::MAX)), Unbounded);
 
-    assert!(sapling_subtrees(no_chain, &db, range).is_empty());
+    assert!(sapling_subtrees(no_chain, &db, range)
+        .expect("an empty range is available")
+        .is_empty());
 }
 
 /// Returns test cases for the empty state and missing blocks.
@@ -636,4 +647,325 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
     assert_eq!(found.unwrap().hash(), best_hash);
 
     Ok(())
+}
+
+/// The absent-band subtree bound must cover exactly the subtrees the fast path skipped.
+///
+/// The bound is what keeps [`crate::HistoricalSubtreeUnavailable`] from firing on an ordinary
+/// "you asked past the tip" query: only indices that completed at or below the last checkpoint were
+/// skipped, everything at or above that is genuinely absent on any node.
+#[test]
+fn subtree_absent_band_bound_is_exact() {
+    const LEAVES_PER_SUBTREE: u64 = 1 << TRACKED_SUBTREE_HEIGHT;
+
+    // No subtree has completed yet, so no index is in the band, whatever the client asks for.
+    for leaves in [0, 1, LEAVES_PER_SUBTREE - 1] {
+        assert!(
+            !subtree_completed_by_last_checkpoint(0.into(), leaves),
+            "no subtree completes before {LEAVES_PER_SUBTREE} leaves, but {leaves} claimed one"
+        );
+    }
+
+    // Exactly one subtree (index 0) completed. Index 1 has not, so it stays an empty list.
+    assert!(subtree_completed_by_last_checkpoint(
+        0.into(),
+        LEAVES_PER_SUBTREE
+    ));
+    assert!(!subtree_completed_by_last_checkpoint(
+        1.into(),
+        LEAVES_PER_SUBTREE
+    ));
+
+    // A partly-filled second subtree does not count as completed.
+    assert!(subtree_completed_by_last_checkpoint(
+        0.into(),
+        LEAVES_PER_SUBTREE + 1
+    ));
+    assert!(!subtree_completed_by_last_checkpoint(
+        1.into(),
+        LEAVES_PER_SUBTREE + 1
+    ));
+
+    // Mainnet-scale: 73,934,658 Sapling commitments at the last checkpoint is 1,128 completed
+    // subtrees, indexes 0..=1127. Index 1128 is the one still filling.
+    let sapling_leaves_at_last_checkpoint = 73_934_658;
+    assert!(subtree_completed_by_last_checkpoint(
+        1127.into(),
+        sapling_leaves_at_last_checkpoint
+    ));
+    assert!(!subtree_completed_by_last_checkpoint(
+        1128.into(),
+        sapling_leaves_at_last_checkpoint
+    ));
+}
+
+/// A persisted last-checkpoint marker does not mean the tree should exist before sync reaches it.
+#[test]
+fn last_checkpoint_tree_is_only_expected_after_sync_reaches_last_checkpoint() {
+    let last_checkpoint = Height(10);
+
+    assert!(is_syncing_below_last_checkpoint(
+        Some(Height(9)),
+        last_checkpoint
+    ));
+    assert!(!is_syncing_below_last_checkpoint(
+        Some(last_checkpoint),
+        last_checkpoint
+    ));
+    assert!(!is_syncing_below_last_checkpoint(
+        Some(Height(11)),
+        last_checkpoint
+    ));
+
+    // A marker without any finalized block cannot be produced by the atomic commit path, so keep
+    // treating that state as an invariant failure rather than ordinary sync progress.
+    assert!(!is_syncing_below_last_checkpoint(None, last_checkpoint));
+}
+
+/// A missing subtree's availability is undecided while the finalized tip is below the last checkpoint.
+///
+/// The node cannot tell a skipped subtree from one the chain has not reached until it has the
+/// pool's leaf count at the last checkpoint, so the error must not advise a retry: every subtree
+/// that completed below the last checkpoint is skipped, and this node never records it.
+#[tokio::test]
+async fn missing_subtree_before_last_checkpoint_reports_indeterminate_reason() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let last_checkpoint = Height(10);
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding a future last checkpoint succeeds");
+
+    let error = sapling_subtrees(
+        None::<Arc<Chain>>,
+        &read_state.db,
+        NoteCommitmentSubtreeIndex(0)..1.into(),
+    )
+    .expect_err("a subtree below an unreached last checkpoint must fail closed");
+
+    assert_eq!(
+        error.reason,
+        HistoricalSubtreeUnavailableReason::Indeterminate
+    );
+    assert!(error
+        .to_string()
+        .contains("cannot yet tell whether the subtree was skipped"));
+    assert!(
+        !error.to_string().contains("retry"),
+        "a subtree skipped below the last checkpoint never arrives, so the error must not advise a \
+         retry, got: {error}"
+    );
+}
+
+/// A subtree that the authenticated last-checkpoint frontier proves was not completed is an
+/// ordinary empty result, even while the finalized tip is below the last checkpoint.
+#[tokio::test]
+async fn incomplete_ironwood_subtree_before_mainnet_last_checkpoint_is_empty() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let last_checkpoint = Mainnet.checkpoint_list().max_height();
+
+    assert!(
+        read_state.db.finalized_tip_height() < Some(last_checkpoint),
+        "the regression requires a finalized tip below the Mainnet last checkpoint"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding the Mainnet VCT last checkpoint succeeds");
+
+    let subtrees = ironwood_subtrees(
+        None::<Arc<Chain>>,
+        &read_state.db,
+        NoteCommitmentSubtreeIndex(0)..1.into(),
+    )
+    .expect("the authenticated last checkpoint proves Ironwood subtree zero was not completed");
+
+    assert!(subtrees.is_empty());
+}
+
+/// A missing last-checkpoint tree is an error once the finalized tip has reached the checkpoint.
+#[tokio::test]
+async fn missing_last_checkpoint_tree_fails_closed_after_sync_reaches_last_checkpoint() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let last_checkpoint = read_state
+        .db
+        .finalized_tip_height()
+        .expect("the populated state has a finalized tip");
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
+    batch.delete_range_sapling_tree(&read_state.db, &Height::MIN, &last_checkpoint);
+    batch.delete_sapling_tree(&read_state.db, &last_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding a missing last-checkpoint tree succeeds");
+
+    let error = sapling_subtrees(
+        None::<Arc<Chain>>,
+        &read_state.db,
+        NoteCommitmentSubtreeIndex(0)..1.into(),
+    )
+    .expect_err("a reached last checkpoint without its tree must fail closed");
+
+    assert_eq!(error.pool, "sapling");
+    assert_eq!(error.index, NoteCommitmentSubtreeIndex(0));
+    assert_eq!(error.last_checkpoint, last_checkpoint);
+    assert_eq!(error.reason, HistoricalSubtreeUnavailableReason::NotStored);
+    assert!(error.to_string().contains("use another node"));
+}
+
+/// Missing pre-activation trees are returned as consensus-defined empty frontiers.
+#[tokio::test]
+async fn pre_activation_tree_requests_return_empty_frontiers() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let requested_height = Height::MIN;
+    let last_checkpoint = Height(10);
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding the VCT absent band succeeds");
+
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::SaplingTree(requested_height.into()))
+            .await
+            .expect("pre-activation Sapling tree request succeeds"),
+        ReadResponse::SaplingTree(Some(Default::default()))
+    );
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::OrchardTree(requested_height.into()))
+            .await
+            .expect("pre-activation Orchard tree request succeeds"),
+        ReadResponse::OrchardTree(Some(Default::default()))
+    );
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::IronwoodTree(requested_height.into()))
+            .await
+            .expect("pre-activation Ironwood tree request succeeds"),
+        ReadResponse::IronwoodTree(Some(Default::default()))
+    );
+    assert_eq!(
+        read_state
+            .oneshot(ReadRequest::SaplingTree(last_checkpoint.into()))
+            .await
+            .expect("missing pre-activation block request succeeds"),
+        ReadResponse::SaplingTree(None),
+        "an empty frontier is only returned for a block that exists"
+    );
+}
+
+/// The served run must be checked to its end, not just at its start.
+///
+/// `z_getsubtreesbyindex` returns one contiguous run, so a gap anywhere truncates the response.
+/// A single unbounded request from index 0 against a truncated artifact would otherwise return a
+/// short list with no error, which a client reads as "that is every subtree on this chain" — the
+/// same silent-truncation failure the typed errors exist to remove.
+#[test]
+fn first_missing_subtree_index_finds_the_end_of_the_run() {
+    let data = || {
+        NoteCommitmentSubtreeData::new(
+            Height(1),
+            sapling_crypto::Node::from_bytes([0; 32]).unwrap(),
+        )
+    };
+    let map = |indexes: &[u16]| {
+        indexes
+            .iter()
+            .map(|i| (NoteCommitmentSubtreeIndex(*i), data()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    // A run that stops early reports the index just past its end, not "nothing missing".
+    assert_eq!(
+        first_missing_subtree_index(&map(&[0, 1, 2]), NoteCommitmentSubtreeIndex(0), None),
+        Some(NoteCommitmentSubtreeIndex(3))
+    );
+
+    // An upgraded database can contain a pre-U row and a post-checkpoint row around a subtree
+    // skipped by VCT fast sync. The later row must not hide the internal gap.
+    assert_eq!(
+        first_missing_subtree_index(&map(&[0, 2]), NoteCommitmentSubtreeIndex(0), None),
+        Some(NoteCommitmentSubtreeIndex(1)),
+        "the first internal gap must be reported instead of one past the last key"
+    );
+
+    // Nothing served at all: the requested start is the first missing index.
+    assert_eq!(
+        first_missing_subtree_index(&map(&[]), NoteCommitmentSubtreeIndex(7), None),
+        Some(NoteCommitmentSubtreeIndex(7))
+    );
+
+    // An index the client did not ask for is not missing from its answer.
+    assert_eq!(
+        first_missing_subtree_index(
+            &map(&[0, 1, 2]),
+            NoteCommitmentSubtreeIndex(0),
+            Some(NoteCommitmentSubtreeIndex(3))
+        ),
+        None,
+        "a fully satisfied bounded request has no gap"
+    );
+    assert_eq!(
+        first_missing_subtree_index(
+            &map(&[0, 1]),
+            NoteCommitmentSubtreeIndex(0),
+            Some(NoteCommitmentSubtreeIndex(5))
+        ),
+        Some(NoteCommitmentSubtreeIndex(2)),
+        "a bounded request served short still reports the gap"
+    );
+
+    // `u16::MAX` is the last index that can exist, so a run reaching it has no successor.
+    assert_eq!(
+        first_missing_subtree_index(
+            &map(&[u16::MAX]),
+            NoteCommitmentSubtreeIndex(u16::MAX),
+            None
+        ),
+        None,
+        "the final index must not overflow into a phantom gap"
+    );
 }

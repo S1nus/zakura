@@ -18,6 +18,7 @@ use zakura_chain::{
     primitives::Groth16Proof,
     serialization::{BytesInDisplayOrder, ZcashDeserializeInto},
     sprout::JoinSplit,
+    subtree::NoteCommitmentSubtreeIndex,
     transaction::{JoinSplitData, LockTime, Transaction, UnminedTx},
     LedgerState,
 };
@@ -25,7 +26,13 @@ use zakura_test::prelude::*;
 
 use crate::{
     config::Config,
-    service::{arbitrary::PreparedChain, check::anchors::tx_anchors_refer_to_final_treestates},
+    error::HistoricalTreeUnavailable,
+    service::{
+        arbitrary::PreparedChain,
+        check::anchors::tx_anchors_refer_to_final_treestates,
+        non_finalized_state::Chain,
+        read::{sapling_subtrees, sapling_tree},
+    },
     tests::FakeChainHelper,
     HashOrHeight,
 };
@@ -1650,8 +1657,45 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // The `z_gettreestate` RPC gate predicate matches the read guard: a
             // below-handoff height is unavailable (typed archive-mode error), while the
             // handoff height itself is available.
-            prop_assert!(fast.db.vct_historical_tree_unavailable(HashOrHeight::Height(Height(last as u32 - 1))), "RPC gate: below-handoff treestate is unavailable");
-            prop_assert!(!fast.db.vct_historical_tree_unavailable(HashOrHeight::Height(handoff)), "RPC gate: handoff treestate is available");
+            prop_assert!(fast.db.vct_tree_absent(Height(last as u32 - 1)), "RPC gate: below-handoff treestate is unavailable");
+            prop_assert!(!fast.db.vct_tree_absent(handoff), "RPC gate: handoff treestate is available");
+
+            // The read handlers turn that predicate into the typed archive-mode error the
+            // RPC boundary reports, carrying the handoff so the failure is diagnosable.
+            // Without it, a below-handoff `z_gettreestate` returns a JSON `null`, which
+            // lightwalletd-style clients read as the *empty* tree.
+            let below_handoff_height = HashOrHeight::Height(Height(last as u32 - 1));
+            prop_assert_eq!(
+                sapling_tree(None::<Arc<Chain>>, &fast.db, below_handoff_height),
+                Err(HistoricalTreeUnavailable {
+                    hash_or_height: below_handoff_height,
+                    last_checkpoint: handoff,
+                }),
+                "a below-handoff tree read is a typed archive-mode error, not an absent tree"
+            );
+            prop_assert!(
+                sapling_tree(None::<Arc<Chain>>, &fast.db, HashOrHeight::Height(handoff))
+                    .expect("the handoff tree is available")
+                    .is_some(),
+                "the handoff height itself is served normally"
+            );
+            // A legacy node never reports the archive-mode error, whatever the height.
+            prop_assert!(
+                sapling_tree(None::<Arc<Chain>>, &legacy.db, below_handoff_height)
+                    .expect("legacy tree reads do not report an absent band")
+                    .is_some(),
+                "a legacy-synced node has the tree and must not report an absent band"
+            );
+
+            // The subtree gate must not fire just because a node is fast-synced. This chain is
+            // far too short to complete a subtree, so `z_getsubtreesbyindex` at index 0 is an
+            // ordinary "nothing here yet" empty list, exactly as on a legacy node.
+            prop_assert!(
+                sapling_subtrees(None::<Arc<Chain>>, &fast.db, NoteCommitmentSubtreeIndex(0)..)
+                    .expect("an index past the last completed subtree is available")
+                    .is_empty(),
+                "an index past the last completed subtree stays an empty list, not an error"
+            );
 
             // Negative: a peer can supply a wrong root exactly at the handoff height,
             // where there is no buffered checkpoint successor to authenticate it. The
