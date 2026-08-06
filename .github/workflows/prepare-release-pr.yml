@@ -2,11 +2,11 @@
 #
 # Runs scripts/prepare-release.sh on a fresh checkout of main (crate bumps via
 # cargo-semver-checks, Zakura release-level validation, lockfile, config
-# fixture, README tag, projected end-of-support height, release-state freshness,
-# and changelog assembly), verifies the result with
-# `make pre-release`, and opens or updates a draft PR through the release
-# GitHub App. Nothing merges, tags, or publishes from this workflow: the PR is
-# always a draft, judgment items (bump-level review, authoritative
+# fixture, README tag, projected end-of-support height, an automatic import of
+# the latest verified release state, and changelog assembly), verifies the
+# result with `make pre-release`, and opens or updates a draft PR through the
+# release GitHub App. Nothing merges, tags, or publishes from this workflow:
+# the PR is always a draft, judgment items (bump-level review, authoritative
 # end-of-support height, changelog curation) are listed in the PR body, and
 # create-release.yml re-validates everything after merge.
 #
@@ -124,6 +124,7 @@ jobs:
             exit 1
           fi
           python3 .github/scripts/fetch-release-state.py --self-test
+          python3 .github/scripts/import-release-state.py --self-test
           python3 scripts/release-readiness.py self-test
           python3 .github/scripts/fetch-release-state.py \
             --latest-url "$LATEST_URL" \
@@ -141,6 +142,34 @@ jobs:
             echo "generated_at=$(jq -r '.generated_at' <<<"$report")"
           } >> "$GITHUB_OUTPUT"
           jq . <<<"$report" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Import the latest Mainnet release state
+        if: inputs.release_state_waiver == ''
+        id: release-state-import
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/import-release-state.py \
+            --bundle "$RUNNER_TEMP/release-state-bundle" \
+            --resolution "$RUNNER_TEMP/release-state-resolution.json" \
+            --result-out "$RUNNER_TEMP/release-state-import.json" \
+            --no-eos-floor
+          jq -r '
+            "has_changes=\(.has_changes)",
+            "committed_height=\(.committed_height)",
+            "height=\(.height)",
+            "block_hash=\(.block_hash)",
+            "generated_at=\(.generated_at)",
+            "meta_url=\(.meta_url)",
+            "meta_sha256=\(.meta_sha256)"
+          ' "$RUNNER_TEMP/release-state-import.json" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the imported release state
+        if: steps.release-state-import.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          .github/scripts/validate-checkpoints.sh \
+            crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         id: toolchain
@@ -160,6 +189,10 @@ jobs:
 
       - uses: ./.github/actions/setup-zakura-build
 
+      - name: Re-prove the imported checkpoint/frontier pairing in cargo
+        if: steps.release-state-import.outputs.has_changes == 'true'
+        run: cargo test -p zakura-state --lib -- frontier sprout_change
+
       - name: Prepare the release
         id: prep
         env:
@@ -169,6 +202,7 @@ jobs:
           ESTIMATED_RELEASE_HEIGHT: ${{ steps.release-state.outputs.estimated_release_height }}
           LATEST_RELEASE_STATE_HEIGHT: ${{ steps.release-state.outputs.bundle_height }}
           RELEASE_STATE_WAIVER: ${{ inputs.release_state_waiver }}
+          RELEASE_STATE_IMPORTED: ${{ steps.release-state-import.outputs.has_changes }}
         run: |
           args=(
             --release-tag "$RELEASE_TAG"
@@ -180,6 +214,8 @@ jobs:
           [ -z "$NO_CRATES_FLAG" ] || args+=("$NO_CRATES_FLAG")
           [ -z "$RELEASE_STATE_WAIVER" ] \
             || args+=(--release-state-waiver "$RELEASE_STATE_WAIVER")
+          [ "$RELEASE_STATE_IMPORTED" = "true" ] \
+            && args+=(--allow-dirty-release-state)
           scripts/prepare-release.sh "${args[@]}"
 
       # cargo package (run by the packaging check) refuses a dirty tree, so
@@ -233,6 +269,12 @@ jobs:
           VERIFY_PRERELEASE: ${{ steps.verify-prerelease.outcome }}
           VERIFY_CONFIG: ${{ steps.verify-config.outcome }}
           VERIFY_FMT: ${{ steps.verify-fmt.outcome }}
+          RELEASE_STATE_IMPORTED: ${{ steps.release-state-import.outputs.has_changes }}
+          PREVIOUS_RELEASE_STATE_HEIGHT: ${{ steps.release-state-import.outputs.committed_height }}
+          RELEASE_STATE_HASH: ${{ steps.release-state-import.outputs.block_hash }}
+          RELEASE_STATE_GENERATED_AT: ${{ steps.release-state-import.outputs.generated_at }}
+          RELEASE_STATE_META_URL: ${{ steps.release-state-import.outputs.meta_url }}
+          RELEASE_STATE_META_SHA256: ${{ steps.release-state-import.outputs.meta_sha256 }}
         run: |
           python3 - "$RUNNER_TEMP/prep-summary.json" > "$RUNNER_TEMP/pr-body.md" <<'PY'
           import json, os, sys
@@ -310,6 +352,18 @@ jobs:
               f"{release_state['committed_height']}, latest verified "
               f"{release_state['latest_verified_height']}."
           )
+          if os.environ["RELEASE_STATE_IMPORTED"] == "true":
+              lines.append(
+                  f"- Mainnet release state imported automatically: "
+                  f"{os.environ['PREVIOUS_RELEASE_STATE_HEIGHT']} → "
+                  f"{release_state['committed_height']}."
+              )
+              lines.append(
+                  f"- Imported bundle: `{os.environ['RELEASE_STATE_HASH']}`, "
+                  f"generated `{os.environ['RELEASE_STATE_GENERATED_AT']}`, "
+                  f"[metadata]({os.environ['RELEASE_STATE_META_URL']}) "
+                  f"(`{os.environ['RELEASE_STATE_META_SHA256']}`)."
+              )
           if release_state["waiver"]:
               lines.append(
                   f"- ⚠️ Rapid-RC release-state waiver: "
@@ -351,6 +405,13 @@ jobs:
               "- [ ] <!-- release-judgment:changelog --> Curate the assembled "
               "changelog (dedupe, trim trivial entries, check categories).",
           ]
+          if os.environ["RELEASE_STATE_IMPORTED"] == "true":
+              lines.append(
+                  "- [ ] <!-- release-judgment:release-state --> Review the "
+                  "consensus-critical checkpoint/frontier update; spot-check "
+                  "new heights and the terminal hash against an independent "
+                  "node or explorer."
+              )
           manual_crates = [
               crate["name"] for crate in summary["crates"]
               if crate["level"] == "manual"

@@ -38,8 +38,10 @@ jobs:
           persist-credentials: false
           ref: main
 
-      - name: Self-test the bundle fetcher
-        run: python3 .github/scripts/fetch-release-state.py --self-test
+      - name: Self-test the release-state tooling
+        run: |
+          python3 .github/scripts/fetch-release-state.py --self-test
+          python3 .github/scripts/import-release-state.py --self-test
 
       - name: Fetch one immutable bundle
         env:
@@ -61,77 +63,20 @@ jobs:
         env:
           BUNDLE: ${{ runner.temp }}/release-state-bundle
           RESOLUTION: ${{ runner.temp }}/release-state-resolution.json
-          CHECKPOINTS: crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-          FRONTIER: crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-          PROVENANCE: crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
-          EOS_FILE: crates/zakurad/src/components/sync/end_of_support.rs
         run: |
           set -euo pipefail
-
-          BUNDLE_HEIGHT=$(jq -er '.height' "$RESOLUTION")
-          COMMITTED_HEIGHT=$(tail -1 "$CHECKPOINTS" | cut -d' ' -f1)
-          echo "bundle height ${BUNDLE_HEIGHT}, committed height ${COMMITTED_HEIGHT}"
-
-          if [ "$BUNDLE_HEIGHT" -le "$COMMITTED_HEIGHT" ]; then
-            echo "The committed checkpoint list is already at or above the bundle; nothing to do."
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # The committed list must be a byte-identical prefix of the bundle's
-          # full list (the selection-grid contract): any rewrite of committed
-          # history fails closed here and in review.
-          COMMITTED_SIZE=$(stat -c%s "$CHECKPOINTS")
-          if ! head -c "$COMMITTED_SIZE" "$BUNDLE/main-checkpoints.txt" | cmp -s - "$CHECKPOINTS"; then
-            echo "Bundle checkpoint list does not extend the committed list byte-for-byte." >&2
-            echo "Publisher and repository are on different selection grids; investigate before retrying." >&2
-            exit 1
-          fi
-
-          cp "$BUNDLE/main-checkpoints.txt" "$CHECKPOINTS"
-          cp "$BUNDLE/mainnet-frontier.bin" "$FRONTIER"
-
-          python3 - "$RESOLUTION" "$BUNDLE" "$CHECKPOINTS" "$FRONTIER" "$PROVENANCE" <<'PY'
-          import hashlib, json, sys
-          resolution_path, bundle, checkpoints, frontier, provenance_path = sys.argv[1:6]
-          resolution = json.load(open(resolution_path, encoding="utf-8"))
-          frontier_bytes = open(frontier, "rb").read()
-          provenance = {
-              "schema_version": 1,
-              "network": "Mainnet",
-              "source": "release-state-bundle",
-              "generated_at": resolution["generated_at"],
-              "finalized_height": resolution["height"],
-              "finalized_hash": resolution["block_hash"],
-              "checkpoints_sha256": hashlib.sha256(open(checkpoints, "rb").read()).hexdigest(),
-              "frontier_sha256": hashlib.sha256(frontier_bytes).hexdigest(),
-              "frontier_size": len(frontier_bytes),
-              "meta_sha256": resolution["meta_sha256"],
-          }
-          with open(provenance_path, "w", encoding="utf-8") as out:
-              json.dump(provenance, out, indent=2)
-              out.write("\n")
-          PY
-
-          # Floor the end-of-support estimate at the bundle height plus ~3 days
-          # of blocks. The release checklist's manual estimate stays
-          # authoritative; this only keeps a skipped checklist step from
-          # shipping a long-stale estimate inside an 18-day support window.
-          EOS_HEIGHT=$((BUNDLE_HEIGHT + 3456))
-          FORMATTED=$(echo "$EOS_HEIGHT" | awk '{n=$0; r=""; for(i=length(n);i>0;i--) { r=substr(n,i,1) r; if((length(n)-i)%3==2 && i>1) r="_" r }; print r}')
-          CURRENT_EOS=$(grep -oE 'ESTIMATED_RELEASE_HEIGHT: u32 = [0-9_]+' "$EOS_FILE" | grep -oE '[0-9_]+$' | tr -d '_')
-          if [ "$CURRENT_EOS" -lt "$EOS_HEIGHT" ]; then
-            sed -i "s/ESTIMATED_RELEASE_HEIGHT: u32 = [0-9_]*/ESTIMATED_RELEASE_HEIGHT: u32 = ${FORMATTED}/" "$EOS_FILE"
-            echo "floored ESTIMATED_RELEASE_HEIGHT at ${FORMATTED}"
-          else
-            echo "ESTIMATED_RELEASE_HEIGHT ${CURRENT_EOS} already at or above the floor"
-          fi
-
-          {
-            echo "has_changes=true"
-            echo "height=${BUNDLE_HEIGHT}"
-            jq -r '"block_hash=\(.block_hash)", "generated_at=\(.generated_at)", "meta_url=\(.meta_url)", "meta_sha256=\(.meta_sha256)"' "$RESOLUTION"
-          } >> "$GITHUB_OUTPUT"
+          python3 .github/scripts/import-release-state.py \
+            --bundle "$BUNDLE" \
+            --resolution "$RESOLUTION" \
+            --result-out "$RUNNER_TEMP/release-state-import.json"
+          jq -r '
+            "has_changes=\(.has_changes)",
+            "height=\(.height)",
+            "block_hash=\(.block_hash)",
+            "generated_at=\(.generated_at)",
+            "meta_url=\(.meta_url)",
+            "meta_sha256=\(.meta_sha256)"
+          ' "$RUNNER_TEMP/release-state-import.json" >> "$GITHUB_OUTPUT"
 
       - name: Validate the imported release state
         if: steps.import.outputs.has_changes == 'true'
