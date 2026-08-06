@@ -11,7 +11,7 @@
 //! each time the database format (column, serialization, etc) changes.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::{Debug, Write},
     fs,
     ops::RangeBounds,
@@ -111,6 +111,11 @@ pub struct DiskDb {
     /// In [`MultiThreaded`](rocksdb::MultiThreaded) mode,
     /// only [`Drop`] requires exclusive access.
     db: Arc<DB>,
+
+    /// The temporary workspace RocksDB uses to follow a primary database.
+    ///
+    /// This must be declared after `db` so the RocksDB handle is dropped before the directory.
+    _secondary_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 /// Wrapper struct to ensure low-level database writes go through the correct API.
@@ -394,8 +399,8 @@ enum DbMode {
     /// A read-write primary backed by temporary files that are deleted on drop.
     Ephemeral,
 
-    /// A read-only secondary that follows an existing primary's on-disk state. It owns
-    /// no files and never writes, flushes, or deletes them.
+    /// A read-only secondary that follows an existing primary's on-disk state. It never writes,
+    /// flushes, or deletes primary files; its temporary workspace is deleted on drop.
     ReadOnlySecondary,
 }
 
@@ -593,7 +598,7 @@ impl DiskDb {
         let mut total_size_in_mem = 0;
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
-        let column_families = DiskDb::construct_column_families(db_options, db.path(), []);
+        let column_families = DiskDb::construct_column_families(db_options, db.path(), [], false);
         let mut column_families_log_string = String::from("");
 
         write!(column_families_log_string, "Column families and sizes: ").unwrap();
@@ -649,7 +654,7 @@ impl DiskDb {
     pub(crate) fn export_metrics(&self) {
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
-        let column_families = DiskDb::construct_column_families(db_options, db.path(), []);
+        let column_families = DiskDb::construct_column_families(db_options, db.path(), [], false);
 
         let mut total_disk: u64 = 0;
         let mut total_live: u64 = 0;
@@ -717,7 +722,7 @@ impl DiskDb {
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
         let mut total_size_on_disk = 0;
-        for cf_descriptor in DiskDb::construct_column_families(db_options, db.path(), []) {
+        for cf_descriptor in DiskDb::construct_column_families(db_options, db.path(), [], false) {
             let cf_name = &cf_descriptor.name();
             let cf_handle = db
                 .cf_handle(cf_name)
@@ -989,6 +994,7 @@ impl DiskDb {
         db_options: Options,
         path: &Path,
         column_families_in_code: impl IntoIterator<Item = String>,
+        read_only: bool,
     ) -> impl Iterator<Item = ColumnFamilyDescriptor> {
         // When opening the database in read/write mode, all column families must be opened.
         //
@@ -1000,9 +1006,21 @@ impl DiskDb {
         let column_families_on_disk = DB::list_cf(&db_options, path).unwrap_or_default();
         let column_families_in_code = column_families_in_code.into_iter();
 
+        // A read-only secondary cannot create column families, so naming one the database does
+        // not have fails the open outright. Restricting to what is actually on disk is what lets
+        // read-only tooling inspect a database written by an older version, which is exactly when
+        // some newer column family is missing. Nothing is lost: a column family that does not
+        // exist holds no data to read, and the accessors for one already handle its absence.
+        let missing_is_fatal = !read_only;
+        let on_disk: HashSet<String> = column_families_on_disk.iter().cloned().collect();
+
         column_families_on_disk
+            .clone()
             .into_iter()
-            .chain(column_families_in_code)
+            .chain(
+                column_families_in_code
+                    .filter(move |cf_name| missing_is_fatal || on_disk.contains(cf_name)),
+            )
             .unique()
             .map(move |cf_name: String| {
                 let mut cf_options = db_options.clone();
@@ -1068,20 +1086,28 @@ impl DiskDb {
 
         let db_options = DiskDb::options();
 
-        let column_families =
-            DiskDb::construct_column_families(db_options.clone(), &path, column_families_in_code);
+        let column_families = DiskDb::construct_column_families(
+            db_options.clone(),
+            &path,
+            column_families_in_code,
+            read_only,
+        );
 
-        let db_result = if read_only {
-            // Use a tempfile for the secondary instance cache directory
-            let secondary_config = Config {
-                ephemeral: true,
-                ..config.clone()
-            };
-            let secondary_path =
-                secondary_config.db_path("secondary_state", format_version_in_code.major, network);
-            let create_dir_result = std::fs::create_dir_all(&secondary_path);
+        let secondary_dir = read_only.then(|| {
+            Arc::new(
+                tempfile::Builder::new()
+                    .prefix("zebra-secondary-state-")
+                    .tempdir()
+                    .expect("temporary RocksDB secondary directory can be created"),
+            )
+        });
 
-            info!(?create_dir_result, "creating secondary db directory");
+        let db_result = if let Some(secondary_dir) = &secondary_dir {
+            let secondary_path = secondary_dir.path().to_path_buf();
+            info!(
+                path = ?secondary_path,
+                "created temporary secondary db directory"
+            );
 
             DB::open_cf_descriptors_as_secondary(
                 &db_options,
@@ -1103,6 +1129,7 @@ impl DiskDb {
                     network: network.clone(),
                     mode,
                     db: Arc::new(db),
+                    _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
                 };
 
@@ -1149,6 +1176,12 @@ impl DiskDb {
     /// Returns the `Path` where the files used by this database are located.
     pub fn path(&self) -> &Path {
         self.db.path()
+    }
+
+    /// Returns the temporary RocksDB secondary workspace in tests.
+    #[cfg(test)]
+    pub(crate) fn secondary_path(&self) -> Option<&Path> {
+        self._secondary_dir.as_deref().map(tempfile::TempDir::path)
     }
 
     /// Returns the low-level rocksdb inner database.

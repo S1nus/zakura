@@ -1,6 +1,12 @@
 //! Randomised property tests for the finalized state.
 
-use std::{collections::HashMap, env, error::Error, fs, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    error::Error,
+    fs,
+    sync::{Arc, Mutex},
+};
 
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -31,7 +37,10 @@ use crate::{
         arbitrary::PreparedChain,
         check::anchors::tx_anchors_refer_to_final_treestates,
         non_finalized_state::Chain,
-        read::{sapling_subtrees, sapling_tree},
+        read::{
+            derive_historical_frontiers, historical_tree::HistoricalTreeDerivationError,
+            sapling_subtrees, sapling_tree, HistoricalTreeCache,
+        },
     },
     tests::FakeChainHelper,
     HashOrHeight,
@@ -39,8 +48,8 @@ use crate::{
 
 use super::super::{
     commitment_aux, serve_block_roots, vct::validate_final_frontiers_bytes,
-    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState, HeaderRootAuthUpdate,
-    HeaderWitnessState, HighestCompletedCheckpoint, NextVctBlock,
+    verify_subtrees_against_stored, CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState,
+    HeaderRootAuthUpdate, HeaderWitnessState, HighestCompletedCheckpoint, NextVctBlock,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -1697,6 +1706,56 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 "an index past the last completed subtree stays an empty list, not an error"
             );
 
+            // On-demand derivation rebuilds the absent band from retained block bodies. `U` is 0
+            // here, so every derivation replays from empty genesis frontiers — the cold path.
+            // Each result is accepted only after reproducing the authenticated root, so agreeing
+            // with the legacy node's own per-height trees is what proves the replay is faithful
+            // rather than merely self-consistent.
+            let cache = Mutex::new(HistoricalTreeCache::default());
+            for height in (seed as u32 + 1)..(last as u32) {
+                let height = Height(height);
+                let derived = derive_historical_frontiers(&fast.db, &cache, height, u64::MAX)
+                    .expect("every absent-band height derives from retained bodies");
+
+                prop_assert_eq!(
+                    derived.sapling.root(),
+                    legacy.db.sapling_tree_by_height(&height).expect("the legacy node stores every tree").root(),
+                    "derived Sapling frontier matches the legacy node at {:?}", height
+                );
+                prop_assert_eq!(
+                    derived.orchard.root(),
+                    legacy.db.orchard_tree_by_height(&height).expect("the legacy node stores every tree").root(),
+                    "derived Orchard frontier matches the legacy node at {:?}", height
+                );
+                prop_assert_eq!(
+                    derived.ironwood.root(),
+                    legacy.db.ironwood_tree_by_height(&height).expect("the legacy node stores every tree").root(),
+                    "derived Ironwood frontier matches the legacy node at {:?}", height
+                );
+            }
+
+            // The replay bound is a serving limit: with the memo primed by the loop above, the
+            // last height is already derived, so it costs nothing. A cold height below every memo
+            // entry still has to replay, and refuses rather than running unbounded.
+            prop_assert!(
+                derive_historical_frontiers(&fast.db, &cache, Height(last as u32 - 1), 0).is_ok(),
+                "a memoized height is served without replaying, whatever the bound"
+            );
+            let cold_cache = Mutex::new(HistoricalTreeCache::default());
+            let cold_height = Height(last as u32 - 1);
+            prop_assert_eq!(
+                derive_historical_frontiers(&fast.db, &cold_cache, cold_height, 1).err(),
+                Some(HistoricalTreeDerivationError::ReplayTooLong {
+                    height: cold_height,
+                    // From empty genesis frontiers, reaching `cold_height` replays every block up
+                    // to and including it.
+                    blocks: u64::from(cold_height.0) + 1,
+                    limit: 1,
+                }),
+                "a cold derivation past the replay bound refuses instead of running unbounded"
+            );
+
+
             // Negative: a peer can supply a wrong root exactly at the handoff height,
             // where there is no buffered checkpoint successor to authenticate it. The
             // final embedded frontier still binds the expected root, so the committer
@@ -1801,6 +1860,62 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 bad_ironwood_handoff.db.finalized_tip_height(),
                 Some(Height(last as u32 - 1)),
                 "the refused Ironwood handoff block left state untouched"
+            );
+
+            // The subtree audit must authenticate the replay endpoint even when no subtree
+            // completes in the range. Otherwise corruption after the last boundary (or, as in
+            // this short fixture, before the first boundary) would leave no subtree row to expose
+            // the bad replay.
+            prop_assert_eq!(
+                verify_subtrees_against_stored(&legacy.db, handoff, handoff),
+                Err(HistoricalTreeDerivationError::InvalidReplayRange {
+                    from: handoff,
+                    to: handoff,
+                }),
+                "an empty subtree replay range is rejected"
+            );
+            prop_assert_eq!(
+                verify_subtrees_against_stored(&legacy.db, handoff, Height(seed as u32)),
+                Err(HistoricalTreeDerivationError::InvalidReplayRange {
+                    from: handoff,
+                    to: Height(seed as u32),
+                }),
+                "a reversed subtree replay range is rejected"
+            );
+
+            let subtree_outcome =
+                verify_subtrees_against_stored(&legacy.db, Height(seed as u32), handoff)
+                    .expect("the unmodified replay endpoint matches its authenticated roots");
+            prop_assert_eq!(
+                subtree_outcome,
+                Default::default(),
+                "the short fixture completes no subtrees"
+            );
+
+            let mut corrupted_endpoint = legacy
+                .db
+                .commitment_roots_by_height_range(handoff..=handoff)
+                .into_iter()
+                .next()
+                .expect("the handoff has an authenticated root row");
+            prop_assert_ne!(
+                corrupted_endpoint.sapling_root,
+                Default::default(),
+                "the fixture needs a non-empty Sapling endpoint"
+            );
+            corrupted_endpoint.sapling_root = Default::default();
+            let mut corrupt_endpoint_batch = DiskWriteBatch::new();
+            corrupt_endpoint_batch
+                .insert_body_derived_commitment_roots(&legacy.db, &corrupted_endpoint);
+            legacy
+                .db
+                .write_batch(corrupt_endpoint_batch)
+                .expect("the test corrupts the endpoint root row");
+
+            prop_assert_eq!(
+                verify_subtrees_against_stored(&legacy.db, Height(seed as u32), handoff),
+                Err(HistoricalTreeDerivationError::RootMismatch { height: handoff }),
+                "the subtree audit rejects a replay whose final frontiers are unauthenticated"
             );
     });
 
@@ -2567,11 +2682,66 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                     .is_empty(),
                 "the serving index is dropped below the upgrade height"
             );
+            let below_upgrade = Height(upgrade.0 - 2);
+            let fallback_anchor = Height(upgrade.0 - 1);
+            prop_assert_eq!(
+                derive_historical_frontiers(
+                    &legacy.db,
+                    &Mutex::new(HistoricalTreeCache::default()),
+                    below_upgrade,
+                    u64::MAX,
+                )
+                .err(),
+                Some(HistoricalTreeDerivationError::MissingAnchor {
+                    height: below_upgrade,
+                    anchor: fallback_anchor,
+                }),
+                "a database fallback anchor above the target is refused without underflowing"
+            );
+            prop_assert_eq!(
+                derive_historical_frontiers(
+                    &legacy.db,
+                    &Mutex::new(HistoricalTreeCache::default()),
+                    fallback_anchor,
+                    u64::MAX,
+                )
+                .err(),
+                Some(HistoricalTreeDerivationError::MissingAuthenticatedRoot {
+                    height: fallback_anchor,
+                }),
+                "a zero-replay database fallback is not served without an authenticated root"
+            );
             let stitched = serve_block_roots(&legacy.db, serve_range);
             prop_assert_eq!(
                 stitched,
                 all_trees_reference,
                 "serve_block_roots stitches the trees below U with the index at/above U into one gap-free run"
+            );
+
+            // Rollback does not move the write-once upgrade marker. Model that stale metadata by
+            // moving it above the current tip: a backwards lookup must not relabel the tip tree as
+            // the marker's `U - 1` fallback anchor.
+            let stale_upgrade = Height(last_height.0 + 2);
+            let stale_anchor = Height(stale_upgrade.0 - 1);
+            let mut batch = DiskWriteBatch::new();
+            batch.update_vct_upgrade_marker(&legacy.db, stale_upgrade);
+            legacy
+                .db
+                .write_batch(batch)
+                .expect("simulating a stale post-rollback upgrade marker succeeds");
+            prop_assert_eq!(
+                derive_historical_frontiers(
+                    &legacy.db,
+                    &Mutex::new(HistoricalTreeCache::default()),
+                    stale_anchor,
+                    u64::MAX,
+                )
+                .err(),
+                Some(HistoricalTreeDerivationError::MissingAnchor {
+                    height: stale_anchor,
+                    anchor: stale_anchor,
+                }),
+                "a stale upgrade marker cannot relabel a retained tree above the finalized tip"
             );
     });
 

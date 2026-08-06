@@ -26,11 +26,12 @@ use zakura_chain::{
 use crate::service::finalized_state::{
     disk_db::{DiskWriteBatch, ReadDisk},
     disk_format::{
+        block::HEIGHT_DISK_BYTES,
         chain::{HistoryTreeDecodeError, HistoryTreeParts},
         shielded::CommitmentRootsByHeight,
         RawBytes,
     },
-    IntoDisk, TypedColumnFamily,
+    FromDisk, IntoDisk, TypedColumnFamily,
 };
 
 use super::{highest_completed_checkpoint::HighestCompletedCheckpoint, ZakuraDb};
@@ -43,6 +44,15 @@ pub const HEADER_ROOT_AUTH_FRONTIER: &str = "header_root_auth_frontier";
 
 type CommitmentRootsCf<'cf> = TypedColumnFamily<'cf, Height, CommitmentRootsByHeight>;
 type HeaderRootAuthFrontierCf<'cf> = TypedColumnFamily<'cf, RawBytes, RawBytes>;
+
+/// A root-index row that prevents historical treestate derivation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitmentRootIndexIssue {
+    /// The expected height has no canonical row.
+    Missing(Height),
+    /// The expected height has a noncanonical key or a value that is not a commitment-root row.
+    Malformed(Height),
+}
 
 const LEGACY_FRONTIER_FORMAT_VERSION: u8 = 1;
 const FRONTIER_FORMAT_VERSION: u8 = 2;
@@ -1043,6 +1053,59 @@ impl ZakuraDb {
             batch.insert_unauthenticated_commitment_roots_for_test(self, &roots);
         }
         self.write_batch(batch)
+    }
+
+    /// Returns the first missing or malformed roots row in `range`, if any.
+    ///
+    /// Streams raw index entries instead of materialising rows, so this stays usable across a whole
+    /// fast-synced absent band, where [`Self::commitment_roots_by_height_range`] would build a
+    /// multi-hundred-megabyte vector.
+    pub fn first_commitment_root_issue(
+        &self,
+        range: impl RangeBounds<Height>,
+    ) -> Option<CommitmentRootIndexIssue> {
+        let (start, end) = inclusive_bounds(range)?;
+        let Some(commitment_roots) = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT) else {
+            return Some(CommitmentRootIndexIssue::Missing(start));
+        };
+        let start_key = RawBytes::new_raw_bytes(start.as_bytes().to_vec());
+        let end_key = RawBytes::new_raw_bytes(end.as_bytes().to_vec());
+
+        let mut expected = start;
+        for (key, raw_value) in self.db.zs_forward_range_iter::<_, RawBytes, RawBytes, _>(
+            &commitment_roots,
+            start_key..=end_key,
+        ) {
+            if key.raw_bytes().len() != HEIGHT_DISK_BYTES {
+                return Some(CommitmentRootIndexIssue::Malformed(expected));
+            }
+
+            let height = Height::from_bytes(key.raw_bytes());
+            if height != expected {
+                return Some(CommitmentRootIndexIssue::Missing(expected));
+            }
+            if raw_value.raw_bytes().len()
+                != std::mem::size_of::<<CommitmentRootsByHeight as IntoDisk>::Bytes>()
+            {
+                return Some(CommitmentRootIndexIssue::Malformed(height));
+            }
+
+            // The last height in the range has no successor to expect, and `next()` would
+            // overflow at `Height::MAX`.
+            if height == end {
+                return None;
+            }
+
+            // Unreachable while the `height == end` return above precedes it, but an overflow
+            // must never read as a clean scan.
+            expected = match height.next() {
+                Ok(next) => next,
+                Err(_) => return Some(CommitmentRootIndexIssue::Malformed(height)),
+            };
+        }
+
+        // The iterator ran out before reaching `end`, so the gap starts wherever it stopped.
+        Some(CommitmentRootIndexIssue::Missing(expected))
     }
 
     /// Returns at most `limit` root heights for startup repair.
@@ -2711,5 +2774,116 @@ mod tests {
                 height: Height(1),
             });
         assert_eq!(error.outcome(), AuthenticateHeaderRootsOutcome::Local);
+    }
+
+    /// A gap scan across the absent band is what tells a fast-synced node whether it can derive
+    /// historical treestates at all: every derived frontier is checked against the row at its own
+    /// height, so a single missing row makes that height unservable.
+    #[test]
+    fn first_commitment_root_issue_finds_the_first_missing_height() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+
+        let roots = |height: u32| BlockCommitmentRoots {
+            height: Height(height),
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
+        };
+
+        db.insert_zakura_header_commitment_roots((1..=5).map(roots))
+            .expect("seeding roots succeeds");
+
+        assert_eq!(
+            db.first_commitment_root_issue(Height(1)..=Height(5)),
+            None,
+            "a fully stored range has no gap"
+        );
+        assert_eq!(
+            db.first_commitment_root_issue(Height(1)..=Height(7)),
+            Some(CommitmentRootIndexIssue::Missing(Height(6))),
+            "a range running past the stored rows reports where they stop"
+        );
+        assert_eq!(
+            db.first_commitment_root_issue(Height(0)..=Height(5)),
+            Some(CommitmentRootIndexIssue::Missing(Height(0))),
+            "a missing first height is reported, not skipped"
+        );
+
+        // Punch a hole in the middle: this is the case that would silently serve a wrong
+        // treestate if the scan only checked the range's endpoints.
+        let mut batch = DiskWriteBatch::new();
+        batch.delete_range_commitment_roots_by_height(&db, &Height(3), &Height(4));
+        db.write_batch(batch).expect("deleting a row succeeds");
+
+        assert_eq!(
+            db.first_commitment_root_issue(Height(1)..=Height(5)),
+            Some(CommitmentRootIndexIssue::Missing(Height(3))),
+            "an interior hole is found"
+        );
+        assert_eq!(
+            db.first_commitment_root_issue(Height(4)..=Height(5)),
+            None,
+            "a range above the hole is still gap-free"
+        );
+        assert_eq!(
+            db.first_commitment_root_issue(Height(5)..=Height(4)),
+            None,
+            "an empty range has no gap"
+        );
+    }
+
+    #[test]
+    fn first_commitment_root_issue_validates_raw_entries() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+        let roots = |height: u32| BlockCommitmentRoots {
+            height: Height(height),
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
+        };
+        db.insert_zakura_header_commitment_roots((1..=3).map(roots))
+            .expect("seeding roots succeeds");
+
+        let roots_cf = db
+            .db
+            .cf_handle(COMMITMENT_ROOTS_BY_HEIGHT)
+            .expect("test database has the roots column family");
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&roots_cf, Height(2), RawBytes::new_raw_bytes(vec![0xff]));
+        db.write_batch(batch)
+            .expect("writing a malformed value succeeds");
+
+        assert_eq!(
+            db.first_commitment_root_issue(Height(1)..=Height(3)),
+            Some(CommitmentRootIndexIssue::Malformed(Height(2))),
+            "a malformed value is corrupt input, not a present row"
+        );
+
+        db.insert_zakura_header_commitment_roots([roots(2)])
+            .expect("restoring valid roots succeeds");
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(
+            &roots_cf,
+            RawBytes::new_raw_bytes(vec![0, 0, 1, 0]),
+            RawBytes::new_raw_bytes(vec![0]),
+        );
+        db.write_batch(batch)
+            .expect("writing a noncanonical key succeeds");
+
+        assert_eq!(
+            db.first_commitment_root_issue(Height(1)..=Height(3)),
+            Some(CommitmentRootIndexIssue::Malformed(Height(2))),
+            "a noncanonical key is corrupt input, not a canonical height"
+        );
     }
 }
