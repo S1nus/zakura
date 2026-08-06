@@ -377,17 +377,25 @@ if [ "$no_crates" = 0 ]; then
       continue
     fi
 
-    base_crate_dir="$(dirname "$base_manifest_rel")"
-    if git diff --quiet "$base_tag" -- "$base_crate_dir" "$crate_dir"; then
-      continue
-    fi
-
     # Assumes [package] has a literal version before any other version key;
     # manifests using version.workspace = true would need different parsing.
     base_version="${base_version_by_crate[$crate]:-}"
     if [ -z "$base_version" ]; then
       echo "ERROR: could not read ${crate}'s package version at ${base_tag}." >&2
       exit 1
+    fi
+
+    base_crate_dir="$(dirname "$base_manifest_rel")"
+    if git diff --quiet "$base_tag" -- "$base_crate_dir" "$crate_dir"; then
+      # Stable promotion must de-rc the entire publishable workspace, not only
+      # crates changed since the final release candidate.
+      if [ -z "$suffix" ] && [ "$current_version" != "$(strip_pre "$current_version")" ]; then
+        target="$(strip_pre "$current_version")"
+        add_crate_row "$crate" "$base_version" "$current_version" "$target" \
+          "kept" "unchanged since ${base_tag}; prerelease suffix removed for stable release"
+        add_to_plan "$crate" "$target" "$current_version" "$manifest_rel"
+      fi
+      continue
     fi
 
     if [ "$retarget_unpublished" = 1 ] \
@@ -780,6 +788,36 @@ if [ "${#plan_names[@]}" -gt 0 ]; then
 fi
 assert_version zakura "$version"
 echo "All applied versions match the plan."
+
+# cargo-release's dependent-version = "fix" deliberately keeps compatible
+# requirements. A prerelease requirement is compatible with the corresponding
+# stable version, so stable promotion must normalize internal path requirements
+# explicitly after every package has reached its final workspace version.
+if [ -z "$suffix" ]; then
+  echo
+  echo "==> Normalizing internal prerelease requirements"
+  while IFS=$'\t' read -r manifest_path dependency_key dependency_version; do
+    [ -n "$manifest_path" ] || continue
+    DEPENDENCY="$dependency_key" NEW="$dependency_version" perl -0777 -pi -e '
+      s~
+        (\Q$ENV{DEPENDENCY}\E\s*=\s*\{[^}]*?\bversion\s*=\s*")
+        [^"]*-[^"]*
+        (")
+      ~$1$ENV{NEW}$2~gx
+    ' "$manifest_path"
+  done < <(
+    jq -r '
+      ([.packages[] | {key: .name, value: .version}] | from_entries) as $versions
+      | .packages[]
+      | .manifest_path as $manifest
+      | .dependencies[]
+      | select(.path != null and (.req | test("-")))
+      | [$manifest, (.rename // .name), $versions[.name]]
+      | @tsv
+    ' <<<"$applied" | sort -u
+  )
+  echo "Internal prerelease requirements now use final workspace versions."
+fi
 
 # Requirement rewrites (the workspace's dependent-version = "fix") must stay
 # inside the bump plan: a published crate whose manifest is rewritten but
