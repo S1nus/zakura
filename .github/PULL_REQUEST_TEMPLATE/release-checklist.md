@@ -141,7 +141,10 @@ The preparation workflow rejects a requested tag below the conservative
 release level implied by the pending changelog: `Added`, `Changed`,
 `Deprecated`, or `Removed` entries require at least a minor release; a
 Mainnet network upgrade requires a major release; otherwise the floor is a
-patch release. It never silently changes the requested tag.
+patch release. The documented, explained `allow-patch` waiver can lower
+backwards-compatible `Added` and `Changed` entries to the patch floor without
+changing independently required library crate bumps. It never silently changes
+the requested tag.
 
 - [ ] Generate and commit the stored config for the new version — the
       `last_config_is_stored` acceptance test derives the expected filename

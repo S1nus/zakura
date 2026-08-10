@@ -2,10 +2,80 @@
 
 All notable changes to Zakura are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+As a binary distribution, the `zakura` package uses
+[Semantic Versioning](https://semver.org) as a baseline, with documented
+release-policy exceptions for backwards-compatible additions. These exceptions
+do not apply to published library crates, whose API versions are evaluated
+independently.
 
 ## [Unreleased]
+
+## [1.1.1] - 2026-08-10
+
+### Added
+
+<!-- release-readiness: allow-patch; reason:
+The added APIs and audit command are backwards compatible, and the ZIP 317
+cap increase is a compatible policy adjustment.
+-->
+
+- Added the `audit-historical-treestates` subcommand, which reports whether a state
+  database can rebuild the note commitment trees a verified-commitment-trees fast-synced
+  node is missing, and can walk that range to rebuild and check every tree against the
+  authenticated roots the node already stores
+  ([#552](https://github.com/zakura-core/zakura/pull/552)).
+- Added the public `NoteCommitmentTree::from_frontier` constructor to the Sapling
+  and Orchard note commitment trees (Ironwood inherits it via the `ironwood::tree`
+  re-export), building a tree from an already-validated frontier without
+  re-appending its leaves. `parallel::batch_frontier` already returns bare
+  frontiers publicly; this adds the way back in
+  ([#602](https://github.com/zakura-core/zakura/pull/602)).
+
+### Changed
+
+- Raised Zakura's ZIP 317 block-production weight ratio cap from 4 to 10
+  ([#595](https://github.com/zakura-core/zakura/pull/595)).
+
+### Fixed
+
+- `zakurad` no longer bans a peer for serving a block whose height is above the
+  sync lookahead limit. The ban used the address of the peer that answered the
+  block request, but a far-ahead height comes from whichever peer supplied that
+  hash in an earlier `FindBlocks` response — usually a different peer — so an
+  honest peer could be banned for correctly answering a request this node made.
+  Such blocks are still dropped without restarting sync, and peers that serve
+  blocks with no valid height or that fail consensus verification are still
+  scored
+  ([GHSA-qhr3-cvch-5fh2](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-qhr3-cvch-5fh2)).
+- Fixed read-only state opens failing against databases written by an older version, which
+  made read-only tooling unable to inspect them at all. Opening read-only no longer
+  requires column families the database does not have
+  ([#552](https://github.com/zakura-core/zakura/pull/552)).
+- Chain synchronization now downloads a peer's only unknown block hash from a short
+  `FindBlocks` response, allowing nodes near the chain tip to continue advancing
+  ([#576](https://github.com/zakura-core/zakura/pull/576)).
+
+### Security
+
+- Score and ban peers that gossip invalid blocks. `zakurad` verifies gossiped
+  blocks with the block verifier router, but inbound cleanup only recognized
+  errors from the semantic verifier, so every rejection from the production
+  path left the advertising peer unscored and it could keep supplying invalid
+  blocks over the same connection
+  ([GHSA-8hh2-hrf2-cqf4](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8hh2-hrf2-cqf4)).
+- Reject a downloaded block that builds on `zakurad`'s own chain tip but claims
+  a coinbase height other than one above the tip. A V5+ coinbase `scriptSig` is
+  authorizing data, so it is excluded from the block hash. That makes the height
+  malleable: a peer can rewrite it in an otherwise canonical body and still
+  answer the request for that hash. Such a poisoned body was previously
+  discarded as a benign old block — unattributed, unscored, and not requeued —
+  delaying the newest block until the next discovery round and leaving a mining
+  backend issuing work on an obsolete tip. The check now runs on both block
+  download paths, the syncer and block gossip. On each, the supplying peer is
+  scored for a ban and the block hash is re-requested straight away under its own
+  bounded retry budget, rather than waiting for the next discovery round
+  ([GHSA-g95h-hw6g-pvgv](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-g95h-hw6g-pvgv)).
 
 ## [1.1.0] - 2026-08-05
 

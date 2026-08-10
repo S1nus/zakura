@@ -18,6 +18,12 @@ import changelog
 
 BLOCKS_PER_DAY = 1152
 MINOR_CATEGORIES = {"Added", "Changed", "Deprecated", "Removed"}
+PATCH_WAIVABLE_CATEGORIES = {"Added", "Changed"}
+PATCH_WAIVER_PREFIX = "<!-- release-readiness: allow-patch"
+PATCH_WAIVER = re.compile(
+    r"<!--\s*release-readiness:\s*allow-patch\s*;\s*reason:\s*(?P<reason>[^<>]*\S)\s*-->",
+    re.IGNORECASE,
+)
 NETWORK_UPGRADE = re.compile(r"\b(?:mainnet\s+)?network upgrade\b", re.IGNORECASE)
 VERSION = re.compile(
     r"^(?P<major>0|[1-9][0-9]*)\."
@@ -112,11 +118,36 @@ def release_entries(repo_root: Path, base_version: str) -> dict[str, list[str]]:
     return entries
 
 
+def patch_waiver_reason(entries: dict[str, list[str]]) -> str | None:
+    combined = "\n".join(body for bodies in entries.values() for body in bodies)
+    markers = list(PATCH_WAIVER.finditer(combined))
+    if PATCH_WAIVER_PREFIX in combined.lower() and not markers:
+        raise ReadinessError(
+            "allow-patch waiver must use "
+            "'<!-- release-readiness: allow-patch; reason: ... -->'"
+        )
+    if len(markers) > 1:
+        raise ReadinessError("release changelog must contain at most one allow-patch waiver")
+    if not markers:
+        return None
+
+    non_waivable = sorted(
+        MINOR_CATEGORIES.intersection(entries) - PATCH_WAIVABLE_CATEGORIES
+    )
+    if non_waivable:
+        raise ReadinessError(
+            "allow-patch waiver cannot cover changelog categories: "
+            + ", ".join(non_waivable)
+        )
+    return " ".join(markers[0].group("reason").split())
+
+
 def minimum_release(
     base: Version, target: Version, entries: dict[str, list[str]]
 ) -> tuple[str, CoreVersion, list[str]]:
     categories = sorted(entries)
     combined = "\n".join(body for bodies in entries.values() for body in bodies)
+    patch_waiver = patch_waiver_reason(entries)
 
     # Later candidates and the stable release keep the core chosen by the
     # first candidate. New entries during the candidate cycle are folded into
@@ -131,6 +162,9 @@ def minimum_release(
     if NETWORK_UPGRADE.search(combined):
         level = "major"
         minimum = CoreVersion(base.core.major + 1, 0, 0)
+    elif patch_waiver is not None:
+        level = "patch"
+        minimum = CoreVersion(base.core.major, base.core.minor, base.core.patch + 1)
     elif MINOR_CATEGORIES.intersection(entries):
         level = "minor"
         minimum = CoreVersion(base.core.major, base.core.minor + 1, 0)
@@ -164,6 +198,7 @@ def version_report(repo_root: Path, base_version: str, release_tag: str) -> dict
         "minimum_level": level,
         "minimum_version": str(minimum),
         "categories": categories,
+        "patch_waiver_reason": patch_waiver_reason(entries),
         "changelog": context,
     }
 
@@ -257,6 +292,63 @@ class SelfTests(unittest.TestCase):
                 parse_version("1.0.5"),
                 parse_version("1.0.6-rc0"),
                 {"Added": ["- Added an RPC."]},
+            )
+
+    def test_explained_waiver_allows_patch_for_added_and_changed(self) -> None:
+        level, minimum, _ = minimum_release(
+            parse_version("1.0.5"),
+            parse_version("1.0.6"),
+            {
+                "Added": [
+                    "<!-- release-readiness: allow-patch; reason: "
+                    "All additions are backwards compatible. -->\n"
+                    "- Added an API."
+                ],
+                "Changed": ["- Raised a compatible operational limit."],
+            },
+        )
+        self.assertEqual((level, str(minimum)), ("patch", "1.0.6"))
+
+    def test_waiver_requires_an_explanation(self) -> None:
+        with self.assertRaisesRegex(ReadinessError, "must use"):
+            minimum_release(
+                parse_version("1.0.5"),
+                parse_version("1.0.6"),
+                {
+                    "Added": [
+                        "<!-- release-readiness: allow-patch -->\n"
+                        "- Added an API."
+                    ]
+                },
+            )
+
+    def test_waiver_cannot_cover_deprecated_or_removed_entries(self) -> None:
+        with self.assertRaisesRegex(ReadinessError, "cannot cover.*Removed"):
+            minimum_release(
+                parse_version("1.0.5"),
+                parse_version("1.0.6"),
+                {
+                    "Added": [
+                        "<!-- release-readiness: allow-patch; reason: "
+                        "The addition is backwards compatible. -->\n"
+                        "- Added an API."
+                    ],
+                    "Removed": ["- Removed an API."],
+                },
+            )
+
+    def test_waiver_cannot_bypass_network_upgrade_major_floor(self) -> None:
+        with self.assertRaisesRegex(ReadinessError, "major floor"):
+            minimum_release(
+                parse_version("1.4.2"),
+                parse_version("1.4.3"),
+                {
+                    "Added": [
+                        "<!-- release-readiness: allow-patch; reason: "
+                        "The API addition is backwards compatible. -->\n"
+                        "- Added the Mainnet Network Upgrade."
+                    ]
+                },
             )
 
     def test_fixed_category_allows_patch_target(self) -> None:

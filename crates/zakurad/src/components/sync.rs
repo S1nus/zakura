@@ -94,6 +94,16 @@ fn block_error_peer_label(error: &BlockDownloadVerifyError, expose_peer_addresse
 /// accountability in `zakura-network` disconnects such peers so this bound is rarely reached.
 const MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 8;
 
+/// Controls how many times the syncer immediately requeues a required block after a peer supplies
+/// a body whose coinbase height contradicts our own tip
+/// ([`BlockDownloadVerifyError::TipChildHeightMismatch`]).
+///
+/// A poisoned body satisfies the network request without delivering a usable block, so the hash
+/// must be requeued rather than left for the next discovery round — otherwise a peer can keep the
+/// node, and any mining backend it feeds, off the newest block. Each rejected body also scores its
+/// supplier for a ban; this budget bounds the loop while that ban is still batched.
+const POISONED_BLOCK_RETRY_LIMIT: usize = MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT;
+
 /// Controls how many times the syncer retries a required block that the peer set reports as missing
 /// from *all* current peers (`NotFoundKind::Registry`) before giving up on the round.
 ///
@@ -785,6 +795,10 @@ where
     /// `notfound` ([`NotFoundKind::Response`]). Bounded by [`MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT`].
     missing_block_retry_counts: HashMap<block::Hash, usize>,
 
+    /// Queue-level retry counts for required blocks whose body claimed a coinbase height that
+    /// contradicts our own tip. Bounded by [`POISONED_BLOCK_RETRY_LIMIT`].
+    poisoned_block_retry_counts: HashMap<block::Hash, usize>,
+
     /// Queue-level retry counts for block hashes missing from *all* current peers
     /// ([`NotFoundKind::Registry`]). Kept separate from [`Self::missing_block_retry_counts`] so the
     /// larger registry budget ([`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`]) isn't defeated by an
@@ -952,6 +966,7 @@ where
             prospective_tips: HashSet::new(),
             recent_syncs,
             missing_block_retry_counts: HashMap::new(),
+            poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
             past_lookahead_limit_receiver,
@@ -1223,6 +1238,7 @@ where
     async fn try_to_sync(&mut self) -> Result<(), Report> {
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
+        self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
         let state_tip = self.latest_chain_tip.best_tip_height();
@@ -2134,11 +2150,18 @@ where
                     .try_send((advertiser_addr, error.misbehavior_score()));
             }
 
-            Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+            // Unlike `AboveLookaheadHeightLimit` below, this one *is* scored. The
+            // claimed height is checked against our own committed tip, so the body
+            // is provably malformed, and the peer being scored is the one that
+            // served that body — not a peer that merely supplied a hash. There is
+            // no misattribution to avoid here.
+            Err(BlockDownloadVerifyError::TipChildHeightMismatch {
                 advertiser_addr: Some(advertiser_addr),
                 ..
             }) => {
-                let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
+                let _ = self
+                    .misbehavior_sender
+                    .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
             }
 
             Err(BlockDownloadVerifyError::InvalidHeight {
@@ -2148,13 +2171,28 @@ where
                 let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
             }
 
+            // `AboveLookaheadHeightLimit` is deliberately unscored. Its
+            // `advertiser_addr` is the peer that served a block this node
+            // requested, but the height came from whichever peer supplied the
+            // hash in a `FindBlocks` response. Those are usually different
+            // peers, and `Response::BlockHashes` carries no address, so the
+            // responsible peer is unknown here. The download task has already
+            // discarded the block without verifying it; scoring the server as
+            // well would ban a peer for honestly answering our own request.
             Err(_) => {}
         };
 
         Self::handle_response(response, self.expose_peer_addresses)
     }
 
-    /// Handles a downloaded block response, requeueing required missing block hashes.
+    /// Handles a downloaded block response, requeueing required missing or poisoned block hashes.
+    ///
+    /// A [`BlockDownloadVerifyError::TipChildHeightMismatch`] means a peer returned a body under
+    /// the correct block hash but with a rewritten coinbase height. That satisfies the network
+    /// request without delivering a usable block, so the supplier is scored for a ban and the hash
+    /// is requeued immediately, bounded by [`POISONED_BLOCK_RETRY_LIMIT`]. Without the requeue the
+    /// newest block would wait for the next discovery round, which is exactly the delay the attack
+    /// is trying to cause.
     ///
     /// The block download service already retries each `BlocksByHash` request and may hedge it to
     /// another peer. If a peer still responds `notfound` ([`NotFoundKind::Response`]), the syncer
@@ -2177,8 +2215,62 @@ where
     ) -> Result<(), Report> {
         if let Ok((_height, hash)) = response.as_ref() {
             self.missing_block_retry_counts.remove(hash);
+            self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
+        }
+
+        if let Some((hash, advertiser_addr)) = response.as_ref().err().and_then(|error| match error
+        {
+            BlockDownloadVerifyError::TipChildHeightMismatch {
+                hash,
+                advertiser_addr,
+                ..
+            } => Some((*hash, *advertiser_addr)),
+            _ => None,
+        }) {
+            let retry_count = self.poisoned_block_retry_counts.entry(hash).or_default();
+
+            if *retry_count < POISONED_BLOCK_RETRY_LIMIT {
+                *retry_count += 1;
+
+                // Ban the supplier before requeueing, so the replacement request is less likely
+                // to route back to it. The peer set batches misbehavior updates, so the ban may
+                // not have landed yet; the retry budget bounds the loop if it hasn't.
+                if let Some(advertiser_addr) = advertiser_addr {
+                    let _ = self
+                        .misbehavior_sender
+                        .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+                }
+
+                info!(
+                    ?hash,
+                    retry_attempt = *retry_count,
+                    retry_limit = POISONED_BLOCK_RETRY_LIMIT,
+                    "sync block body claimed the wrong height for our tip child, \
+                     retrying required block"
+                );
+                metrics::counter!("sync.poisoned.block.requeued.count").increment(1);
+
+                match self.downloads.download_and_verify(hash).await {
+                    Ok(())
+                    | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
+                        return Ok(())
+                    }
+                    Err(error) => self.handle_block_response(Err(error))?,
+                }
+
+                return Ok(());
+            }
+
+            self.poisoned_block_retry_counts.remove(&hash);
+
+            warn!(
+                ?hash,
+                retry_limit = POISONED_BLOCK_RETRY_LIMIT,
+                "poisoned sync block retry budget exhausted, restarting sync"
+            );
+            metrics::counter!("sync.poisoned.block.retry.limit.count").increment(1);
         }
 
         if let Some((hash, kind)) = response
@@ -2421,6 +2513,17 @@ where
                      dropping the block and continuing sync"
                 );
                 false
+            }
+            BlockDownloadVerifyError::TipChildHeightMismatch { .. } => {
+                // Only reached once the requeue budget is exhausted: the required hash still
+                // hasn't produced a usable body, so restart to get fresh tips and peers rather
+                // than leaving the newest block unresolved.
+                warn!(
+                    error = ?e,
+                    %peer,
+                    "peers kept supplying a poisoned body for our tip child, restarting sync"
+                );
+                true
             }
             BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. } => {
                 debug!(

@@ -90,6 +90,19 @@ is in
 - A change to a tunable parameter gets a row in `docs/changelog/params.md` _in
   addition to_ a changelog entry when it is user-visible.
 
+`Added` and `Changed` entries normally require a minor `zakura` release. A
+release may intentionally keep a patch version when every such entry is
+backwards compatible and the release team records one explanation in a
+fragment:
+
+```markdown
+<!-- release-readiness: allow-patch; reason: All additions and behavior changes are backwards compatible. -->
+```
+
+The waiver applies to the node release level only; changed library crates still
+receive their independently required SemVer bumps. It cannot waive
+`Deprecated`, `Removed`, or Mainnet network-upgrade entries.
+
 ## Library crates
 
 The repository does not maintain per-crate changelogs. Version bumps for

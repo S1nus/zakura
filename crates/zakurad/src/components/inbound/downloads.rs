@@ -28,9 +28,27 @@ use zakura_chain::{
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
-use crate::components::sync::MIN_CONCURRENCY_LIMIT;
+use crate::components::{auth_download_height::tip_child_mismatch, sync::MIN_CONCURRENCY_LIMIT};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// A gossiped block claims our best tip as its parent, but its coinbase height is not one
+/// above the tip height.
+///
+/// V5+ coinbase `scriptSig`s are not covered by the mined transaction ID, the transaction
+/// merkle root, or the block hash, so a peer can rewrite the claimed height of an otherwise
+/// canonical body without changing the advertised hash. A tip child's real height is known
+/// from our own committed tip, so a mismatch is definitively a poisoned body.
+///
+/// This is a distinct type rather than a string error so [`super::Inbound`] can score the
+/// supplying peer for it.
+#[derive(Copy, Clone, Debug, thiserror::Error)]
+#[error("gossiped tip child claimed height {height:?} instead of {expected_height:?}: {hash:?}")]
+pub struct GossipedTipChildHeightMismatch {
+    pub height: block::Height,
+    pub expected_height: block::Height,
+    pub hash: block::Hash,
+}
 
 /// Source key used for inbound block download ordering.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -119,6 +137,18 @@ pub const MAX_INBOUND_CONCURRENCY: usize = 200;
 /// advertiser source and are not counted against this cap.
 pub const MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER: usize = 5;
 
+/// The maximum number of times a gossiped block hash is re-requested after a peer supplies a
+/// body whose coinbase height contradicts our own tip.
+///
+/// A poisoned response satisfies the gossip request without delivering a usable block, and it
+/// occupies the per-hash dedupe slot while it is outstanding — so honest peers' `inv`s for the
+/// same hash were already dropped as [`DownloadAction::AlreadyQueued`]. Without a re-request the
+/// block waits for the syncer's next round, which is the delay this attack aims to cause.
+///
+/// The re-request is bounded because it can be poisoned in turn: the supplying peer's ban is
+/// queued rather than applied immediately, so a replacement request can still route back to it.
+pub const POISONED_GOSSIP_BLOCK_RETRY_LIMIT: usize = 3;
+
 /// The action taken in response to a peer's gossiped block hash.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DownloadAction {
@@ -135,6 +165,70 @@ pub enum DownloadAction {
     /// The sync service should discover this block later, when we are closer
     /// to the tip. The queue's capacity is [`Downloads::full_verify_concurrency_limit`].
     FullQueue,
+}
+
+/// Per-hash re-request budgets for gossiped blocks rejected as poisoned, scoped to one tip.
+///
+/// The counts and the tip they belong to are paired here because neither is meaningful alone:
+/// a count only bounds anything while it is read against the tip it was recorded under.
+///
+/// # Lifetime
+///
+/// An exhausted budget is *not* released on exhaustion. Doing so would re-arm it, letting a peer
+/// buy a fresh set of re-requests by poisoning the same hash again. Budgets are released in
+/// exactly two places:
+///
+/// - [`Self::release`], when the block is finally downloaded — the only outcome that means the
+///   budget did its job.
+/// - [`Self::consume`], for *every* hash, on the first call after the tip moves.
+///
+/// The second is what actually bounds the map, because gossip usually is not the path that
+/// resolves the block: exhaustion explicitly leaves it to the syncer, whose downloads never
+/// reach [`Self::release`]. It is sound because this check only ever fires for children of the
+/// current tip, so an entry recorded under an older tip could never be read again.
+///
+/// That is also why a tip change cannot re-arm an exhausted budget: once the tip moves, the
+/// exhausted hash is no longer a tip child and can never produce a mismatch, so its fresh budget
+/// is unreachable. The one exception is a reorg back to the original tip, which costs the
+/// attacker further bannable addresses to exploit.
+///
+/// The clear is lazy — it happens on the next rejection, not when the tip moves — so a node whose
+/// attacker has stopped keeps one tip's worth of entries until the next rejection or process exit.
+#[derive(Debug, Default)]
+struct PoisonedRetryBudgets {
+    /// Re-requests already spent, keyed by block hash.
+    counts: HashMap<block::Hash, usize>,
+
+    /// The tip [`Self::counts`] is scoped to.
+    tip: Option<block::Hash>,
+}
+
+impl PoisonedRetryBudgets {
+    /// Spends one re-request from `hash`'s budget under `tip_hash`, returning the attempt number.
+    ///
+    /// Returns `None` when the budget is exhausted, leaving the block to the syncer. Discards
+    /// every budget first if `tip_hash` differs from the one they were recorded under.
+    fn consume(&mut self, hash: block::Hash, tip_hash: Option<block::Hash>) -> Option<usize> {
+        if self.tip != tip_hash {
+            self.counts.clear();
+            self.tip = tip_hash;
+        }
+
+        let spent = self.counts.entry(hash).or_default();
+
+        if *spent >= POISONED_GOSSIP_BLOCK_RETRY_LIMIT {
+            return None;
+        }
+
+        *spent += 1;
+
+        Some(*spent)
+    }
+
+    /// Releases `hash`'s budget, because the block was downloaded.
+    fn release(&mut self, hash: &block::Hash) {
+        self.counts.remove(hash);
+    }
 }
 
 /// Manages download and verification of blocks gossiped to this peer.
@@ -196,6 +290,9 @@ where
 
     /// Number of admitted tasks, active or waiting, per source.
     source_counts: HashMap<AdvertiserSource, usize>,
+
+    /// Re-request budgets for gossiped hashes whose body was rejected as poisoned.
+    poisoned_retries: PoisonedRetryBudgets,
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
@@ -226,7 +323,11 @@ where
         if let Some(join_result) = ready!(this.pending.as_mut().poll_next(cx)) {
             let (result, hash) =
                 match join_result.expect("block download and verify tasks must not panic") {
-                    Ok(hash) => (Ok(hash), hash),
+                    Ok(hash) => {
+                        // The block finally arrived, so its poisoned-retry budget is spent.
+                        this.poisoned_retries.release(&hash);
+                        (Ok(hash), hash)
+                    }
                     Err((e, hash, advertiser_addr)) => (Err((e, advertiser_addr)), hash),
                 };
             if let Some((_, Some(source))) = this.cancel_handles.remove(&hash) {
@@ -295,7 +396,90 @@ where
             cancel_handles: HashMap::new(),
             source_locks: HashMap::new(),
             source_counts: HashMap::new(),
+            poisoned_retries: PoisonedRetryBudgets::default(),
         }
+    }
+
+    /// Re-request a gossiped block whose body was rejected as poisoned, from any peer.
+    ///
+    /// The replacement is requested without a download source, so it routes through the peer
+    /// set's inventory rather than back to the peer that supplied the poisoned body. That peer's
+    /// ban is only queued at this point, so the request can still reach it — hence the
+    /// [`POISONED_GOSSIP_BLOCK_RETRY_LIMIT`] budget, which is consumed per hash.
+    ///
+    /// Returns `None` once the budget for `hash` is exhausted, leaving the block to the syncer.
+    /// Exhaustion is sticky for as long as the entry lives: a peer cannot buy a fresh set of
+    /// re-requests by poisoning the same hash again.
+    ///
+    /// Budgets are scoped to the tip they were recorded against, and dropped on the first
+    /// rejection after the tip moves — the clear is lazy, so if the attack simply stops, one
+    /// tip's worth of entries stays resident until the next rejection or process exit. That is
+    /// the natural lifetime: this check only ever fires for children of the *current* tip, so an
+    /// entry from an older tip could never be consulted again. It also bounds the map without
+    /// relying on the gossip path resolving the block, which it usually does not — the syncer
+    /// commonly downloads it instead, which is what exhaustion explicitly asks for, and the
+    /// syncer's downloads never reach the release point in this stream's `poll_next`.
+    ///
+    /// Clearing on a tip change is not a way to re-arm an exhausted budget. Once the tip moves,
+    /// the exhausted hash is no longer a child of it, so it can never produce a mismatch again
+    /// and its fresh budget is unreachable. The one exception is a reorg back to the original
+    /// tip, which costs the attacker further bannable addresses to exploit.
+    ///
+    /// The tip is read here, not when the body was rejected, so the two can disagree — most often
+    /// because the syncer committed that very block in between. The consequences are contained:
+    /// the entry is filed under a tip the hash is not a child of, where it is dead weight until
+    /// the next clear, and the replacement download is dispatched for a block that may already be
+    /// committed. The latter is benign only because `download_and_verify` queries the state for
+    /// the block before issuing any network request, so it short-circuits without touching a
+    /// peer. That ordering is a real dependency of this design.
+    ///
+    /// Returns the [`DownloadAction`] otherwise. The queue bounds can refuse the replacement, in
+    /// which case the budget is spent without dispatching anything; that case is logged here, so
+    /// callers do not need to inspect the result.
+    pub fn retry_poisoned(&mut self, hash: block::Hash) -> Option<DownloadAction> {
+        // The tip is read here, later than the rejection read it, so the two can disagree —
+        // usually because the syncer committed the block in between. See the method docs.
+        let tip_hash = self.latest_chain_tip.best_tip_hash();
+
+        let Some(retry_attempt) = self.poisoned_retries.consume(hash, tip_hash) else {
+            warn!(
+                ?hash,
+                retry_limit = POISONED_GOSSIP_BLOCK_RETRY_LIMIT,
+                "poisoned gossip block retry budget exhausted, leaving the block to the syncer"
+            );
+            metrics::counter!("gossip.poisoned.block.retry.limit.count").increment(1);
+
+            return None;
+        };
+
+        // Report what actually happened, not what was attempted: the replacement can be refused
+        // by the queue bounds, which spends the budget without dispatching anything.
+        let action = self.download_and_verify(hash, None);
+
+        match action {
+            DownloadAction::AddedToQueue => {
+                info!(
+                    ?hash,
+                    retry_attempt,
+                    retry_limit = POISONED_GOSSIP_BLOCK_RETRY_LIMIT,
+                    "gossiped block body was poisoned, re-requesting the block from another peer"
+                );
+                metrics::counter!("gossip.poisoned.block.requeued.count").increment(1);
+            }
+            DownloadAction::AlreadyQueued | DownloadAction::FullQueue => {
+                warn!(
+                    ?hash,
+                    ?action,
+                    retry_attempt,
+                    retry_limit = POISONED_GOSSIP_BLOCK_RETRY_LIMIT,
+                    "poisoned gossip block re-request was refused, \
+                     spending the retry budget without dispatching"
+                );
+                metrics::counter!("gossip.poisoned.block.requeue.refused.count").increment(1);
+            }
+        }
+
+        Some(action)
     }
 
     /// Queue a block for download and verification.
@@ -494,6 +678,12 @@ where
             // that will timeout before being verified, and low blocks that can never be finalized.
             let tip_height = latest_chain_tip.best_tip_height();
 
+            // Read separately from `tip_height`, and used only by the new tip-child height check
+            // below. Deriving `tip_height` from this pair instead would couple the existing
+            // lookahead and behind-tip policies to hash availability: a chain tip reporting a
+            // height but not yet a hash would fall into the no-tip regime.
+            let best_tip = latest_chain_tip.best_tip_height_and_hash();
+
             let max_lookahead_height = if let Some(tip_height) = tip_height {
                 let lookahead = HeightDiff::try_from(full_verify_concurrency_limit)
                     .expect("fits in HeightDiff");
@@ -531,6 +721,37 @@ where
                     BoxError::from("gossiped block with no height")
                 })
                 .map_err(|e| (e, None))?;
+
+            // Security: authenticate the claimed coinbase height against our own tip before the
+            // height policies below run. See `crate::components::auth_download_height`.
+            //
+            // This matters more here than on the syncer path: an `inv` for the new tip normally
+            // reaches gossip before the syncer asks for it, and `download_and_verify` drops
+            // honest peers' `inv`s for the same hash as `AlreadyQueued` while a download is
+            // outstanding. So a single poisoned response can consume the node's only chance at
+            // the new block until the next sync round, which is what leaves a mining backend
+            // issuing work on an obsolete tip.
+            if let Some(expected_height) =
+                tip_child_mismatch(block.header.previous_block_hash, block_height, best_tip)
+            {
+                debug!(
+                    ?hash,
+                    ?block_height,
+                    ?expected_height,
+                    "gossiped tip child claimed the wrong coinbase height: \
+                     dropped downloaded block"
+                );
+                metrics::counter!("gossip.tip.child.height.mismatch.count").increment(1);
+
+                Err((
+                    BoxError::from(GossipedTipChildHeightMismatch {
+                        height: block_height,
+                        expected_height,
+                        hash,
+                    }),
+                    advertiser_addr,
+                ))?;
+            }
 
             if block_height > max_lookahead_height {
                 debug!(
@@ -609,8 +830,10 @@ mod tests {
     use futures::StreamExt as _;
     use std::{collections::HashSet, future, time::Duration};
     use tower::{service_fn, util::BoxCloneService};
-    use zakura_chain::{parameters::Network, serialization::ZcashDeserializeInto};
+    use zakura_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
     use zakura_network::InventoryResponse::Available;
+
+    use crate::components::auth_download_height::poison_coinbase_height;
 
     type PendingNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
     type PendingVerifier = BoxCloneService<zakura_consensus::Request, block::Hash, BoxError>;
@@ -636,6 +859,13 @@ mod tests {
     fn pending_downloads() -> Downloads<PendingNetwork, PendingVerifier, PendingState> {
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
+        pending_downloads_with_tip(latest_chain_tip)
+    }
+
+    /// [`pending_downloads`], with a caller-supplied chain tip.
+    fn pending_downloads_with_tip(
+        latest_chain_tip: zs::LatestChainTip,
+    ) -> Downloads<PendingNetwork, PendingVerifier, PendingState> {
         Downloads::new(
             MAX_INBOUND_CONCURRENCY,
             false,
@@ -1083,5 +1313,283 @@ mod tests {
         assert_eq!(downloads.queue_len(), 0);
 
         Ok(())
+    }
+
+    /// Builds a [`zs::LatestChainTip`] reporting `height` and `hash` as the best tip.
+    ///
+    /// The tip block's contents are irrelevant to the height check, so an arbitrary block is
+    /// reused and its identity fields overridden.
+    fn chain_tip_at(
+        height: block::Height,
+        hash: block::Hash,
+    ) -> (zs::ChainTipSender, zs::LatestChainTip) {
+        let any_block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .expect("test vector deserializes");
+
+        let mut tip_block: zs::ChainTipBlock =
+            zs::SemanticallyVerifiedBlock::from(any_block).into();
+        tip_block.hash = hash;
+        tip_block.height = height;
+
+        let (mut tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        tip_sender.set_finalized_tip(tip_block);
+
+        (tip_sender, latest_chain_tip)
+    }
+
+    /// Moves the tip reported by a [`chain_tip_at`] sender.
+    fn set_tip(tip_sender: &mut zs::ChainTipSender, height: block::Height, hash: block::Hash) {
+        let any_block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .expect("test vector deserializes");
+
+        let mut tip_block: zs::ChainTipBlock =
+            zs::SemanticallyVerifiedBlock::from(any_block).into();
+        tip_block.hash = hash;
+        tip_block.height = height;
+
+        tip_sender.set_finalized_tip(tip_block);
+    }
+
+    /// Builds a gossip [`Downloads`] whose network service returns `block` for any request.
+    fn downloads_returning(
+        block: Arc<Block>,
+        advertiser_addr: PeerSocketAddr,
+        latest_chain_tip: zs::LatestChainTip,
+    ) -> Downloads<PendingNetwork, PendingVerifier, PendingState> {
+        Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            BoxCloneService::new(service_fn(move |_request| {
+                let block = block.clone();
+                async move {
+                    Ok(zn::Response::Blocks(vec![Available((
+                        block,
+                        Some(advertiser_addr),
+                    ))]))
+                }
+            })),
+            BoxCloneService::new(service_fn(|_request| {
+                future::pending::<Result<block::Hash, BoxError>>()
+            })),
+            // The download path asks the state whether it already has the block, before any
+            // height check runs. Answering `None` lets the download proceed.
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+        )
+    }
+
+    /// The gossip path must reject a tip child whose coinbase height was rewritten, and keep the
+    /// advertiser so the peer can be scored.
+    ///
+    /// This is the path that matters most for miners: an `inv` for the new tip normally arrives
+    /// here first, and honest peers' `inv`s for the same hash are dropped as `AlreadyQueued`
+    /// while the poisoned download is outstanding.
+    #[tokio::test]
+    async fn gossiped_tip_child_rejects_poisoned_coinbase_height() {
+        let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .expect("test vector deserializes");
+        let canonical_hash = canonical.hash();
+        let parent_hash = canonical.header.previous_block_hash;
+
+        let poisoned = poison_coinbase_height(&canonical, block::Height(1));
+        assert_eq!(
+            poisoned.hash(),
+            canonical_hash,
+            "the poisoned body still answers for the advertised hash"
+        );
+
+        let advertiser_addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+        let (_tip_sender, latest_chain_tip) = chain_tip_at(block::Height(1_687_106), parent_hash);
+
+        let mut downloads = downloads_returning(poisoned, advertiser_addr, latest_chain_tip);
+
+        assert_eq!(
+            downloads.download_and_verify(
+                canonical_hash,
+                Some(zn::PeerSource::LegacySocket(advertiser_addr)),
+            ),
+            DownloadAction::AddedToQueue
+        );
+
+        let (error, addr) = downloads
+            .next()
+            .await
+            .expect("the download task produces a result")
+            .expect_err("a poisoned tip child must be rejected");
+
+        assert_eq!(
+            addr,
+            Some(advertiser_addr),
+            "the advertiser must be preserved so Inbound can score the peer"
+        );
+
+        let mismatch = error
+            .downcast_ref::<GossipedTipChildHeightMismatch>()
+            .expect("the error must be the typed mismatch that Inbound scores");
+
+        assert_eq!(mismatch.height, block::Height(1));
+        assert_eq!(mismatch.expected_height, block::Height(1_687_107));
+        assert_eq!(mismatch.hash, canonical_hash);
+    }
+
+    /// A gossiped block that is not a tip child keeps the existing behind-tip policy, and stays
+    /// unattributed as before.
+    #[tokio::test]
+    async fn gossiped_non_tip_child_keeps_the_behind_tip_policy() {
+        let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .expect("test vector deserializes");
+        let block1_hash = block1.hash();
+
+        let advertiser_addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+        // A tip far ahead of block 1, which is not block 1's parent.
+        let (_tip_sender, latest_chain_tip) = chain_tip_at(block::Height(1_000_000), hash(0x11));
+
+        let mut downloads = downloads_returning(block1, advertiser_addr, latest_chain_tip);
+
+        assert_eq!(
+            downloads.download_and_verify(
+                block1_hash,
+                Some(zn::PeerSource::LegacySocket(advertiser_addr)),
+            ),
+            DownloadAction::AddedToQueue
+        );
+
+        let (error, addr) = downloads
+            .next()
+            .await
+            .expect("the download task produces a result")
+            .expect_err("a block behind the finalized tip is still dropped");
+
+        assert!(
+            error
+                .downcast_ref::<GossipedTipChildHeightMismatch>()
+                .is_none(),
+            "a non-tip-child must not be reported as a height mismatch"
+        );
+        assert_eq!(addr, None, "the behind-tip policy is unchanged");
+    }
+
+    /// The poisoned-body re-request is bounded, so a second attacker cannot keep the gossip
+    /// path re-requesting the same hash indefinitely.
+    #[tokio::test]
+    async fn poisoned_retries_are_bounded_per_hash() {
+        let mut downloads = pending_downloads();
+        let poisoned_hash = hash(1);
+
+        assert_eq!(
+            downloads.retry_poisoned(poisoned_hash),
+            Some(DownloadAction::AddedToQueue),
+            "the first retry dispatches a replacement download"
+        );
+
+        // The replacement is still in flight, so further retries are refused by the per-hash
+        // dedupe. They still spend the budget, which is why `retry_poisoned` logs the action
+        // rather than claiming the block was re-requested.
+        for attempt in 2..=POISONED_GOSSIP_BLOCK_RETRY_LIMIT {
+            assert_eq!(
+                downloads.retry_poisoned(poisoned_hash),
+                Some(DownloadAction::AlreadyQueued),
+                "retry {attempt} is within the budget, but is refused while one is in flight"
+            );
+        }
+
+        assert!(
+            downloads.retry_poisoned(poisoned_hash).is_none(),
+            "the block is left to the syncer once the budget is exhausted"
+        );
+
+        // The budget is per hash, so an unrelated block is unaffected.
+        assert!(
+            downloads.retry_poisoned(hash(2)).is_some(),
+            "a different hash keeps its own budget"
+        );
+
+        // Exhaustion is sticky. Clearing the entry here would let a peer buy three more
+        // re-requests by poisoning the same hash again.
+        for _ in 0..3 {
+            assert!(
+                downloads.retry_poisoned(poisoned_hash).is_none(),
+                "an exhausted budget must not re-arm for the same hash"
+            );
+        }
+    }
+
+    /// Poisoned-retry budgets are dropped when the tip moves.
+    ///
+    /// The syncer, not gossip, commonly resolves a block whose gossip budget was exhausted —
+    /// that is exactly what exhaustion asks for — and the syncer's downloads never reach this
+    /// stream's `poll_next`. Without tip scoping those entries would accumulate for the life of
+    /// the process.
+    #[tokio::test]
+    async fn poisoned_retry_budgets_are_scoped_to_the_tip() {
+        let (mut tip_sender, latest_chain_tip) = chain_tip_at(block::Height(100), hash(0xAA));
+        let mut downloads = pending_downloads_with_tip(latest_chain_tip);
+        let poisoned_hash = hash(1);
+
+        for _ in 0..POISONED_GOSSIP_BLOCK_RETRY_LIMIT {
+            assert!(downloads.retry_poisoned(poisoned_hash).is_some());
+        }
+        assert!(
+            downloads.retry_poisoned(poisoned_hash).is_none(),
+            "the budget is exhausted while the tip is unchanged"
+        );
+        assert_eq!(downloads.poisoned_retries.counts.len(), 1);
+
+        // The block is resolved by the syncer, so the tip moves without this stream ever seeing
+        // a successful download for the hash.
+        set_tip(&mut tip_sender, block::Height(101), hash(0xBB));
+
+        assert!(
+            downloads.retry_poisoned(hash(2)).is_some(),
+            "a child of the new tip gets a fresh budget"
+        );
+        assert!(
+            !downloads
+                .poisoned_retries
+                .counts
+                .contains_key(&poisoned_hash),
+            "the stale entry must be dropped when the tip moves, not held for the process life"
+        );
+        assert_eq!(downloads.poisoned_retries.counts.len(), 1);
+    }
+
+    /// A downloaded block releases its budget, so a later poisoning of the same hash starts
+    /// fresh.
+    ///
+    /// This is the one release path the `Downloads`-level tests cannot reach: they use
+    /// `pending_downloads`, whose downloads never complete.
+    #[test]
+    fn a_downloaded_block_releases_its_budget() {
+        let mut budgets = PoisonedRetryBudgets::default();
+        let tip = Some(hash(0xAA));
+        let poisoned_hash = hash(1);
+
+        for _ in 0..POISONED_GOSSIP_BLOCK_RETRY_LIMIT {
+            assert!(budgets.consume(poisoned_hash, tip).is_some());
+        }
+        assert_eq!(budgets.consume(poisoned_hash, tip), None);
+
+        budgets.release(&poisoned_hash);
+
+        assert_eq!(
+            budgets.consume(poisoned_hash, tip),
+            Some(1),
+            "the budget restarts once the block has actually been downloaded"
+        );
+        assert_eq!(
+            budgets.consume(hash(2), tip),
+            Some(1),
+            "releasing one hash leaves the others alone"
+        );
     }
 }

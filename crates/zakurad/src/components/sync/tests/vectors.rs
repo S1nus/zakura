@@ -33,6 +33,7 @@ use zakura_state as zs;
 
 use crate::{
     components::{
+        auth_download_height::poison_coinbase_height,
         sync::{
             self,
             downloads::{BlockDownloadVerifyError, Downloads},
@@ -1760,6 +1761,58 @@ fn invalid_ancestor_does_not_score_descendant_advertiser() {
     );
 }
 
+/// A block above the lookahead limit is dropped without scoring the peer that
+/// served it, because that peer answered a hash this node asked for. Errors the
+/// serving peer is genuinely responsible for are still scored.
+#[test]
+fn far_ahead_block_does_not_score_serving_peer() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        _peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(2);
+    chain_sync.misbehavior_sender = misbehavior_tx;
+
+    let serving_peer: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+
+    let far_ahead = BlockDownloadVerifyError::AboveLookaheadHeightLimit {
+        height: Height(60_000),
+        hash: block::Hash([0xC1; 32]),
+        advertiser_addr: Some(serving_peer),
+    };
+
+    assert!(
+        chain_sync.handle_block_response(Err(far_ahead)).is_ok(),
+        "a far-ahead block is dropped without restarting sync"
+    );
+    assert!(
+        matches!(
+            misbehavior_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "the peer that served a far-ahead block we requested must not be scored"
+    );
+
+    // The same peer is still scored for a block whose own contents are bad.
+    let invalid_height = BlockDownloadVerifyError::InvalidHeight {
+        hash: block::Hash([0xC2; 32]),
+        advertiser_addr: Some(serving_peer),
+    };
+
+    assert!(chain_sync
+        .handle_block_response(Err(invalid_height))
+        .is_ok());
+    assert_eq!(
+        misbehavior_rx.try_recv(),
+        Ok((serving_peer, 100)),
+        "a block with no valid height is still the serving peer's fault"
+    );
+}
+
 /// A scratch state can have finalized genesis tip metadata before
 /// `KnownBlock(genesis)` can find a block body. In that state, committing the
 /// downloaded genesis block returns duplicate/finalized; the genesis bootstrap
@@ -1910,8 +1963,9 @@ async fn above_lookahead_does_not_restart_sync() {
     );
 }
 
-/// Verifies fix for GHSA-gvjc-3w7c-92jx: `AboveLookaheadHeightLimit` now
-/// carries `advertiser_addr` so the offending peer can be scored.
+/// Verifies fix for GHSA-gvjc-3w7c-92jx: `AboveLookaheadHeightLimit` carries
+/// `advertiser_addr` so the serving peer is named in the drop logs. It is not
+/// scored — see [`far_ahead_block_does_not_score_serving_peer`].
 #[tokio::test]
 async fn above_lookahead_has_peer_attribution() {
     let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
@@ -1924,7 +1978,7 @@ async fn above_lookahead_has_peer_attribution() {
     assert_eq!(
         err.advertiser_addr(),
         Some(addr),
-        "AboveLookaheadHeightLimit should carry advertiser_addr for peer scoring \
+        "AboveLookaheadHeightLimit should carry advertiser_addr for drop logs \
          (GHSA-gvjc-3w7c-92jx fix)"
     );
 }
@@ -3072,4 +3126,428 @@ async fn empty_block_response_is_retryable_download_failure() {
         matches!(result, Err(BlockDownloadVerifyError::DownloadFailed { .. })),
         "an empty block response must be a retryable DownloadFailed, got {result:?}",
     );
+}
+
+/// Builds a [`Downloads`] wired to `peer_set`, `verifier`, and `chain_tip`.
+fn setup_downloads(
+    peer_set: MockService<zn::Request, zn::Response, PanicAssertion>,
+    verifier: MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    chain_tip: MockChainTip,
+) -> Downloads<
+    MockService<zn::Request, zn::Response, PanicAssertion>,
+    MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    MockChainTip,
+> {
+    let (past_lookahead_limit_sender, _past_lookahead_limit_receiver) =
+        tokio::sync::watch::channel(false);
+
+    Downloads::new(
+        peer_set,
+        verifier,
+        chain_tip,
+        past_lookahead_limit_sender,
+        sync::MIN_CONCURRENCY_LIMIT,
+        Height(0),
+        LegacySyncTrace::new(None, false),
+    )
+}
+
+/// A peer that rewrites the coinbase height of a canonical tip child still answers under the
+/// canonical block hash, but must be rejected and attributed instead of silently dropped by the
+/// behind-tip height policy.
+#[tokio::test]
+async fn tip_child_rejects_poisoned_coinbase_height() {
+    let _init_guard = zakura_test::init();
+
+    let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let canonical_hash = canonical.hash();
+    let parent_hash = canonical.header.previous_block_hash;
+    let canonical_coinbase_hash = canonical.transactions[0].hash();
+    let canonical_auth_digest = canonical.transactions[0]
+        .auth_digest()
+        .expect("an NU5 coinbase has an authorizing data digest");
+
+    // The attack: claim height 1, which is far behind the reorg window, so the unpatched
+    // downloader exits with the unattributed, unrequeued `BehindTipHeightLimit`.
+    let poisoned = poison_coinbase_height(&canonical, Height(1));
+
+    assert_eq!(
+        poisoned.hash(),
+        canonical_hash,
+        "the poisoned body still answers a request for the canonical hash"
+    );
+    assert_eq!(
+        poisoned.transactions[0].hash(),
+        canonical_coinbase_hash,
+        "V5 authorizing data is excluded from the mined transaction ID, \
+         so the transaction merkle root is unchanged"
+    );
+    assert_ne!(
+        poisoned.transactions[0].auth_digest(),
+        Some(canonical_auth_digest),
+        "the mutation does change the authorizing data digest, \
+         which is what full consensus validation would have caught"
+    );
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+
+    // Our tip is the poisoned block's parent, so its real height is known without a state lookup.
+    chain_tip_sender.send_best_tip_height(Height(1_687_106));
+    chain_tip_sender.send_best_tip_hash(parent_hash);
+
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+    let mut downloads = setup_downloads(peer_set.clone(), verifier.clone(), chain_tip);
+
+    downloads
+        .download_and_verify(canonical_hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(canonical_hash).collect(),
+        ))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            poisoned,
+            Some(addr),
+        ))]));
+
+    let result = downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking");
+
+    assert!(
+        matches!(
+            result,
+            Err(BlockDownloadVerifyError::TipChildHeightMismatch {
+                height: Height(1),
+                expected_height: Height(1_687_107),
+                hash,
+                advertiser_addr: Some(error_addr),
+            }) if hash == canonical_hash && error_addr == addr
+        ),
+        "a poisoned tip child must be attributed to its supplier, got {result:?}"
+    );
+
+    verifier.expect_no_requests().await;
+}
+
+/// A forged *high* coinbase height on a tip child is rejected by the same check, before the
+/// lookahead policy drops it without knowing the real height.
+#[tokio::test]
+async fn tip_child_rejects_forged_high_coinbase_height() {
+    let _init_guard = zakura_test::init();
+
+    let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let canonical_hash = canonical.hash();
+    let parent_hash = canonical.header.previous_block_hash;
+
+    let poisoned = poison_coinbase_height(&canonical, Height(2_000_000));
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+
+    chain_tip_sender.send_best_tip_height(Height(1_687_106));
+    chain_tip_sender.send_best_tip_hash(parent_hash);
+
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+    let mut downloads = setup_downloads(peer_set.clone(), verifier.clone(), chain_tip);
+
+    downloads
+        .download_and_verify(canonical_hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(canonical_hash).collect(),
+        ))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            poisoned,
+            Some(addr),
+        ))]));
+
+    let result = downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking");
+
+    assert!(
+        matches!(
+            result,
+            Err(BlockDownloadVerifyError::TipChildHeightMismatch {
+                height: Height(2_000_000),
+                expected_height: Height(1_687_107),
+                ..
+            })
+        ),
+        "a forged high height on a tip child must be caught by the tip check, got {result:?}"
+    );
+
+    verifier.expect_no_requests().await;
+}
+
+/// The canonical tip child is unaffected: its coinbase height matches the tip, so it reaches
+/// the verifier as before.
+#[tokio::test]
+async fn canonical_tip_child_reaches_the_verifier() {
+    let _init_guard = zakura_test::init();
+
+    let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let canonical_hash = canonical.hash();
+    let parent_hash = canonical.header.previous_block_hash;
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+
+    chain_tip_sender.send_best_tip_height(Height(1_687_106));
+    chain_tip_sender.send_best_tip_hash(parent_hash);
+
+    let mut downloads = setup_downloads(peer_set.clone(), verifier.clone(), chain_tip);
+
+    downloads
+        .download_and_verify(canonical_hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(canonical_hash).collect(),
+        ))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            canonical.clone(),
+            None,
+        ))]));
+
+    verifier
+        .expect_request_that(|req| matches!(req, zakura_consensus::Request::Commit(_)))
+        .await
+        .respond(canonical_hash);
+
+    let result = downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking");
+
+    assert_eq!(
+        result.expect("a canonical tip child verifies"),
+        (Height(1_687_107), canonical_hash),
+        "the canonical tip child must be unaffected by the height check"
+    );
+}
+
+/// A body whose parent is not our tip keeps the existing behind-tip policy: the tip check can't
+/// authenticate its height, so nothing about that path changes.
+#[tokio::test]
+async fn non_tip_child_keeps_the_behind_tip_policy() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let block1_hash = block1.hash();
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+
+    // A tip far ahead of block 1, which is *not* block 1's parent.
+    chain_tip_sender.send_best_tip_height(Height(1_000_000));
+    chain_tip_sender.send_best_tip_hash(block::Hash([0x11; 32]));
+
+    let mut downloads = setup_downloads(peer_set.clone(), verifier.clone(), chain_tip);
+
+    downloads
+        .download_and_verify(block1_hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((block1, None))]));
+
+    let result = downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking");
+
+    assert!(
+        matches!(
+            result,
+            Err(BlockDownloadVerifyError::BehindTipHeightLimit { .. })
+        ),
+        "an unauthenticated old block keeps the existing behind-tip policy, got {result:?}"
+    );
+
+    verifier.expect_no_requests().await;
+}
+
+/// A poisoned tip child must be requeued immediately, and its supplier scored, instead of
+/// leaving the newest block for the next discovery round.
+#[tokio::test]
+async fn poisoned_tip_child_requeues_and_scores_its_supplier() -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = misbehavior_tx;
+
+    let block_hash = block::Hash::from([0xAB; 32]);
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+
+    let error = BlockDownloadVerifyError::TipChildHeightMismatch {
+        height: Height(1),
+        expected_height: Height(1_687_107),
+        hash: block_hash,
+        advertiser_addr: Some(addr),
+    };
+
+    let requeue = tokio::spawn(async move {
+        let result = chain_sync
+            .handle_block_response_with_missing_retry(Err(error))
+            .await;
+        (result, chain_sync)
+    });
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
+        .await
+        .respond(Err(not_found_block_error(block_hash)));
+
+    let (result, chain_sync) = requeue.await.expect("the retry task should not panic");
+    result?;
+
+    assert_eq!(
+        misbehavior_rx.recv().await,
+        Some((addr, 100)),
+        "the supplier of a poisoned body must be scored for a ban"
+    );
+    assert_eq!(
+        chain_sync.poisoned_block_retry_counts.get(&block_hash),
+        Some(&1),
+        "the requeue must be counted against the retry budget"
+    );
+
+    block_verifier_router.expect_no_requests().await;
+
+    Ok(())
+}
+
+/// The poisoned-body requeue is bounded, so a peer can't hold the sync loop open forever.
+#[tokio::test]
+async fn poisoned_tip_child_restarts_after_retry_limit() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xAB; 32]);
+    chain_sync
+        .poisoned_block_retry_counts
+        .insert(block_hash, sync::POISONED_BLOCK_RETRY_LIMIT);
+
+    let error = BlockDownloadVerifyError::TipChildHeightMismatch {
+        height: Height(1),
+        expected_height: Height(1_687_107),
+        hash: block_hash,
+        advertiser_addr: Some("127.0.0.1:8233".parse().expect("valid peer address")),
+    };
+
+    let result = chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "an exhausted poisoned-body budget must restart sync"
+    );
+
+    peer_set.expect_no_requests().await;
+}
+
+/// A chain tip reporting a height but no hash must keep the existing behind-tip policy.
+///
+/// The tip-child check needs both height and hash, but the lookahead and behind-tip policies must
+/// keep reading the height on its own. Deriving it from `best_tip_height_and_hash()` would couple
+/// them to hash availability, moving such a tip into the no-tip regime and changing drop and pause
+/// behaviour for blocks this change is not meant to affect.
+///
+/// A real `LatestChainTip` does not occupy this state — it publishes height and hash together —
+/// so this is a mock-only input. It is used because it isolates the coupling exactly: it is the
+/// one case where the two ways of obtaining `tip_height` disagree.
+#[tokio::test]
+async fn tip_height_without_a_tip_hash_keeps_the_behind_tip_policy() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let block1_hash = block1.hash();
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+
+    // Height only. `LatestChainTip` never reports this: it publishes height and hash together, so
+    // a height without a hash is a `MockChainTip` artifact of its two separate watch channels.
+    // It is still the sharpest probe for the coupling under test, because it is the one input
+    // where deriving `tip_height` from the pair diverges from reading it directly.
+    chain_tip_sender.send_best_tip_height(Height(1_000_000));
+
+    let mut downloads = setup_downloads(peer_set.clone(), verifier.clone(), chain_tip);
+
+    downloads
+        .download_and_verify(block1_hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((block1, None))]));
+
+    let result = downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking");
+
+    assert!(
+        matches!(
+            result,
+            Err(BlockDownloadVerifyError::BehindTipHeightLimit { .. })
+        ),
+        "a height-only tip must still apply the behind-tip policy, got {result:?}"
+    );
+
+    verifier.expect_no_requests().await;
 }
