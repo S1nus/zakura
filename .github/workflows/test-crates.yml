@@ -7,7 +7,10 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Include non-Rust inputs compiled or exercised by workspace crates.
+      - crates/**
       - .cargo/config.toml
+      - .github/actions/setup-zakura-build/**
       - .github/workflows/test-crates.yml
 
   push:
@@ -16,7 +19,10 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Include non-Rust inputs compiled or exercised by workspace crates.
+      - crates/**
       - .cargo/config.toml
+      - .github/actions/setup-zakura-build/**
       - .github/workflows/test-crates.yml
 
   # Run the full crate-build suite when a PR is queued so the merge queue
