@@ -187,6 +187,9 @@ jobs:
           # not written to any node (manage_config = false).
           rpc_listen_addr = "0.0.0.0:8232"
           log_file        = "/root/logs/zakura-tracing.log"
+          # Verified on the fleet: the nine regional nodes keep state here, the
+          # compat host does not. Used only for the dashboard's disk probe.
+          state_cache_dir = "/mnt/data/zakura-cache"
 
           # Public mainnet node ids (crates/zakura-network/src/zakura/handler.rs). Used by
           # the dashboard to label each host; not deployed to the nodes.
@@ -255,6 +258,7 @@ jobs:
           service_name = "zakurad-compat"
           log_file   = ""
           rpc_listen_addr = "127.0.0.1:8232"
+          state_cache_dir = "/mnt/data/import-zebra"
           EOF
 
       - name: Build deployer binary
@@ -355,6 +359,7 @@ jobs:
           rpc_listen_addr = "[::1]:8232"
           rpc_auth = "cookie"
           rpc_config_path = "/mnt/data/runtime/zcashd/.cookie"
+          state_cache_dir = "/mnt/data/runtime/zcashd"
           # P2P sidecar (post -zebra-compat): supervised with -connect=127.0.0.1:8233.
           process_pattern = "zcashd .*-connect=127.0.0.1:8233"
           EOF
@@ -369,7 +374,7 @@ jobs:
           [Service]
           Type=simple
           WorkingDirectory=/opt/zakura-mainnet-dashboard
-          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network mainnet --interval 10 --stale-after 300 --upgrade-height 3428143 --target-spacing 75 --state-file /var/lib/zakura-mainnet-dashboard/orphan-pairs.json
+          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network mainnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-mainnet-dashboard/orphan-pairs.json
           Restart=always
           RestartSec=5
 
