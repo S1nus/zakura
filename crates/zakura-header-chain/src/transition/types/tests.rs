@@ -8,17 +8,16 @@ use zakura_chain::{
 };
 
 use crate::{
-    AuxDelivery, AuxEvidence, AuxObservationId, AuxObservationV1, AuxOutcome, AuxOutcomeStatus,
-    AuxVerificationFactV1, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodyRuleId,
-    BodySizeHint, BodySupplierDiscovered, BodyUnavailableSummary, BodyVerificationOutcome,
-    BodyWorkAuthority, BodyWorkOwner, BranchId, ConsensusBodyInvalid, EventAdmission, EvidenceId,
-    Frontier, FullStateFinalized, HeaderGeneration, HeaderSyncWorkOwner, HeaderValidationState,
-    HeaderWorkAuthority, InsertHeaders, MigratedPinRefutation, OperatorBodyRetry,
-    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, PreparedHeader,
-    PreparedHeaderBatch, SourceId, TargetCompletion, TransientBodyFailure,
-    TransientBodyFailureKind, TransitionDomain, TransitionEvent, TransitionTypeError,
-    VerifiedBlockAccepted, VerifiedBodyEvidence, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedGeneration, VerifiedHeaderRef,
+    AuxAuthentication, AuxDelivery, AuxEvidence, BodyCommitmentKind, BodyEvidence,
+    BodyPayloadMismatch, BodyRuleId, BodySizeHint, BodySupplierDiscovered, BodyUnavailableSummary,
+    BodyVerificationOutcome, BodyWorkAuthority, BodyWorkOwner, BranchId, ConsensusBodyInvalid,
+    EventAdmission, EvidenceId, Frontier, FullStateFinalized, HeaderGeneration,
+    HeaderSyncWorkOwner, HeaderValidationState, HeaderWorkAuthority, InsertHeaders,
+    MigratedPinRefutation, OperatorBodyRetry, OperatorInvalidate, OperatorInvalidationId,
+    OperatorReconsider, PreparedHeader, PreparedHeaderBatch, SourceId, TargetCompletion,
+    TransientBodyFailure, TransientBodyFailureKind, TransitionDomain, TransitionEvent,
+    TransitionTypeError, VerifiedBlockAccepted, VerifiedBodyEvidence, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef,
 };
 
 fn header_owner() -> HeaderSyncWorkOwner {
@@ -78,14 +77,15 @@ fn delivery(
     header_hash: block::Hash,
     owner: HeaderSyncWorkOwner,
 ) -> AuxDelivery {
-    AuxDelivery::new(
+    AuxDelivery {
         delivery_id,
         header_hash,
-        SourceId::from_digest([10; 32]),
+        source: SourceId::from_digest([10; 32]),
         owner,
-        BodySizeHint::Unknown,
-        None,
-    )
+        body_size: BodySizeHint::Unknown,
+        tree_aux: None,
+        authentication: AuxAuthentication::Unauthenticated,
+    }
 }
 
 fn insert_event(
@@ -136,19 +136,6 @@ fn event_cases() -> Vec<EventCase> {
     let operator_evidence = EvidenceId::from_digest([18; 32]);
     let aux_evidence = EvidenceId::from_digest([19; 32]);
     let availability = BodyUnavailableSummary::default();
-    let aux_observation = AuxObservationV1::from_vct(
-        body_owner,
-        vec![delivery(
-            aux_evidence,
-            block::Hash([39; 32]),
-            body_owner.into(),
-        )],
-        AuxVerificationFactV1::current_delivery_verified(),
-        Some([40; 32].into()),
-    )
-    .expect("the auxiliary observation fixture is valid");
-    let aux_observation_evidence =
-        EvidenceId::from_digest(aux_observation.observation_id().digest());
 
     vec![
         EventCase {
@@ -384,20 +371,46 @@ fn event_cases() -> Vec<EventCase> {
             body_owner: None,
         },
         EventCase {
-            name: "missing auxiliary observation",
-            event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence::missing())),
+            name: "unauthenticated auxiliary evidence",
+            event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
+                owner: body_owner,
+                deliveries: Vec::new(),
+                authentication: AuxAuthentication::Unauthenticated,
+            })),
             domain: TransitionDomain::AuxEvidence,
             admission: EventAdmission::IntegratedFullState,
             idempotency: None,
             header_owner: None,
-            body_owner: None,
+            body_owner: Some(body_owner),
         },
         EventCase {
             name: "authenticated auxiliary evidence",
-            event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence::observed(aux_observation))),
+            event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
+                owner: body_owner,
+                deliveries: Vec::new(),
+                authentication: AuxAuthentication::Authenticated {
+                    evidence: aux_evidence,
+                    boundary_hash: block::Hash([39; 32]),
+                },
+            })),
             domain: TransitionDomain::AuxEvidence,
             admission: EventAdmission::IntegratedFullState,
-            idempotency: Some(aux_observation_evidence),
+            idempotency: Some(aux_evidence),
+            header_owner: None,
+            body_owner: Some(body_owner),
+        },
+        EventCase {
+            name: "rejected auxiliary evidence",
+            event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
+                owner: body_owner,
+                deliveries: Vec::new(),
+                authentication: AuxAuthentication::Rejected {
+                    evidence: aux_evidence,
+                },
+            })),
+            domain: TransitionDomain::AuxEvidence,
+            admission: EventAdmission::IntegratedFullState,
+            idempotency: Some(aux_evidence),
             header_owner: None,
             body_owner: Some(body_owner),
         },
@@ -414,25 +427,30 @@ fn event_cases() -> Vec<EventCase> {
 }
 
 #[test]
-fn auxiliary_outcomes_only_refine_evidence() {
-    let unauthenticated = AuxOutcome::unauthenticated();
-    let disputed = AuxOutcome::derived(
-        unauthenticated,
-        AuxOutcomeStatus::Disputed,
-        AuxObservationId::from_digest([1; 32]),
-        block::Hash([3; 32]),
-    );
-    for next in [
-        AuxOutcomeStatus::Disputed,
-        AuxOutcomeStatus::Authenticated,
-        AuxOutcomeStatus::Rejected,
-    ] {
-        assert!(unauthenticated.can_refine_to(next));
+fn auxiliary_authentication_transitions_only_refine_evidence() {
+    let evidence = EvidenceId::from_digest([1; 32]);
+    let other_evidence = EvidenceId::from_digest([2; 32]);
+    let disputed = AuxAuthentication::Disputed { evidence };
+    let authenticated = AuxAuthentication::Authenticated {
+        evidence: other_evidence,
+        boundary_hash: block::Hash([3; 32]),
+    };
+    let rejected = AuxAuthentication::Rejected {
+        evidence: other_evidence,
+    };
+
+    for next_state in [disputed, authenticated, rejected] {
+        assert!(AuxAuthentication::Unauthenticated.can_refine_to(next_state));
     }
-    assert!(disputed.can_refine_to(AuxOutcomeStatus::Authenticated));
-    assert!(disputed.can_refine_to(AuxOutcomeStatus::Rejected));
-    assert!(!disputed.can_refine_to(AuxOutcomeStatus::Unauthenticated));
-    assert!(!disputed.can_refine_to(AuxOutcomeStatus::Disputed));
+    for next_state in [authenticated, rejected] {
+        assert!(disputed.can_refine_to(next_state));
+    }
+    for current_state in [disputed, authenticated, rejected] {
+        assert!(!current_state.can_refine_to(AuxAuthentication::Unauthenticated));
+        assert!(!current_state.can_refine_to(disputed));
+    }
+    assert!(!authenticated.can_refine_to(rejected));
+    assert!(!rejected.can_refine_to(authenticated));
 }
 
 #[test]
@@ -549,22 +567,11 @@ fn mutate_effect_bearing_payload(event: &mut TransitionEvent) {
         TransitionEvent::MigratedPinRefutation(event) => {
             mutate_hash(&mut event.invalid_header.hash);
         }
-        TransitionEvent::AuxEvidence(event) => {
-            let observation = event
-                .observation()
-                .expect("fingerprinted auxiliary events have an observation");
-            let mut deliveries = observation.deliveries().to_vec();
-            deliveries[0].delivery_id = EvidenceId::from_digest([40; 32]);
-            **event = AuxEvidence::observed(
-                AuxObservationV1::from_vct(
-                    observation.owner(),
-                    deliveries,
-                    observation.verification(),
-                    observation.boundary_witness(),
-                )
-                .expect("the mutated auxiliary observation is valid"),
-            );
-        }
+        TransitionEvent::AuxEvidence(event) => event.deliveries.push(delivery(
+            EvidenceId::from_digest([40; 32]),
+            block::Hash([41; 32]),
+            event.owner.into(),
+        )),
         TransitionEvent::ReevaluateDeferred => {
             panic!("deferred reevaluation has no effect-bearing fingerprint")
         }
@@ -589,19 +596,6 @@ fn transition_fingerprint_binds_every_effect_bearing_domain() {
         let mutated = mutated_event
             .fingerprint()
             .expect("a payload mutation preserves replay identity");
-        if case.domain == TransitionDomain::AuxEvidence {
-            assert_ne!(
-                original.evidence(),
-                mutated.evidence(),
-                "{} evidence",
-                case.name
-            );
-            assert_eq!(original.domain(), mutated.domain(), "{} domain", case.name);
-            assert!(!original.conflicts_with(mutated));
-            assert!(!original.conflicts_with(original), "{}", case.name);
-            exercised[code] = true;
-            continue;
-        }
         assert_eq!(
             original.evidence(),
             mutated.evidence(),

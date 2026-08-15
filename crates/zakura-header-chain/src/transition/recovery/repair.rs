@@ -21,7 +21,7 @@ pub(super) fn classify_and_plan<S: StoreAuditRead>(
         ..
     } = audited;
     let ReconstructedDerivedViews {
-        source_nodes,
+        promoted_source_nodes,
         header_nodes,
         header_child_edges,
         selected_projection,
@@ -29,6 +29,7 @@ pub(super) fn classify_and_plan<S: StoreAuditRead>(
         deferred_entries,
         selected_tip,
         selected_score,
+        elapsed_deferrals,
         oldest_retained_height,
         body_unavailable_alarm,
     } = derived;
@@ -36,6 +37,10 @@ pub(super) fn classify_and_plan<S: StoreAuditRead>(
     let mut repairs = BTreeSet::new();
     if trust_anchor_changed {
         repairs.insert(RecoveryRepair::TrustAnchorConfiguration);
+    }
+    if elapsed_deferrals {
+        repairs.insert(RecoveryRepair::ElapsedDeferrals);
+        repairs.insert(RecoveryRepair::DeferredIndex);
     }
     compare_by_key(
         store.header_child_edges()?,
@@ -60,7 +65,7 @@ pub(super) fn classify_and_plan<S: StoreAuditRead>(
     if store.verified_projection()? != verified_projection {
         repairs.insert(RecoveryRepair::VerifiedProjection);
     }
-    if source_nodes != header_nodes {
+    if promoted_source_nodes != header_nodes {
         repairs.insert(RecoveryRepair::InheritedEligibility);
     }
     if metadata.oldest_retained_height != oldest_retained_height {
@@ -75,6 +80,7 @@ pub(super) fn classify_and_plan<S: StoreAuditRead>(
         metadata.anchor_manifest_digest = config.trust_anchor_digest();
         if repairs.contains(&RecoveryRepair::SelectedProjection)
             || repairs.contains(&RecoveryRepair::InheritedEligibility)
+            || repairs.contains(&RecoveryRepair::ElapsedDeferrals)
         {
             metadata.header_generation = metadata.header_generation.checked_next()?;
         }

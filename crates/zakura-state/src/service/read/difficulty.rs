@@ -94,7 +94,7 @@ pub fn solution_rate(
     db: &ZakuraDb,
     num_blocks: usize,
     start_hash: Hash,
-) -> Option<u128> {
+) -> Option<U256> {
     // Take 1 extra header for calculating the number of seconds between when mining on the first
     // block likely started. The work for the extra header is not added to `total_work`.
     //
@@ -127,7 +127,7 @@ pub fn solution_rate(
         max_time = max_time.max(header.time);
 
         last_work = get_work(&header);
-        total_work += last_work;
+        total_work = total_work.checked_add(last_work)?;
     }
 
     // We added an extra header so we could estimate when mining on the first block
@@ -143,12 +143,10 @@ pub fn solution_rate(
         return None;
     }
 
-    // `work_duration` is positive here, so the cast cannot wrap.
-    let rate = total_work.as_u256() / U256::from(work_duration as u128);
+    let work_duration =
+        u64::try_from(work_duration).expect("positive i64 work duration always fits in u64");
 
-    // The RPC solution rate stays u128. Saturate rather than panic: cumulative work is
-    // exact 256-bit, so a custom-network chain could in principle exceed the narrower type.
-    Some(rate.min(U256::from(u128::MAX)).low_u128())
+    Some(total_work.as_u256() / U256::from(work_duration))
 }
 
 /// Do a consistency check by checking the finalized tip before and after all other database
@@ -253,7 +251,8 @@ fn difficulty_time_and_history_tree(
         tip_height,
         network,
         relevant_data.iter().cloned(),
-    );
+    )
+    .expect("the mining template requires a complete committed difficulty context");
     let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
 
     let mut result = GetBlockTemplateChainInfo {
@@ -371,6 +370,7 @@ fn adjust_difficulty_and_time_for_testnet(
             network,
             relevant_data.iter().cloned(),
         )
+        .expect("the testnet mining template retains the same complete difficulty context")
         .expected_difficulty_threshold();
     }
 }

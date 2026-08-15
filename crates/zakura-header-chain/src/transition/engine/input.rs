@@ -258,10 +258,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        BodyRuleId, BodyUnavailableSummary, BranchId, EvidenceId, FinalityEpoch, FinalitySource,
-        HeaderContextFact, HeaderGeneration, HeaderValidationState, HeaderWorkAuthority,
-        OperatorInvalidationId, PreparedHeader, PreparedHeaderBatch, SourceId, TargetCompletion,
-        VerifiedBodyEvidence, VerifiedChangeCause,
+        AuxAuthentication, BodyRuleId, BodyUnavailableSummary, BodyWorkAuthority, BranchId,
+        EvidenceId, FinalityEpoch, FinalitySource, HeaderContextFact, HeaderGeneration,
+        HeaderValidationState, HeaderWorkAuthority, OperatorInvalidationId, PreparedHeader,
+        PreparedHeaderBatch, SourceId, TargetCompletion, VerifiedBodyEvidence, VerifiedChangeCause,
+        VerifiedGeneration,
     };
 
     fn frontier(byte: u8, height: u32) -> Frontier {
@@ -278,6 +279,20 @@ mod tests {
             NonZeroU64::new(5).expect("the fixture request ID is nonzero"),
         )
         .into()
+    }
+
+    fn body_owner() -> crate::BodyWorkOwner {
+        BodyWorkAuthority {
+            header: HeaderWorkAuthority {
+                header_generation: HeaderGeneration::new(3),
+                branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+            },
+            verified_generation: VerifiedGeneration::new(6),
+        }
+        .bind(
+            7,
+            NonZeroU64::new(8).expect("the fixture request ID is nonzero"),
+        )
     }
 
     fn prepared_batch() -> PreparedHeaderBatch {
@@ -396,7 +411,11 @@ mod tests {
             invalid_header: frontier(36, 3),
             rule: BodyRuleId::new("body.rule"),
         };
-        let auxiliary = AuxEvidence::missing();
+        let auxiliary = AuxEvidence {
+            owner: body_owner(),
+            deliveries: Vec::new(),
+            authentication: AuxAuthentication::Unauthenticated,
+        };
         let rebase = FinalityRecord {
             previous: parent,
             current: frontier(37, 1),

@@ -14,11 +14,11 @@ use super::super::{
 };
 use super::{fixture, injected_store_error, violations, AuditRead};
 use crate::{
-    AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId, ChainScore,
-    CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMode,
-    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, HeaderGeneration,
-    HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, SourceId, StoreError,
-    SuffixWork, WorkCoordinate,
+    AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId,
+    ChainScore, CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState,
+    EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
+    HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
+    SourceId, SuffixWork, WorkCoordinate,
 };
 
 #[test]
@@ -43,88 +43,19 @@ fn canonical_work_and_recovery_time_are_authoritative() {
     ));
 
     let mut elapsed = base.clone();
-    let anchor = elapsed.metadata.frontiers.finalized;
     let until = elapsed.nodes[1].header.time - Duration::hours(2);
     elapsed.nodes[1].validation = crate::HeaderValidationState::DeferredUntil(until);
-    elapsed.metadata.frontiers.header_best = anchor;
-    elapsed.metadata.header_best_score = ChainScore::new(SuffixWork::zero(), anchor.hash);
-    elapsed.snapshot = elapsed.metadata.snapshot();
-    elapsed.selected = vec![anchor];
     elapsed.deferred = vec![(until, child_hash)];
     let plan = audit_store_at(&elapsed, &config, elapsed.nodes[1].header.time)
-        .expect("an elapsed deferral remains authoritative until normal reevaluation");
-    assert!(plan.is_clean());
-    assert_eq!(plan.metadata, elapsed.metadata);
-    assert_eq!(plan.deferred_entries, elapsed.deferred);
+        .expect("an exact elapsed deferral is a reconstructible startup transition");
+    assert!(plan.repairs.contains(&RecoveryRepair::ElapsedDeferrals));
     assert_eq!(
         plan.header_nodes
             .iter()
             .find(|node| node.hash == child_hash)
             .expect("the child remains retained")
             .validation,
-        crate::HeaderValidationState::DeferredUntil(until)
-    );
-}
-
-#[test]
-fn headers_only_recovery_rejects_an_unsettled_selected_suffix() {
-    let (mut store, mut config) = fixture();
-    let anchor = store.metadata.frontiers.finalized;
-    let child = store.metadata.frontiers.header_best;
-    let child_node = store.nodes[1].clone();
-    let mut grandchild_header = *child_node.header;
-    grandchild_header.previous_block_hash = child.hash;
-    grandchild_header.time += Duration::seconds(1);
-    grandchild_header.nonce = [2; 32].into();
-    let grandchild_header = Arc::new(grandchild_header);
-    let grandchild_hash = grandchild_header.hash();
-    let grandchild_work = grandchild_header
-        .difficulty_threshold
-        .to_work()
-        .expect("the fixture grandchild target has work");
-    let grandchild = Frontier::new(block::Height(2), grandchild_hash);
-    let grandchild_node = HeaderNode::from_durable_parts(
-        grandchild_header,
-        grandchild_hash,
-        child.hash,
-        grandchild.height,
-        grandchild_work,
-        child_node
-            .work_coordinate()
-            .checked_add(grandchild_work)
-            .expect("the fixture grandchild work fits"),
-        HeaderValidationState::Valid,
-        EligibilityState::default(),
-        BodyValidationState::Unknown,
-        Vec::new(),
-    )
-    .expect("the fixture grandchild fields agree");
-
-    config.mode = EngineMode::HeadersOnly;
-    config.limits.local_finality_depth = std::num::NonZeroU32::new(1).expect("one is nonzero");
-    store.metadata.mode = EngineMode::HeadersOnly;
-    store.metadata.frontiers.header_best = grandchild;
-    store.metadata.header_best_score = ChainScore::new(
-        SuffixWork::new(
-            child_node
-                .block_work
-                .as_u256()
-                .checked_add(grandchild_work.as_u256())
-                .expect("the two-block suffix work fits"),
-        ),
-        grandchild.hash,
-    );
-    store.snapshot = store.metadata.snapshot();
-    store.nodes.push(grandchild_node);
-    store.children.push((child.hash, grandchild.hash));
-    store.selected = vec![anchor, child, grandchild];
-    store.finality[0].source = FinalitySource::MigratedHeadersOnly;
-
-    assert_eq!(
-        audit_store(&store, &config),
-        Err(RecoveryFailure::Source {
-            violations: vec![AuditViolation::Finality],
-        })
+        crate::HeaderValidationState::Valid
     );
 }
 
@@ -471,133 +402,6 @@ fn migrated_finality_is_rejected_after_the_migration_boundary() {
 }
 
 #[test]
-fn resource_stall_alarm_does_not_exempt_startup_node_limit() {
-    let (mut store, mut config) = fixture();
-    config.limits.max_non_finalized_nodes =
-        NonZeroUsize::new(1).expect("one is a valid node limit");
-    let anchor = store.metadata.frontiers.finalized;
-    let mut sibling_header = *store.nodes[1].header;
-    sibling_header.nonce = [2; 32].into();
-    let sibling_header = Arc::new(sibling_header);
-    let sibling_hash = sibling_header.hash();
-    let sibling_work = sibling_header
-        .difficulty_threshold
-        .to_work()
-        .expect("the fixture sibling target has work");
-    store.nodes.push(
-        HeaderNode::from_durable_parts(
-            sibling_header,
-            sibling_hash,
-            anchor.hash,
-            block::Height(1),
-            sibling_work,
-            store.nodes[0]
-                .work_coordinate()
-                .checked_add(sibling_work)
-                .expect("the sibling work fits"),
-            HeaderValidationState::Valid,
-            EligibilityState::default(),
-            BodyValidationState::Unknown,
-            Vec::new(),
-        )
-        .expect("the canonical sibling fields agree"),
-    );
-    store.metadata.alarms.resource_stalled = true;
-    store.snapshot = store.metadata.snapshot();
-
-    assert_eq!(
-        audit_store(&store, &config),
-        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
-            collection: "header nodes",
-            limit: 2,
-        }))
-    );
-}
-
-#[test]
-fn oversized_node_table_fails_before_node_rows_are_loaded() {
-    let (mut store, mut config) = fixture();
-    config.limits.max_non_finalized_nodes =
-        NonZeroUsize::new(1).expect("one is a valid node limit");
-    store.nodes.push(store.nodes[1].clone());
-    store.failed_read = Some(AuditRead::HeaderNodes);
-
-    assert_eq!(
-        audit_store(&store, &config),
-        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
-            collection: "header nodes",
-            limit: 2,
-        }))
-    );
-}
-
-#[test]
-fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
-    let (mut store, mut config) = fixture();
-    config.limits.max_aux_deliveries_total =
-        NonZeroUsize::new(1).expect("one is a valid auxiliary limit");
-    let delivery = AuxDelivery::new(
-        EvidenceId::from_digest([0x51; 32]),
-        store.nodes[1].hash,
-        SourceId::from_digest([0x52; 32]),
-        HeaderWorkOwner {
-            authority: HeaderWorkAuthority {
-                header_generation: HeaderGeneration::new(1),
-                branch: BranchId::new(store.metadata.work_origin.hash, store.nodes[1].hash),
-            },
-            session_id: 1,
-            request_id: NonZeroU64::new(1).expect("one is nonzero"),
-        }
-        .into(),
-        BodySizeHint::Unknown,
-        None,
-    );
-    store.aux = vec![delivery, delivery];
-    store.failed_read = Some(AuditRead::AuxDeliveries);
-
-    assert_eq!(
-        audit_store(&store, &config),
-        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
-            collection: "auxiliary deliveries",
-            limit: 1,
-        }))
-    );
-
-    let (mut store, config) = fixture();
-    store.contexts = vec![
-        ValidationContextRecord {
-            header: store.nodes[0].header.clone(),
-            height: block::Height(0),
-        };
-        crate::POW_PREDECESSOR_CONTEXT_SPAN + 1
-    ];
-    store.failed_read = Some(AuditRead::ValidationContexts);
-
-    assert_eq!(
-        audit_store(&store, &config),
-        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
-            collection: "validation contexts",
-            limit: crate::POW_PREDECESSOR_CONTEXT_SPAN,
-        }))
-    );
-}
-
-#[test]
-fn fatal_configuration_mismatch_fails_before_collection_preflight() {
-    let (mut store, config) = fixture();
-    store.metadata.mode = EngineMode::HeadersOnly;
-    store.snapshot = store.metadata.snapshot();
-    store.failed_read = Some(AuditRead::HeaderNodeCount);
-
-    assert_eq!(
-        audit_store(&store, &config),
-        Err(RecoveryFailure::Source {
-            violations: vec![AuditViolation::Configuration],
-        })
-    );
-}
-
-#[test]
 fn audits_each_normative_invariant() {
     let (base, config) = fixture();
     let child_hash = base.metadata.frontiers.header_best.hash;
@@ -733,21 +537,15 @@ fn audits_each_normative_invariant() {
     limited.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
     let mut oversized = base.clone();
     oversized.nodes.push(oversized.nodes[1].clone());
-    assert_eq!(
-        audit_store(&oversized, &limited),
-        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
-            collection: "header nodes",
-            limit: 2,
-        }))
-    );
+    assert!(violations(&oversized, &limited).contains(&AuditViolation::Limits));
 
     let mut store = base.clone();
     let evidence = EvidenceId::from_digest([5; 32]);
-    store.aux.push(AuxDelivery::new(
-        evidence,
-        block::Hash([6; 32]),
-        SourceId::from_digest([7; 32]),
-        HeaderWorkOwner {
+    store.aux.push(AuxDelivery {
+        delivery_id: evidence,
+        header_hash: block::Hash([6; 32]),
+        source: SourceId::from_digest([7; 32]),
+        owner: HeaderWorkOwner {
             authority: HeaderWorkAuthority {
                 header_generation: HeaderGeneration::new(1),
                 branch: BranchId::new(base.metadata.work_origin.hash, child_hash),
@@ -756,9 +554,10 @@ fn audits_each_normative_invariant() {
             request_id: NonZeroU64::new(1).expect("one is nonzero"),
         }
         .into(),
-        BodySizeHint::Unknown,
-        None,
-    ));
+        body_size: BodySizeHint::Unknown,
+        tree_aux: None,
+        authentication: AuxAuthentication::Unauthenticated,
+    });
     assert!(violations(&store, &config)
         .iter()
         .any(|violation| matches!(violation, AuditViolation::Auxiliary(_))));

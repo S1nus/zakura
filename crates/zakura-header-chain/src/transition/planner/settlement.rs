@@ -126,11 +126,6 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         }
     }
 
-    let checkpoint_finality = matches!(
-        event,
-        TransitionEvent::VerifiedChainChanged(ref event)
-            if event.cause == crate::VerifiedChangeCause::CheckpointFinalizedGrow
-    );
     let mut effect = TransitionEffect::none();
     debug_assert_ne!(
         header_rebase,
@@ -138,7 +133,13 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         "already-applied header work returns during replay binding before settlement"
     );
     effect.header_work = settlement_header_work_effect(work_rebased, header_rebase);
-    if matches!(event, TransitionEvent::AuxEvidence(_)) {
+    if matches!(
+        event,
+        TransitionEvent::VerifiedChainChanged(ref event)
+            if event.cause == crate::VerifiedChangeCause::CheckpointFinalizedGrow
+    ) {
+        effect.finality = Some(FinalityEffect::Checkpoint);
+    } else if matches!(event, TransitionEvent::AuxEvidence(_)) {
         effect.auxiliary = Some(AuxiliaryEffect::Authentication);
     } else if matches!(event, TransitionEvent::FullStateFinalized(_)) {
         // Finality effect is set when a record is actually appended below.
@@ -162,11 +163,9 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                     effect.finality = Some(FinalityEffect::HeadersOnlyDepth);
                 }
                 FinalitySource::FullState { .. } => {
-                    effect.finality = Some(if checkpoint_finality {
-                        FinalityEffect::Checkpoint
-                    } else {
-                        FinalityEffect::FullState
-                    });
+                    if effect.finality.is_none() {
+                        effect.finality = Some(FinalityEffect::FullState);
+                    }
                 }
                 FinalitySource::MigratedHeadersOnly => {}
             }
@@ -177,8 +176,15 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         projected.force_headers_only_verified();
     }
 
+    let authoritative_full_state_fork_set = matches!(
+        event,
+        TransitionEvent::VerifiedChainChanged(_) | TransitionEvent::VerifiedBlockAccepted(_)
+    ) && context
+        .full_state_authority
+        .is_some_and(|authority| authority.authorizes_full_state(event));
     let retention = projected.enforce_retention(
         selected_tip,
+        !authoritative_full_state_fork_set,
         context.retention_references.iter().copied(),
         context.config.limits,
     )?;

@@ -39,10 +39,12 @@ projection is the contiguous full-state-accepted path in integrated mode; it
 can legitimately differ from the selected path. Both remain anchored by
 finality.
 
-The crate is intentionally not connected to the node runtime yet. Follow-up
-changes will add the durable `zakura-state` adapter, the asynchronous
-`zakura-node-services` port, consensus-validator reuse, and `zakurad`
-orchestration.
+[`zakura-state`](../zakura-state/src/service/finalized_state/header_chain.rs)
+owns the durable adapter and commit ordering.
+[`zakura-node-services`](../zakura-node-services/src/header_chain.rs) defines
+the asynchronous port used by network header sync. Consensus code reuses the
+crate's context-free validators, while `zakurad` wires the state-backed port to
+network orchestration.
 
 Engine hydration requires an audited durable state. Integrations should use the
 state-backed boundary rather than treating the in-memory graph store as a
@@ -56,5 +58,5 @@ Run the focused test suite from the workspace root:
 cargo test -p zakura-header-chain
 ```
 
-The `fuzz-impl` feature exposes the deterministic replay adapter used by the
-follow-up header-chain fuzz target.
+Property and mutation fuzzing are documented in the
+[header-chain fuzz target](../../fuzz/header-chain/README.md).

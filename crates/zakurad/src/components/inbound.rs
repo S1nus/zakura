@@ -752,6 +752,15 @@ impl Service<zn::Request> for Inbound {
                     .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
             }
+            zn::Request::AdvertiseBlock(hash, Some(zn::PeerSource::Zakura(peer_id))) => {
+                debug!(
+                    ?hash,
+                    ?peer_id,
+                    "ignoring Zakura block advertisement because native block sync owns block bodies",
+                );
+                metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
+                async { Ok(zn::Response::Nil) }.boxed()
+            }
             zn::Request::AdvertiseBlock(hash, advertiser) => {
                 block_downloads.download_and_verify(hash, advertiser);
                 async { Ok(zn::Response::Nil) }.boxed()
