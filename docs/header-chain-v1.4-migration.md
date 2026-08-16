@@ -3,11 +3,10 @@
 Header-chain v1.4 is a protocol and storage cutover, not a backward-compatible
 upgrade of the predecessor header overlay.
 
-- A database containing predecessor header-overlay rows is rejected before the
-  new header DAG is initialized or published. Zakura does not decode, import,
-  reinterpret, or delete those rows. Start with a fresh state database and
-  resynchronize.
-- A clean database initializes the header DAG from authenticated finalized and
+- The three obsolete canonical predecessor-overlay indexes are discarded.
+  Zakura does not decode, trust, or import those rows. Their deletion and the
+  initial header DAG write commit atomically.
+- The header DAG initializes exclusively from authenticated finalized and
   reconstructed full-state facts. Headers above the verified block tip are
   downloaded again.
 - `network.zakura.header_sync.accept_new_blocks` no longer exists because header

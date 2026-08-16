@@ -14,6 +14,7 @@ use zakura_header_chain::{
 
 use super::{HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, StartupReport};
 use crate::service::finalized_state::{
+    disk_db::{ReadDisk, WriteDisk},
     disk_format::{header_chain_values::HeaderValidationContextDisk, RawBytes},
     zakura_db::{
         block::{
@@ -41,11 +42,6 @@ pub enum HeaderChainInitializationError {
     /// The new schema already has its format-complete metadata marker.
     #[error("fork-aware header-chain schema is already initialized")]
     AlreadyInitialized,
-    /// Predecessor overlay rows require an explicit database resync.
-    #[error(
-        "incompatible predecessor header overlay found; resync this database before starting Zakura"
-    )]
-    IncompatibleLegacyOverlay,
     /// Full state has no finalized tip to authenticate initialization.
     #[error("header-chain initialization requires a finalized full-state anchor")]
     MissingFinalizedAnchor,
@@ -61,15 +57,15 @@ pub enum HeaderChainInitializationError {
     /// The durable initialization or mandatory startup audit failed.
     #[error(transparent)]
     Store(#[from] HeaderChainStoreError),
-    /// RocksDB failed while checking predecessor columns.
-    #[error("predecessor header overlay check failed: {0}")]
+    /// RocksDB rejected the atomic legacy-overlay replacement.
+    #[error("header-chain initialization database write failed: {0}")]
     RocksDb(#[from] rocksdb::Error),
 }
 
 /// Initialize an absent DAG only from authenticated full-state facts.
 ///
-/// Initialization checks the predecessor overlay before it writes any DAG row.
-/// Initialization never decodes, deletes, or reinterprets predecessor overlay rows.
+/// Initialization discards obsolete predecessor overlay rows in the same atomic
+/// batch that publishes the replacement DAG.
 pub(in crate::service) fn initialize_header_chain_reconciled(
     source: &ZakuraDb,
     config: &EngineConfig,
@@ -78,9 +74,6 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
     let store = HeaderChainStore::new(source.header_chain_disk_db());
     if store.metadata_row()?.is_some() {
         return Err(HeaderChainInitializationError::AlreadyInitialized);
-    }
-    if legacy_overlay_has_rows(source)? {
-        return Err(HeaderChainInitializationError::IncompatibleLegacyOverlay);
     }
 
     let (anchor_height, anchor_hash) = source
@@ -167,6 +160,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
     };
     let contexts = validation_context(source, anchor, anchor_header.previous_block_hash)?;
     let mut base_batch = super::super::DiskWriteBatch::new();
+    clear_legacy_overlay(source, &mut base_batch);
     for context in &contexts {
         store.put_value(
             &mut base_batch,
@@ -189,7 +183,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
     ))
 }
 
-fn legacy_overlay_has_rows(source: &ZakuraDb) -> Result<bool, HeaderChainInitializationError> {
+fn clear_legacy_overlay(source: &ZakuraDb, batch: &mut super::super::DiskWriteBatch) {
     let db = source.header_chain_disk_db();
     for family in [
         ZAKURA_HEADER_BY_HEIGHT,
@@ -199,15 +193,15 @@ fn legacy_overlay_has_rows(source: &ZakuraDb) -> Result<bool, HeaderChainInitial
         let Some(cf) = db.cf_handle(family) else {
             continue;
         };
-        if db
-            .zs_forward_range_iter::<_, RawBytes, RawBytes, _>(&cf, ..)
-            .next()
-            .is_some()
-        {
-            return Ok(true);
-        }
+        let Some((first, _)) = db.zs_first_key_value::<_, RawBytes, RawBytes>(&cf) else {
+            continue;
+        };
+        let (last, _) = db
+            .zs_last_key_value::<_, RawBytes, RawBytes>(&cf)
+            .expect("last legacy overlay row exists because the first row exists");
+        batch.zs_delete_range(&cf, &first, &last);
+        batch.zs_delete(&cf, &last);
     }
-    Ok(false)
 }
 
 fn finalized_anchor(
@@ -219,9 +213,9 @@ fn finalized_anchor(
     if bootstrap.height > finalized.height {
         return Err(HeaderChainInitializationError::AnchorMismatch);
     }
-    let (stored_bootstrap_hash, stored_bootstrap) = source
-        .header_by_height(bootstrap.height)
-        .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
+    let (stored_bootstrap_hash, stored_bootstrap) =
+        finalized_header_by_height(source, bootstrap.height)
+            .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
     if stored_bootstrap_hash != bootstrap.hash
         || stored_bootstrap.as_ref() != config.bootstrap_anchor().header.as_ref()
     {
@@ -238,8 +232,7 @@ fn finalized_anchor(
         height = height
             .next()
             .map_err(|_| HeaderChainInitializationError::Work)?;
-        let (hash, next) = source
-            .header_by_height(height)
+        let (hash, next) = finalized_header_by_height(source, height)
             .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
         if next.hash() != hash || next.previous_block_hash != header.hash() {
             return Err(HeaderChainInitializationError::AnchorMismatch);
@@ -265,8 +258,17 @@ fn validation_context(
     expected_hash: block::Hash,
 ) -> Result<Vec<HeaderValidationContextDisk>, HeaderChainInitializationError> {
     linked_validation_context(anchor, expected_hash, |height| {
-        source.header_by_height(height)
+        finalized_header_by_height(source, height)
     })
+}
+
+fn finalized_header_by_height(
+    source: &ZakuraDb,
+    height: block::Height,
+) -> Option<(block::Hash, Arc<block::Header>)> {
+    let hash = source.hash(height)?;
+    let header = source.block_header(height.into())?;
+    Some((hash, header))
 }
 
 fn linked_validation_context(
