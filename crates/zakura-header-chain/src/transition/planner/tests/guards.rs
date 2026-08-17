@@ -98,15 +98,12 @@ fn active_prepared_header_limit_accepts_exactly_limit_and_rejects_one_more() {
 }
 
 #[test]
-fn retention_references_admit_all_staged_targets_and_candidate_tips() {
+fn unauthenticated_retention_reference_is_rejected() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());
-    let references = vec![
-        store.metadata.frontiers.finalized.hash;
-        crate::MAX_STAGED_TARGETS_V1 + crate::MAX_CANDIDATE_TIPS_V1
-    ];
+    let references = [store.metadata.frontiers.finalized.hash];
 
-    apply_transition(
+    let result = apply_transition(
         &store,
         TransitionRequest {
             expected_version: store.metadata.state_version,
@@ -118,13 +115,16 @@ fn retention_references_admit_all_staged_targets_and_candidate_tips() {
             full_state_authority: None,
             retention_references: &references,
         },
-    )
-    .expect("one transition admits every active header target and full-state fork tip");
+    );
+
+    assert!(matches!(result, Err(TransitionFailure::Authority)));
 }
 
 #[test]
 fn retention_references_are_bounded_before_ancestry_walks() {
-    let (store, config) = TestStore::new(EngineMode::HeadersOnly);
+    let (store, mut config) = TestStore::new(EngineMode::HeadersOnly);
+    config.limits.max_retention_references =
+        std::num::NonZeroUsize::new(1).expect("one is nonzero");
     let clock = ManualClock(Utc::now());
     let references = vec![
         store.metadata.frontiers.finalized.hash;

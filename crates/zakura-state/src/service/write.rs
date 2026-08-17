@@ -106,22 +106,41 @@ pub struct PreparedFullStateTransition {
     header_request: TransitionRequest,
 }
 
-struct PreparedAuthority(zakura_header_chain::TransitionFingerprint);
+struct PreparedAuthority {
+    transition: zakura_header_chain::TransitionFingerprint,
+    retention_references: Vec<block::Hash>,
+}
 
 impl PreparedAuthority {
     fn for_event(event: &TransitionEvent) -> Result<Self, HeaderChainStoreError> {
         event
             .fingerprint()
-            .map(Self)
+            .map(|transition| Self {
+                transition,
+                retention_references: Vec::new(),
+            })
             .ok_or(HeaderChainStoreError::Incoherent(
                 "prepared full-state event has no stable identity",
             ))
+    }
+
+    fn for_event_with_retention(
+        event: &TransitionEvent,
+        retention_references: Vec<block::Hash>,
+    ) -> Result<Self, HeaderChainStoreError> {
+        let mut authority = Self::for_event(event)?;
+        authority.retention_references = retention_references;
+        Ok(authority)
     }
 }
 
 impl FullStateEvidenceAuthority for PreparedAuthority {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
-        event.fingerprint() == Some(self.0)
+        event.fingerprint() == Some(self.transition)
+    }
+
+    fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
+        self.retention_references.contains(&reference)
     }
 }
 
@@ -225,7 +244,10 @@ impl PreparedFullStateTransition {
             header_request,
             ..
         } = self;
-        let authority = PreparedAuthority::for_event(&header_request.event)?;
+        let authority = PreparedAuthority::for_event_with_retention(
+            &header_request.event,
+            staged_tips.clone(),
+        )?;
         let mut retention_references = context.retention_references.to_vec();
         retention_references.extend(staged_tips);
         retention_references.sort_unstable_by_key(|hash| hash.0);
@@ -1697,7 +1719,11 @@ impl BlockWriteSender {
     }
 }
 
-trait DeferredHeaderMaintenance {
+trait HeaderChainMaintenance {
+    fn resource_stalled_version(&self) -> Option<StateVersion> {
+        None
+    }
+
     fn earliest_deferred(
         &self,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, HeaderChainStoreError>;
@@ -1705,7 +1731,15 @@ trait DeferredHeaderMaintenance {
     fn reevaluate_deferred(&self) -> Result<(), HeaderChainStoreError>;
 }
 
-impl DeferredHeaderMaintenance for HeaderChainWriter {
+impl HeaderChainMaintenance for HeaderChainWriter {
+    fn resource_stalled_version(&self) -> Option<StateVersion> {
+        let snapshot = self.runtime.publisher().snapshot();
+        snapshot
+            .alarms
+            .resource_stalled
+            .then_some(snapshot.state_version)
+    }
+
     fn earliest_deferred(
         &self,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, HeaderChainStoreError> {
@@ -1721,7 +1755,7 @@ impl DeferredHeaderMaintenance for HeaderChainWriter {
     }
 }
 
-fn receive_until_deferred_deadline<M: DeferredHeaderMaintenance>(
+fn receive_until_deferred_deadline<M: HeaderChainMaintenance>(
     receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
     maintenance: Option<&M>,
     deadline_runtime: &tokio::runtime::Runtime,
@@ -1754,6 +1788,30 @@ fn receive_until_deferred_deadline<M: DeferredHeaderMaintenance>(
             Err(_) => maintenance.reevaluate_deferred()?,
         }
     }
+}
+
+fn recover_resource_stall<M: HeaderChainMaintenance>(
+    maintenance: Option<&M>,
+    last_recovery: &mut Option<StateVersion>,
+) -> Result<(), HeaderChainStoreError> {
+    let Some(maintenance) = maintenance else {
+        *last_recovery = None;
+        return Ok(());
+    };
+    let Some(version) = maintenance.resource_stalled_version() else {
+        *last_recovery = None;
+        return Ok(());
+    };
+    if *last_recovery == Some(version) {
+        return Ok(());
+    }
+
+    *last_recovery = Some(version);
+    maintenance.reevaluate_deferred()?;
+    if maintenance.resource_stalled_version().is_none() {
+        *last_recovery = None;
+    }
+    Ok(())
 }
 
 fn handle_header_chain_control_message(
@@ -2278,8 +2336,23 @@ impl WriteBlockWorkerTask {
         // Track rejected ancestors so queued descendants can be rejected without
         // attributing the ancestor's validation failure to the descendant's peer.
         let mut rejected_ancestor_map: IndexMap<block::Hash, block::Hash> = IndexMap::new();
+        let mut last_resource_stall_recovery = None;
 
         loop {
+            if let Err(error) =
+                recover_resource_stall(header_chain.as_ref(), &mut last_resource_stall_recovery)
+            {
+                tracing::error!(
+                    ?error,
+                    "stopping state writer after resource-stall recovery failure"
+                );
+                return BlockWriteTaskExit::HeaderChainRuntimeFailed(
+                    BlockWriteTaskFailure::runtime(
+                        "resource-stall recovery stopped the state writer",
+                        error,
+                    ),
+                );
+            }
             let msg = match deferred_non_finalized_messages.pop_front() {
                 Some(msg) => Some(msg),
                 None => match receive_until_deferred_deadline(

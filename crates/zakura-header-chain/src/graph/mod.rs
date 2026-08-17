@@ -25,6 +25,8 @@ pub use header_node::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
     EligibilityState, HeaderNode, HeaderValidationState, MAX_DIRECT_ELIGIBILITY_REASONS_V1,
 };
+#[cfg(test)]
+pub(crate) use overlay::{overlay_construction_count, reset_overlay_construction_count};
 pub(crate) use overlay::{GraphDelta, GraphOverlay};
 
 #[cfg(test)]
@@ -78,14 +80,20 @@ pub(crate) trait HeaderGraphView {
     fn view_header_node(&self, hash: block::Hash) -> Option<&HeaderNode>;
     /// Return every retained header node.
     fn view_header_nodes(&self) -> Vec<&HeaderNode>;
-    /// Return every retained canonical header hash.
-    fn view_retained_header_hashes(&self) -> Vec<block::Hash>;
+    /// Visit every retained header node without allocating a collection.
+    fn visit_header_nodes(&self, visitor: &mut dyn FnMut(&HeaderNode));
     /// Return retained header hashes at the exact height.
     fn view_header_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash>;
     /// Return the retained direct children of the exact parent hash.
     fn view_header_children(&self, parent: block::Hash) -> Vec<block::Hash>;
+    /// Return whether the exact retained header has any retained children.
+    fn view_header_has_children(&self, parent: block::Hash) -> bool;
     /// Return every eligible header without an eligible retained child.
     fn view_eligible_header_tips(&self) -> Vec<Frontier>;
+    /// Return the number of eligible retained tips.
+    fn view_eligible_header_tip_count(&self) -> usize;
+    /// Return whether the exact retained header is an eligible tip.
+    fn view_is_eligible_header_tip(&self, hash: block::Hash) -> bool;
     /// Select the eligible header chain with the greatest deterministic score.
     fn view_select_best_header_chain(&self) -> Result<(Frontier, ChainScore), GraphError>;
     /// Return one retained header's score relative to the finalized frontier.
@@ -1188,10 +1196,6 @@ impl MemHeaderStore {
         Ok(deleted)
     }
 
-    pub(crate) fn retained_header_hashes(&self) -> impl Iterator<Item = block::Hash> + '_ {
-        self.nodes.keys().copied()
-    }
-
     pub(crate) fn remove_header_leaf(&mut self, hash: block::Hash) -> Result<(), GraphError> {
         let node = self
             .nodes
@@ -1370,8 +1374,8 @@ impl HeaderGraphView for MemHeaderStore {
         self.header_nodes().collect()
     }
 
-    fn view_retained_header_hashes(&self) -> Vec<block::Hash> {
-        self.retained_header_hashes().collect()
+    fn visit_header_nodes(&self, visitor: &mut dyn FnMut(&HeaderNode)) {
+        self.nodes.values().for_each(visitor);
     }
 
     fn view_header_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
@@ -1382,8 +1386,22 @@ impl HeaderGraphView for MemHeaderStore {
         self.header_children(parent)
     }
 
+    fn view_header_has_children(&self, parent: block::Hash) -> bool {
+        self.children
+            .get(&parent)
+            .is_some_and(|children| !children.is_empty())
+    }
+
     fn view_eligible_header_tips(&self) -> Vec<Frontier> {
         self.eligible_header_tips()
+    }
+
+    fn view_eligible_header_tip_count(&self) -> usize {
+        self.eligible_header_tips.len()
+    }
+
+    fn view_is_eligible_header_tip(&self, hash: block::Hash) -> bool {
+        self.eligible_header_tips.contains(&hash)
     }
 
     fn view_select_best_header_chain(&self) -> Result<(Frontier, ChainScore), GraphError> {
