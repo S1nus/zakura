@@ -23,7 +23,7 @@ pub use frontier::{
 };
 pub use header_node::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
-    EligibilityState, HeaderNode, HeaderValidationState,
+    EligibilityState, HeaderNode, HeaderValidationState, MAX_DIRECT_ELIGIBILITY_REASONS_V1,
 };
 pub(crate) use overlay::{GraphDelta, GraphOverlay};
 
@@ -199,6 +199,14 @@ pub enum GraphError {
     /// A reconstructed graph contains more than one row for one hash.
     #[error("duplicate reconstructed header {0:?}")]
     DuplicateHeaderNode(block::Hash),
+    /// A header exceeded the direct eligibility-reason bound.
+    #[error("header {header:?} exceeds the direct eligibility-reason limit {limit}")]
+    DirectEligibilityReasonLimit {
+        /// Header whose reasons exceeded the limit.
+        header: block::Hash,
+        /// Maximum retained direct reasons.
+        limit: usize,
+    },
     /// A retained header row violates one structural invariant.
     #[error("retained header {header:?} violates the {invariant} invariant")]
     InvalidHeaderNode {
@@ -304,6 +312,8 @@ impl fmt::Display for GraphRevision {
 pub struct ConsensusInvalidBodyTombstone {
     /// Canonical header hash whose body failed consensus.
     pub hash: block::Hash,
+    /// Canonical header height used for finality pruning and deterministic eviction.
+    pub height: block::Height,
     /// Exact authoritative evidence identity.
     pub evidence: EvidenceId,
     /// Exact failed consensus rule.
@@ -528,6 +538,12 @@ impl MemHeaderStore {
             };
         }
         let direct_reasons: BTreeSet<EligibilityReason> = direct_reasons.into_iter().collect();
+        if direct_reasons.len() > MAX_DIRECT_ELIGIBILITY_REASONS_V1 {
+            return Err(GraphError::DirectEligibilityReasonLimit {
+                header: hash,
+                limit: MAX_DIRECT_ELIGIBILITY_REASONS_V1,
+            });
+        }
         let node = HeaderNode {
             header,
             hash,
@@ -572,8 +588,7 @@ impl MemHeaderStore {
             .get_mut(&hash)
             .ok_or(GraphError::UnknownHeaderNode(hash))?
             .eligibility
-            .direct_reasons
-            .insert(reason);
+            .try_insert_direct_reason(hash, reason)?;
         if changed {
             self.recompute_descendant_eligibility(hash)?;
             self.advance_revision()?;
@@ -630,10 +645,16 @@ impl MemHeaderStore {
         hash: block::Hash,
         body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError> {
+        let height = self
+            .nodes
+            .get(&hash)
+            .ok_or(GraphError::UnknownHeaderNode(hash))?
+            .height;
         let tombstone = match &body_validation_state {
             BodyValidationState::ConsensusInvalid { evidence, rule } => {
                 Some(ConsensusInvalidBodyTombstone {
                     hash,
+                    height,
                     evidence: *evidence,
                     rule: rule.clone(),
                 })
@@ -1155,6 +1176,8 @@ impl MemHeaderStore {
             }
         }
         self.finalized_frontier = finalized_frontier;
+        self.consensus_invalid_body_tombstones
+            .retain(|_, tombstone| tombstone.height > finalized_frontier.height);
         self.nodes
             .get_mut(&finalized_frontier.hash)
             .expect("the new finalized root is retained")
@@ -1322,6 +1345,8 @@ impl MemHeaderStore {
         self.consensus_invalid_body_tombstones
             .extend(application.new_consensus_invalid_body_tombstones_by_hash);
         self.finalized_frontier = application.finalized_frontier;
+        self.consensus_invalid_body_tombstones
+            .retain(|_, tombstone| tombstone.height > self.finalized_frontier.height);
         self.eligible_header_tips = application.eligible_header_tips;
         self.graph_revision = next_revision;
         Ok(())
@@ -1641,6 +1666,34 @@ mod tests {
         assert_eq!(store.heights, before.heights);
         assert_eq!(store.eligible_header_tips, before.eligible_header_tips);
         assert_eq!(store.finalized_frontier, before.finalized_frontier);
+    }
+
+    #[test]
+    fn advancing_finality_prunes_in_memory_tombstones_at_or_below_the_frontier() {
+        let mut store = anchor_store();
+        let anchor = store.finalized_frontier();
+        let selected = insert_child(&mut store, anchor.hash, 1);
+        let sibling = insert_child(&mut store, anchor.hash, 2);
+        store
+            .set_body_validation_state(
+                sibling.hash,
+                BodyValidationState::ConsensusInvalid {
+                    evidence: EvidenceId::from_digest([3; 32]),
+                    rule: BodyRuleId::new("test.finality-prunes-tombstone"),
+                },
+            )
+            .expect("the sibling body evidence is accepted");
+        assert!(store
+            .consensus_invalid_body_tombstone(sibling.hash)
+            .is_some());
+
+        store
+            .advance_finalized_frontier(selected)
+            .expect("the eligible sibling can become final");
+
+        assert!(store
+            .consensus_invalid_body_tombstone(sibling.hash)
+            .is_none());
     }
 
     fn uncached_eligible_header_tips(store: &MemHeaderStore) -> Vec<Frontier> {
