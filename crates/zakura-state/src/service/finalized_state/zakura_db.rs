@@ -14,7 +14,7 @@ use std::{path::Path, sync::Arc};
 use crossbeam_channel::bounded;
 use semver::Version;
 
-use zakura_chain::{block::Height, diagnostic::task::WaitForPanics, parameters::Network};
+use zakura_chain::{diagnostic::task::WaitForPanics, parameters::Network};
 
 use crate::{
     config::database_format_version_on_disk,
@@ -22,7 +22,6 @@ use crate::{
         disk_db::DiskDb,
         disk_format::{
             block::MAX_ON_DISK_HEIGHT,
-            transparent::AddressLocation,
             upgrade::{DbFormatChange, DbFormatChangeThreadHandle},
         },
     },
@@ -222,17 +221,6 @@ impl ZakuraDb {
         // longer be made safe: refuse to expose it at all, in every open mode.
         if is_unrepairable_vct_database(&db, disk_version_before_open.as_ref()) {
             return Err(StateInitError::VctSproutHistoryUnrepairable);
-        }
-
-        let zero_location_utxos =
-            db.address_utxo_locations(AddressLocation::from_usize(Height(0), 0, 0));
-        if !zero_location_utxos.is_empty() {
-            warn!(
-                "You have been impacted by the Zebra 2.4.0 address indexer corruption bug. \
-                If you rely on the data from the RPC interface, you will need to recover your database. \
-                Follow the instructions in the 2.4.1 release notes: https://github.com/ZcashFoundation/zebra/releases/tag/v2.4.1 \
-                If you just run the node for consensus and don't use data from the RPC interface, you can ignore this warning."
-            )
         }
 
         db.run_startup_format_change(format_change)?;
@@ -514,6 +502,7 @@ impl Drop for ZakuraDb {
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+    use zakura_chain::block::Height;
 
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
