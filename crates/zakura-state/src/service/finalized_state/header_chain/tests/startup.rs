@@ -408,6 +408,45 @@ fn mark_metadata_as_v1(metadata: &EngineMetadata) -> Vec<u8> {
     bytes
 }
 
+fn v1_bounded_rule(rule: &str) -> Vec<u8> {
+    let rule_bytes = rule.as_bytes();
+    let mut bytes = Vec::with_capacity(4 + rule_bytes.len());
+    bytes.extend(
+        u32::try_from(rule_bytes.len())
+            .expect("fixture rule IDs fit u32")
+            .to_be_bytes(),
+    );
+    bytes.extend(rule_bytes);
+    bytes
+}
+
+fn v1_consensus_invalid_tombstone_bytes(
+    hash: block::Hash,
+    evidence: EvidenceId,
+    rule: &str,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(1);
+    bytes.extend(hash.0);
+    bytes.extend(evidence.digest());
+    bytes.extend(v1_bounded_rule(rule));
+    bytes
+}
+
+fn v1_consensus_invalid_authority_bytes(
+    hash: block::Hash,
+    evidence: EvidenceId,
+    rule: &str,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(1);
+    bytes.push(1);
+    bytes.extend(hash.0);
+    bytes.extend(evidence.digest());
+    bytes.extend(v1_bounded_rule(rule));
+    bytes
+}
+
 #[test]
 fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
     let db_config = Config::ephemeral();
@@ -457,11 +496,14 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
         zakura_header_chain::BodySizeHint::Unknown,
         None,
     );
+    anchor.body_validation_state = BodyValidationState::Verified {
+        evidence: EvidenceId::from_digest([0x34; 32]),
+    };
     anchor.aux_delivery_ids.push(delivery.delivery_id);
     let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
-        .initialize(metadata.clone(), anchor)
+        .initialize(metadata.clone(), anchor.clone())
         .expect("the current fixture initializes");
 
     let delivery_key = HeaderAuxDeliveryKey {
@@ -487,8 +529,34 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
             mark_metadata_as_v1(&metadata),
         )
         .expect("the version-one metadata stages");
+    let authority_cf = store
+        .cf(HEADER_BODY_EVIDENCE_AUTHORITY)
+        .expect("the body-evidence authority column family exists");
+    let mut authority_value = store
+        .db
+        .raw_get_cf(&authority_cf, &anchor.hash.0)
+        .expect("the body-evidence authority is readable")
+        .expect("verified full state writes body-evidence authority");
+    authority_value[0] = 1;
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_BODY_EVIDENCE_AUTHORITY,
+            anchor.hash.0,
+            authority_value,
+        )
+        .expect("the version-one body-evidence authority stages");
+    store
+        .delete_raw(&mut batch, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+        .expect("the version-one fixture omits the current tombstone count");
+    store
+        .delete_raw(&mut batch, HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
+        .expect("the version-one fixture omits the current finality count");
     store.db.write(batch).expect("the legacy fixture commits");
 
+    assert!(store
+        .is_initialized()
+        .expect("released version-one metadata identifies an initialized store"));
     assert!(store
         .migrate_v1_to_current(&engine_config)
         .expect("the version-one store migrates"));
@@ -504,6 +572,62 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
             .expect("the fixture state version can advance")
     );
     assert_eq!(migrated_metadata.last_transition, None);
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+            .expect("the migrated tombstone count is readable"),
+        Some(HeaderRowCountDisk(0))
+    );
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
+            .expect("the migrated finality count is readable"),
+        Some(HeaderRowCountDisk(1))
+    );
+    let mut interrupted = DiskWriteBatch::new();
+    store
+        .delete_raw(&mut interrupted, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+        .expect("the interrupted migration omits the tombstone count");
+    store
+        .delete_raw(
+            &mut interrupted,
+            HEADER_ENGINE_META,
+            FINALITY_HISTORY_COUNT_KEY,
+        )
+        .expect("the interrupted migration omits the finality count");
+    let mut interrupted_authority = store
+        .db
+        .raw_get_cf(&authority_cf, &anchor.hash.0)
+        .expect("the migrated body-evidence authority is readable")
+        .expect("the migrated body-evidence authority exists");
+    interrupted_authority[0] = 1;
+    store
+        .put_raw(
+            &mut interrupted,
+            HEADER_BODY_EVIDENCE_AUTHORITY,
+            anchor.hash.0,
+            interrupted_authority,
+        )
+        .expect("the interrupted migration retains version-one body authority");
+    store
+        .db
+        .write(interrupted)
+        .expect("the interrupted migration fixture commits");
+    assert!(store
+        .migrate_v1_to_current(&engine_config)
+        .expect("the interrupted current-format migration completes"));
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+            .expect("the recovered tombstone count is readable"),
+        Some(HeaderRowCountDisk(0))
+    );
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
+            .expect("the recovered finality count is readable"),
+        Some(HeaderRowCountDisk(1))
+    );
     assert_eq!(
         store
             .load_aux_deliveries()
@@ -533,6 +657,92 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
     assert!(!HeaderChainStore::new(db)
         .migrate_v1_to_current(&engine_config)
         .expect("reopening the migrated store is a no-op"));
+}
+
+#[test]
+fn version_one_migration_drops_pruned_consensus_invalid_rows() {
+    let db_config = Config::ephemeral();
+    let (mut engine_config, anchor, metadata) = mainnet_fixture();
+    engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
+    store
+        .initialize(metadata.clone(), anchor)
+        .expect("the current fixture initializes");
+
+    let pruned = block::Hash([0xab; 32]);
+    let evidence = EvidenceId::from_digest([0xcd; 32]);
+    let rule = "body-consensus-invalid";
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            mark_metadata_as_v1(&metadata),
+        )
+        .expect("the version-one metadata stages");
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+            pruned.0,
+            v1_consensus_invalid_tombstone_bytes(pruned, evidence, rule),
+        )
+        .expect("the version-one pruned tombstone stages");
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_BODY_EVIDENCE_AUTHORITY,
+            pruned.0,
+            v1_consensus_invalid_authority_bytes(pruned, evidence, rule),
+        )
+        .expect("the version-one pruned authority stages");
+    store
+        .delete_raw(&mut batch, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+        .expect("the version-one fixture omits the current tombstone count");
+    store
+        .delete_raw(&mut batch, HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
+        .expect("the version-one fixture omits the current finality count");
+    store
+        .db
+        .write(batch)
+        .expect("the pruned v1 fixture commits");
+
+    assert!(store
+        .header_node(pruned)
+        .expect("a missing pruned header is readable")
+        .is_none());
+    assert!(store
+        .migrate_v1_to_current(&engine_config)
+        .expect("the version-one store migrates without the pruned header node"));
+
+    let tombstone_cf = store
+        .cf(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE)
+        .expect("the tombstone column family exists");
+    assert!(store
+        .db
+        .raw_get_cf(&tombstone_cf, &pruned.0)
+        .expect("the pruned tombstone family is readable")
+        .is_none());
+    let authority_cf = store
+        .cf(HEADER_BODY_EVIDENCE_AUTHORITY)
+        .expect("the body-evidence authority column family exists");
+    assert!(store
+        .db
+        .raw_get_cf(&authority_cf, &pruned.0)
+        .expect("the pruned authority family is readable")
+        .is_none());
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+            .expect("the migrated tombstone count is readable"),
+        Some(HeaderRowCountDisk(0))
+    );
+
+    let (_, report) = store
+        .startup(&engine_config)
+        .expect("startup audits the store after dropping pruned v1 invalid-body rows");
+    assert!(report.publication_allowed);
 }
 
 #[test]

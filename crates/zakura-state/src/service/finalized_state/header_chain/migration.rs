@@ -18,8 +18,10 @@ use crate::service::finalized_state::{
     disk_format::{
         header_chain::HeaderAuxDeliveryKey,
         header_chain_values::{
-            decode_v1_aux_delivery, decode_v1_engine_metadata, HeaderChainValueError,
-            HeaderValidationContextDisk,
+            decode_v1_aux_delivery, decode_v1_consensus_invalid_body_tombstone,
+            decode_v1_engine_metadata, decode_v1_full_state_body_validation_evidence_authority,
+            FullStateBodyValidationEvidenceAuthorityDisk, HeaderChainValueError,
+            HeaderRowCountDisk, HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
@@ -29,7 +31,9 @@ use crate::service::finalized_state::{
         },
         ZakuraDb,
     },
-    DiskWriteBatch, HEADER_AUX_DELIVERY, HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT,
+    DiskWriteBatch, HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY,
+    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
+    HEADER_VALIDATION_CONTEXT,
 };
 
 impl HeaderChainStore {
@@ -55,7 +59,39 @@ impl HeaderChainStore {
         let version = u32::from_be_bytes(version_bytes);
         if version == HeaderChainDiskVersion::CURRENT.0 {
             EngineMetadata::decode(&metadata_bytes)?;
-            return Ok(false);
+            let tombstone_count_exists = self
+                .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, super::TOMBSTONE_COUNT_KEY)?
+                .is_some();
+            let finality_count_exists = self
+                .get_value::<HeaderRowCountDisk>(
+                    HEADER_ENGINE_META,
+                    super::FINALITY_HISTORY_COUNT_KEY,
+                )?
+                .is_some();
+            let v1_authorities = self.first_row_has_version(HEADER_BODY_EVIDENCE_AUTHORITY, 1)?;
+            let v1_tombstones =
+                self.first_row_has_version(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, 1)?;
+            if tombstone_count_exists && finality_count_exists && !v1_authorities && !v1_tombstones
+            {
+                return Ok(false);
+            }
+            let mut batch = DiskWriteBatch::new();
+            let authority_rows = if v1_authorities {
+                self.stage_v1_body_evidence_authorities(config, &mut batch)?
+            } else {
+                0
+            };
+            let tombstone_rows = self.stage_tombstone_count(&mut batch)?;
+            let finality_rows = self.stage_finality_history_count(&mut batch)?;
+            self.db.write(batch)?;
+            tracing::info!(
+                authority_rows,
+                tombstone_rows,
+                finality_rows,
+                disk_format = HeaderChainDiskVersion::CURRENT.0,
+                "completed an interrupted durable header-chain migration"
+            );
+            return Ok(true);
         }
 
         let mut metadata =
@@ -109,6 +145,9 @@ impl HeaderChainStore {
         metadata.disk_format = HeaderChainDiskVersion::CURRENT;
         metadata.state_version = metadata.state_version.checked_next()?;
         metadata.last_transition = None;
+        let authority_rows = self.stage_v1_body_evidence_authorities(config, &mut batch)?;
+        let tombstone_rows = self.stage_tombstone_count(&mut batch)?;
+        let finality_rows = self.stage_finality_history_count(&mut batch)?;
         self.put_value(
             &mut batch,
             HEADER_ENGINE_META,
@@ -118,11 +157,210 @@ impl HeaderChainStore {
         self.db.write(batch)?;
         tracing::info!(
             auxiliary_rows = rows,
+            authority_rows,
+            tombstone_rows,
+            finality_rows,
             from_version = 1,
             to_version = HeaderChainDiskVersion::CURRENT.0,
             "migrated the durable header-chain format"
         );
         Ok(true)
+    }
+
+    fn first_row_has_version(
+        &self,
+        family: &'static str,
+        version: u8,
+    ) -> Result<bool, HeaderChainStoreError> {
+        let cf = self.cf(family)?;
+        Ok(self
+            .db
+            .raw_first_cf(&cf)?
+            .is_some_and(|(_, value)| value.first() == Some(&version)))
+    }
+
+    fn stage_v1_body_evidence_authorities(
+        &self,
+        config: &EngineConfig,
+        batch: &mut DiskWriteBatch,
+    ) -> Result<usize, HeaderChainStoreError> {
+        let authority_cf = self.cf(HEADER_BODY_EVIDENCE_AUTHORITY)?;
+        // Authorities cover the finalized anchor, bounded non-finalized nodes, and bounded
+        // tombstones whose consensus-invalid nodes have already been pruned.
+        let maximum_authorities = config
+            .limits
+            .max_non_finalized_nodes
+            .get()
+            .checked_add(1)
+            .and_then(|maximum| maximum.checked_add(super::TOMBSTONE_LIMIT))
+            .ok_or(HeaderChainStoreError::Incoherent(
+                "body-evidence authority limit overflow",
+            ))?;
+        let limit = zakura_header_chain::RowLimit::new(maximum_authorities);
+        let mut rows = 0;
+        self.db
+            .raw_visit_cf(&authority_cf, &mut |key, value| {
+                if rows == limit.get() {
+                    return Err(HeaderChainStoreError::Store(
+                        zakura_header_chain::StoreError::LimitExceeded {
+                            collection: zakura_header_chain::StoreCollection::HeaderNodes,
+                            limit,
+                        },
+                    ));
+                }
+                rows += 1;
+                let hash = block::Hash(key.try_into().map_err(|_| {
+                    HeaderChainStoreError::Incoherent(
+                        "invalid version-one body-evidence authority key width",
+                    )
+                })?);
+                let authority = match value.first() {
+                    Some(1) => {
+                        // v1 omitted height. Pruned consensus-invalid headers keep authority
+                        // rows after the node is deleted, so there is no height to recover.
+                        let Some(node) = self.header_node(hash)? else {
+                            self.delete_raw(batch, HEADER_BODY_EVIDENCE_AUTHORITY, hash.0)?;
+                            return Ok(());
+                        };
+                        decode_v1_full_state_body_validation_evidence_authority(value, node.height)?
+                    }
+                    _ => FullStateBodyValidationEvidenceAuthorityDisk::decode(value)?,
+                };
+                if !authority.attests_to_body_validation_state(
+                    hash,
+                    &match &authority {
+                        FullStateBodyValidationEvidenceAuthorityDisk::Verified {
+                            evidence, ..
+                        } => BodyValidationState::Verified {
+                            evidence: *evidence,
+                        },
+                        FullStateBodyValidationEvidenceAuthorityDisk::ConsensusInvalid(
+                            tombstone,
+                        ) => BodyValidationState::ConsensusInvalid {
+                            evidence: tombstone.evidence,
+                            rule: tombstone.rule.clone(),
+                        },
+                    },
+                ) {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "body-evidence authority key/value mismatch",
+                    ));
+                }
+                if value.first() == Some(&1) {
+                    self.put_value(batch, HEADER_BODY_EVIDENCE_AUTHORITY, hash.0, &authority)?;
+                }
+                Ok(())
+            })
+            .map_err(|error| match error {
+                RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
+                RawVisitError::Visitor(error) => error,
+            })?;
+        Ok(rows)
+    }
+
+    fn stage_finality_history_count(
+        &self,
+        batch: &mut DiskWriteBatch,
+    ) -> Result<usize, HeaderChainStoreError> {
+        let finality_cf = self.cf(HEADER_FINALITY_HISTORY)?;
+        let limit = zakura_header_chain::RowLimit::new(super::FINALITY_HISTORY_LIMIT);
+        let mut rows = 0;
+        self.db
+            .raw_visit_cf(&finality_cf, &mut |_, _| {
+                if rows == limit.get() {
+                    return Err(HeaderChainStoreError::Store(
+                        zakura_header_chain::StoreError::LimitExceeded {
+                            collection: zakura_header_chain::StoreCollection::FinalityHistory,
+                            limit,
+                        },
+                    ));
+                }
+                rows += 1;
+                Ok(())
+            })
+            .map_err(|error| match error {
+                RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
+                RawVisitError::Visitor(error) => error,
+            })?;
+        self.put_value(
+            batch,
+            HEADER_ENGINE_META,
+            super::FINALITY_HISTORY_COUNT_KEY,
+            &HeaderRowCountDisk(u64::try_from(rows).map_err(|_| {
+                HeaderChainStoreError::Incoherent("finality history count does not fit u64")
+            })?),
+        )?;
+        Ok(rows)
+    }
+
+    fn stage_tombstone_count(
+        &self,
+        batch: &mut DiskWriteBatch,
+    ) -> Result<usize, HeaderChainStoreError> {
+        let tombstone_cf = self.cf(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE)?;
+        let mut tombstone_rows = 0;
+        self.db
+            .raw_visit_cf(&tombstone_cf, &mut |key, value| {
+                if tombstone_rows == super::TOMBSTONE_LIMIT {
+                    return Err(HeaderChainStoreError::Store(
+                        zakura_header_chain::StoreError::LimitExceeded {
+                            collection:
+                                zakura_header_chain::StoreCollection::ConsensusInvalidBodyTombstones,
+                            limit: zakura_header_chain::RowLimit::new(super::TOMBSTONE_LIMIT),
+                        },
+                    ));
+                }
+                tombstone_rows += 1;
+                let hash = block::Hash(key.try_into().map_err(|_| {
+                    HeaderChainStoreError::Incoherent(
+                        "invalid version-one consensus-invalid tombstone key width",
+                    )
+                })?);
+                let tombstone = match value.first() {
+                    Some(1) => {
+                        // v1 omitted height. Tombstones are append-only evidence for pruned
+                        // headers, so a missing node is a legal v1 layout, not corruption.
+                        let Some(node) = self.header_node(hash)? else {
+                            self.delete_raw(
+                                batch,
+                                HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+                                hash.0,
+                            )?;
+                            tombstone_rows -= 1;
+                            return Ok(());
+                        };
+                        decode_v1_consensus_invalid_body_tombstone(value, node.height)?
+                    }
+                    _ => zakura_header_chain::ConsensusInvalidBodyTombstone::decode(value)?,
+                };
+                if tombstone.hash != hash {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "consensus-invalid tombstone key/value mismatch",
+                    ));
+                }
+                if value.first() == Some(&1) {
+                    self.put_value(
+                        batch,
+                        HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+                        hash.0,
+                        &tombstone,
+                    )?;
+                }
+                Ok(())
+            })
+            .map_err(|error| match error {
+                RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
+                RawVisitError::Visitor(error) => error,
+            })?;
+        self.put_value(
+            batch,
+            HEADER_ENGINE_META,
+            super::TOMBSTONE_COUNT_KEY,
+            &HeaderRowCountDisk(u64::try_from(tombstone_rows).map_err(|_| {
+                HeaderChainStoreError::Incoherent("tombstone count does not fit u64")
+            })?),
+        )?;
+        Ok(tombstone_rows)
     }
 }
 
