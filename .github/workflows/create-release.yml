@@ -282,12 +282,12 @@ jobs:
           if [ "$canary_status" -ne 0 ]; then
             if [ "$canary_status" -eq 124 ]; then
               gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" || true
-              echo "::warning title=Release start canary timed out::The us-east-0 canary exceeded 40 minutes and was cancelled. Review ${run_url} before approving the release."
+              echo "::warning title=Release start canary timed out::The us-east-0 canary exceeded 40 minutes and was cancelled. Review ${run_url}."
             fi
-            echo "::warning title=Release start canary failed::The us-east-0 deploy or startup validation failed. Review ${run_url} before approving the release."
+            echo "::warning title=Release start canary failed::The us-east-0 deploy or startup validation failed. Review ${run_url}."
             {
               echo
-              echo "Result: **failed**. Review the deploy run before approving. This advisory failure does not block release publication."
+              echo "Result: **failed**. This advisory failure does not block release publication."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
@@ -321,11 +321,10 @@ jobs:
   publish:
     name: Publish release and create tag
     runs-on: ubuntu-latest
-    needs: [validate, build-assets, start-canary]
+    needs: [validate, build-assets]
     # Tolerate asset staging being skipped only when emergency Mode B asked for
-    # the source-first path. The start canary finishes before release approval
-    # but is advisory, so its failure or Mode B skip never blocks publication.
-    # The separately dispatched handoff canary also remains advisory.
+    # the source-first path. The independently dispatched handoff and start
+    # canaries are advisory and never delay release approval.
     if: >-
       ${{
         !cancelled()
@@ -333,10 +332,6 @@ jobs:
         && (
           needs.build-assets.result == 'success'
           || (inputs.source_first_release && needs.build-assets.result == 'skipped')
-        )
-        && contains(
-          fromJSON('["success", "failure", "skipped"]'),
-          needs.start-canary.result
         )
       }}
     environment: release
