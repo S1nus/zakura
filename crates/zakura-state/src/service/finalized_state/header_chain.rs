@@ -296,12 +296,21 @@ struct StateIssuedAuthority<'a> {
     inner: Option<&'a dyn FullStateEvidenceAuthority>,
     validation_leases: &'a [ValidationLease],
     active_retention_references: &'a [block::Hash],
+    full_state_authorization_version: Option<StateVersion>,
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.inner
             .is_some_and(|inner| inner.authorizes_full_state(event))
+    }
+
+    fn full_state_authorization_version(&self, event: &TransitionEvent) -> Option<StateVersion> {
+        if self.authorizes_full_state(event) {
+            self.full_state_authorization_version
+        } else {
+            None
+        }
     }
 
     fn authorizes_scheduler_retry(&self, retry: &zakura_header_chain::OperatorBodyRetry) -> bool {
@@ -2308,10 +2317,34 @@ impl HeaderChainRuntime {
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
             .active_references(Instant::now());
 
+        // The state writer binds checkpoint finality evidence to the durable version it read,
+        // and the auxiliary transition below advances that version. Provenance therefore has
+        // to be checked against the pre-auxiliary snapshot the writer actually authorized.
+        let before = transition_engine.snapshot();
+        if checkpoint_request.expected_version != before.state_version {
+            let branch = checkpoint_request
+                .event
+                .header_sync_owner()
+                .map(HeaderSyncWorkOwner::header_authority)
+                .map(|authority| authority.branch)
+                .or_else(|| {
+                    checkpoint_request
+                        .event
+                        .body_owner()
+                        .map(|owner| owner.branch)
+                });
+            return Ok(ApplyResult::Stale(StaleReceipt {
+                current_version: before.state_version,
+                branch,
+            }));
+        }
+        validate_full_state_finality_provenance(&checkpoint_request.event, &before)?;
+
         let first_authority = StateIssuedAuthority {
             inner: first_context.full_state_authority,
             validation_leases: &[],
             active_retention_references: lease_references.as_ref(),
+            full_state_authorization_version: None,
         };
         let first_context = TransitionContext {
             config: first_context.config,
@@ -2351,6 +2384,7 @@ impl HeaderChainRuntime {
             inner: checkpoint_context.full_state_authority,
             validation_leases: validation_leases.as_slice(),
             active_retention_references: lease_references.as_ref(),
+            full_state_authorization_version: Some(before.state_version),
         };
         let checkpoint_context = TransitionContext {
             config: checkpoint_context.config,
@@ -2390,10 +2424,6 @@ impl HeaderChainRuntime {
         }
 
         let expected_version = transition_engine.snapshot().state_version;
-        validate_full_state_finality_provenance(
-            &checkpoint_request.event,
-            &transition_engine.snapshot(),
-        )?;
         let TransitionEvent::VerifiedChainChanged(checkpoint_event) = checkpoint_request.event
         else {
             return Err(HeaderChainStoreError::Incoherent(
@@ -2679,6 +2709,7 @@ impl HeaderChainRuntime {
             inner: base_context.full_state_authority,
             validation_leases: &validation_leases,
             active_retention_references: lease_references.as_deref().unwrap_or_default(),
+            full_state_authorization_version: Some(before.state_version),
         };
         let transition_context = TransitionContext {
             config: base_context.config,
