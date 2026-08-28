@@ -186,7 +186,7 @@ fn v3_history_node_hash_input_has_exact_serialized_size() -> Result<()> {
     // value in a V3 node.
     assert_eq!(encoded.len(), serialized_v3_node_data_size(&node_data));
     assert_eq!(encoded.last(), Some(&1));
-    assert_eq!(::zcash_history::MAX_NODE_DATA_SIZE, 317);
+    assert_eq!(::zcash_history::MAX_NODE_DATA_SIZE, 390);
 
     Ok(())
 }

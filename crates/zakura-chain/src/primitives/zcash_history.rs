@@ -9,7 +9,7 @@ mod tests;
 use std::{collections::BTreeMap, io, sync::Arc};
 
 use serde_big_array::BigArray;
-pub use zcash_history::{V1, V2, V3};
+pub use zcash_history::{MAX_ENTRY_SIZE, V1, V2, V3};
 
 use crate::{
     block::{Block, ChainHistoryMmrRootHash, Header, Height},
