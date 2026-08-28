@@ -120,14 +120,18 @@ impl Version {
                 170_150
             }
             (Mainnet, Nu6_2) => 170_150,
-            // TODO: these NU6.3 (Ironwood) and Nu7 protocol versions are provisional, bumped above
-            // Nu6_2's 170_150. Update them when the real values are specified.
+            // TODO: these NU6.3, NU7, and NuTachyon protocol versions are provisional, bumped
+            // above Nu6_2's 170_150. Update them when the real values are specified.
             (Testnet(params), Nu6_3) if params.is_default_testnet() || params.is_regtest() => {
                 170_160
             }
             (Mainnet, Nu6_3) => 170_160,
             (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_170,
             (Mainnet, Nu7) => 170_180,
+            (Testnet(params), NuTachyon) if params.is_default_testnet() || params.is_regtest() => {
+                170_190
+            }
+            (Mainnet, NuTachyon) => 170_190,
 
             // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
             (Testnet(_), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
@@ -220,7 +224,10 @@ mod test {
 
         let highest_network_upgrade = NetworkUpgrade::current(network, block::Height::MAX);
         assert!(
-            matches!(highest_network_upgrade, Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7),
+            matches!(
+                highest_network_upgrade,
+                Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 | NuTachyon
+            ),
             "expected coverage of all network upgrades: \
             add the new network upgrade to the list in this test"
         );
@@ -238,6 +245,7 @@ mod test {
             Nu6_2,
             Nu6_3,
             Nu7,
+            NuTachyon,
         ] {
             let height = network_upgrade.activation_height(network);
             if let Some(height) = height {
@@ -250,19 +258,22 @@ mod test {
     }
 
     #[test]
-    fn nu63_protocol_versions_match_current_version() {
+    fn nu_tachyon_protocol_versions_match_current_version() {
         let _init_guard = zakura_test::init();
 
         assert_eq!(
-            Version::min_specified_for_upgrade(&Mainnet, Nu6_3),
+            Version::min_specified_for_upgrade(&Mainnet, NuTachyon),
             CURRENT_NETWORK_PROTOCOL_VERSION
         );
         assert_eq!(
-            Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_3),
+            Version::min_specified_for_upgrade(&Network::new_default_testnet(), NuTachyon),
             CURRENT_NETWORK_PROTOCOL_VERSION
         );
         assert_eq!(
-            Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_3),
+            Version::min_specified_for_upgrade(
+                &Network::new_regtest(Default::default()),
+                NuTachyon
+            ),
             CURRENT_NETWORK_PROTOCOL_VERSION
         );
     }

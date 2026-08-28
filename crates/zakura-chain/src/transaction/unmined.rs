@@ -1,8 +1,8 @@
 //! Unmined Zcash transaction identifiers and transactions.
 //!
-//! Transaction versions 5 and 6 are uniquely identified by [`WtxId`] when
+//! Transaction versions 5 and later are uniquely identified by [`WtxId`] when
 //! unmined, and [`struct@Hash`] in the blockchain. The effects of a v5 or
-//! v6 transaction (spends and outputs) are uniquely identified by the same
+//! v5+ transaction (spends and outputs) are uniquely identified by the same
 //! [`struct@Hash`] in both cases.
 //!
 //! Transaction versions 1-4 are uniquely identified by legacy
@@ -98,8 +98,8 @@ pub enum UnminedTxId {
 
     /// A witnessed unmined transaction identifier.
     ///
-    /// Used to uniquely identify unmined version 5 and 6 transactions.
-    /// (After v5 and v6 transactions are mined, they can be uniquely identified
+    /// Used to uniquely identify unmined version 5+ transactions.
+    /// (After v5+ transactions are mined, they can be uniquely identified
     /// using only the [`struct@Hash`] in their `WtxId.id`.)
     ///
     /// For more details, see [`WtxId`].
@@ -141,7 +141,7 @@ impl From<&Transaction> for UnminedTxId {
         match transaction {
             V1 { .. } | V2 { .. } | V3 { .. } | V4 { .. } => Legacy(transaction.into()),
             V5 { .. } => Witnessed(transaction.into()),
-            V6 { .. } => Witnessed(transaction.into()),
+            V6 { .. } | V7 { .. } => Witnessed(transaction.into()),
         }
     }
 }

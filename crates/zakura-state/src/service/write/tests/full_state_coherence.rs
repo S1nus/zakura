@@ -176,6 +176,7 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
                 nu6_2: Some(120),
                 nu6_3: Some(130),
                 nu7: Some(140),
+                nu_tachyon: None,
             })
             .expect("the compressed activation schedule is ordered")
             .with_disable_pow(true)

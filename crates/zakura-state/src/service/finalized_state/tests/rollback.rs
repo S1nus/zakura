@@ -870,6 +870,7 @@ fn modern_rollback_network() -> Network {
             nu6_2: Some(10),
             nu6_3: Some(11),
             nu7: Some(12),
+            nu_tachyon: None,
         })
         .expect("configured activation heights are valid")
         .extend_funding_streams()

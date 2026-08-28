@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-use crate::parameters::TX_V6_VERSION_GROUP_ID;
+use crate::parameters::{TX_V6_VERSION_GROUP_ID, TX_V7_VERSION_GROUP_ID};
 
 use super::*;
 use crate::sapling;
@@ -199,7 +199,7 @@ impl ZcashDeserialize for Option<sapling::ShieldedData<sapling::SharedAnchor>> {
     }
 }
 
-/// Deserialize V5/V6 Sapling shielded data with an optional early coinbase
+/// Deserialize V5+ Sapling shielded data with an optional early coinbase
 /// rejection.
 ///
 /// When `is_coinbase` is true, a non-zero `nSpendsSapling` count is rejected
@@ -875,6 +875,45 @@ impl ZcashSerialize for Transaction {
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
             }
+            Transaction::V7 {
+                network_upgrade,
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ironwood_shielded_data,
+            } => {
+                if *network_upgrade < NetworkUpgrade::NuTachyon {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "v7 transaction must have a NuTachyon or later consensus branch ID",
+                    ));
+                }
+
+                writer.write_u32::<LittleEndian>(TX_V7_VERSION_GROUP_ID)?;
+                writer.write_u32::<LittleEndian>(u32::from(
+                    network_upgrade
+                        .branch_id()
+                        .expect("valid transactions must have a network upgrade with a branch id"),
+                ))?;
+                lock_time.zcash_serialize(&mut writer)?;
+                writer.write_u32::<LittleEndian>(expiry_height.0)?;
+                inputs.zcash_serialize(&mut writer)?;
+                outputs.zcash_serialize(&mut writer)?;
+                sapling_shielded_data.zcash_serialize(&mut writer)?;
+                serialize_optional_orchard_shielded_data_with_flags(
+                    orchard_shielded_data,
+                    &mut writer,
+                    !ALLOW_CROSS_ADDRESS_BIT,
+                )?;
+                serialize_optional_orchard_shielded_data_with_flags(
+                    ironwood_shielded_data,
+                    &mut writer,
+                    ALLOW_CROSS_ADDRESS_BIT,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1225,6 +1264,49 @@ impl ZcashDeserialize for Transaction {
                 )?;
 
                 Ok(Transaction::V6 {
+                    network_upgrade,
+                    lock_time,
+                    expiry_height,
+                    inputs,
+                    outputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                })
+            }
+            (7, true) => {
+                let id = limited_reader.read_u32::<LittleEndian>()?;
+                if id != TX_V7_VERSION_GROUP_ID {
+                    return Err(SerializationError::Parse("expected TX_V7_VERSION_GROUP_ID"));
+                }
+
+                let network_upgrade =
+                    NetworkUpgrade::try_from(limited_reader.read_u32::<LittleEndian>()?)?;
+                if network_upgrade < NetworkUpgrade::NuTachyon {
+                    return Err(SerializationError::Parse(
+                        "v7 transaction must have a NuTachyon or later consensus branch ID",
+                    ));
+                }
+
+                let lock_time = LockTime::zcash_deserialize(&mut limited_reader)?;
+                let expiry_height = block::Height(limited_reader.read_u32::<LittleEndian>()?);
+                let inputs: Vec<transparent::Input> = Vec::zcash_deserialize(&mut limited_reader)?;
+                let outputs = Vec::zcash_deserialize(&mut limited_reader)?;
+
+                let is_coinbase = inputs.len() == 1
+                    && matches!(inputs.first(), Some(transparent::Input::Coinbase { .. }));
+                let sapling_shielded_data =
+                    deserialize_v5_sapling_shielded_data(&mut limited_reader, is_coinbase)?;
+                let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
+                    &mut limited_reader,
+                    !ALLOW_CROSS_ADDRESS_BIT,
+                )?;
+                let ironwood_shielded_data = deserialize_orchard_shielded_data_with_flags(
+                    &mut limited_reader,
+                    ALLOW_CROSS_ADDRESS_BIT,
+                )?;
+
+                Ok(Transaction::V7 {
                     network_upgrade,
                     lock_time,
                     expiry_height,

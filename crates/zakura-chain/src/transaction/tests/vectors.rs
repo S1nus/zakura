@@ -1721,6 +1721,10 @@ fn binding_signatures() {
                     Transaction::V6 {
                         sapling_shielded_data,
                         ..
+                    }
+                    | Transaction::V7 {
+                        sapling_shielded_data,
+                        ..
                     } => {
                         if let Some(sapling_shielded_data) = sapling_shielded_data {
                             // V6 txs have the outputs spent by their transparent inputs hashed into
@@ -1822,6 +1826,79 @@ fn v6_version_group_id_matches_librustzcash_and_wire_format() {
     assert!(matches!(
         error,
         SerializationError::Parse("expected TX_V6_VERSION_GROUP_ID")
+    ));
+}
+
+#[test]
+fn v7_is_nu_tachyon_gated_and_matches_librustzcash() {
+    use crate::parameters::TX_V7_VERSION_GROUP_ID;
+
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(
+        TX_V7_VERSION_GROUP_ID,
+        zcash_protocol::constants::V7_VERSION_GROUP_ID,
+    );
+    assert_eq!(
+        TX_V7_VERSION_GROUP_ID,
+        zcash_primitives::transaction::TxVersion::V7.version_group_id(),
+    );
+
+    let empty_v7 = |network_upgrade| Transaction::V7 {
+        network_upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+    };
+
+    empty_v7(NetworkUpgrade::Nu6_3)
+        .zcash_serialize_to_vec()
+        .expect_err("V7 must not serialize before NuTachyon");
+
+    let tx = empty_v7(NetworkUpgrade::NuTachyon);
+    let tx_bytes = tx
+        .zcash_serialize_to_vec()
+        .expect("an empty NuTachyon V7 transaction has a valid wire encoding");
+    assert_eq!(&tx_bytes[0..4], &[0x07, 0x00, 0x00, 0x80]);
+    assert_eq!(&tx_bytes[4..8], &TX_V7_VERSION_GROUP_ID.to_le_bytes());
+    assert_eq!(&tx_bytes[8..12], &0xffff_fffcu32.to_le_bytes());
+    assert_eq!(tx.version_group_id(), Some(TX_V7_VERSION_GROUP_ID));
+
+    let decoded = Transaction::zcash_deserialize(&tx_bytes[..])
+        .expect("Zakura must deserialize its NuTachyon V7 encoding");
+    assert_eq!(decoded, tx);
+    let librustzcash_tx = tx
+        .to_librustzcash(NetworkUpgrade::NuTachyon)
+        .expect("librustzcash must accept Zakura's NuTachyon V7 encoding");
+    assert_eq!(tx.hash().0, *librustzcash_tx.txid().as_ref());
+    let librustzcash_auth_digest: [u8; 32] = librustzcash_tx
+        .auth_commitment()
+        .as_ref()
+        .try_into()
+        .expect("the authorizing-data digest is 32 bytes");
+    assert_eq!(
+        tx.auth_digest()
+            .expect("V7 transactions have an authorizing-data digest")
+            .0,
+        librustzcash_auth_digest,
+    );
+
+    let mut pre_nu_tachyon = tx_bytes;
+    let nu6_3_branch_id = u32::from(
+        NetworkUpgrade::Nu6_3
+            .branch_id()
+            .expect("NU6.3 has a branch ID"),
+    );
+    pre_nu_tachyon[8..12].copy_from_slice(&nu6_3_branch_id.to_le_bytes());
+    let error = Transaction::zcash_deserialize(&pre_nu_tachyon[..])
+        .expect_err("V7 must not deserialize with a pre-NuTachyon branch ID");
+    assert!(matches!(
+        error,
+        SerializationError::Parse(message) if message.contains("NuTachyon")
     ));
 }
 

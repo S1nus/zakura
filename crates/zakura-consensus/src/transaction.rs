@@ -612,15 +612,15 @@ where
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v5 transaction has a witnessed transaction ID"),
                 )?,
-                Transaction::V6 {
-                    ..
-                } => Self::verify_v6_transaction(
-                    &req,
-                    &network,
-                    script_verifier,
-                    cached_ffi_transaction.clone(),
-                    wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
-                )?,
+                Transaction::V6 { .. } | Transaction::V7 { .. } => {
+                    Self::verify_v6_or_v7_transaction(
+                        &req,
+                        &network,
+                        script_verifier,
+                        cached_ffi_transaction.clone(),
+                        wtx_id.expect("a v6 or v7 transaction has a witnessed transaction ID"),
+                    )?
+                }
             };
 
             if let Some(unmined_tx) = mempool_transaction {
@@ -994,7 +994,8 @@ where
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
-            | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            | NetworkUpgrade::Nu7
+            | NetworkUpgrade::NuTachyon => Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
             )),
@@ -1080,7 +1081,8 @@ where
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
-            | NetworkUpgrade::Nu7 => Ok(()),
+            | NetworkUpgrade::Nu7
+            | NetworkUpgrade::NuTachyon => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -1099,8 +1101,8 @@ where
         }
     }
 
-    /// Verify a V6 transaction.
-    fn verify_v6_transaction(
+    /// Verify a V6 or V7 transaction.
+    fn verify_v6_or_v7_transaction(
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
@@ -1110,7 +1112,15 @@ where
         let transaction = request.transaction();
         let nu = request.upgrade(network);
 
-        Self::verify_v6_transaction_network_upgrade(&transaction, nu)?;
+        match transaction.as_ref() {
+            Transaction::V6 { .. } => {
+                Self::verify_v6_transaction_network_upgrade(&transaction, nu)?
+            }
+            Transaction::V7 { .. } => {
+                Self::verify_v7_transaction_network_upgrade(&transaction, nu)?
+            }
+            _ => unreachable!("V6/V7 verification is only called for V6 or V7 transactions"),
+        }
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
@@ -1150,6 +1160,21 @@ where
         network_upgrade: NetworkUpgrade,
     ) -> Result<(), TransactionError> {
         if network_upgrade < NetworkUpgrade::Nu6_3 {
+            return Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Verifies if a V7 `transaction` is supported by `network_upgrade`.
+    fn verify_v7_transaction_network_upgrade(
+        transaction: &Transaction,
+        network_upgrade: NetworkUpgrade,
+    ) -> Result<(), TransactionError> {
+        if network_upgrade < NetworkUpgrade::NuTachyon {
             return Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
@@ -1346,7 +1371,7 @@ where
     ///
     /// `wtx_id` identifies the transaction containing `bundle`; the cache adds
     /// the bundle's value pool to distinguish the Orchard and Ironwood slots in
-    /// a v6 transaction.
+    /// a v6 or v7 transaction.
     fn verify_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,

@@ -660,7 +660,7 @@ impl SpendConflictTestInput {
 
                 // No JoinSplits
                 Transaction::V1 { .. } | Transaction::V5 { .. } => {}
-                Transaction::V6 { .. } => {}
+                Transaction::V6 { .. } | Transaction::V7 { .. } => {}
             }
         }
     }
@@ -732,6 +732,10 @@ impl SpendConflictTestInput {
                 }
 
                 Transaction::V6 {
+                    sapling_shielded_data,
+                    ..
+                }
+                | Transaction::V7 {
                     sapling_shielded_data,
                     ..
                 } => {
@@ -810,6 +814,10 @@ impl SpendConflictTestInput {
                 } => Self::remove_orchard_actions_with_conflicts(orchard_shielded_data, &conflicts),
 
                 Transaction::V6 {
+                    orchard_shielded_data,
+                    ..
+                }
+                | Transaction::V7 {
                     orchard_shielded_data,
                     ..
                 } => Self::remove_orchard_actions_with_conflicts(orchard_shielded_data, &conflicts),

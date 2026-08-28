@@ -1854,6 +1854,14 @@ impl Chain {
                     orchard_shielded_data,
                     ironwood_shielded_data,
                     ..
+                }
+                | V7 {
+                    inputs,
+                    outputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                    ..
                 } => (
                     inputs,
                     outputs,
@@ -2057,6 +2065,14 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     &None::<ironwood::ShieldedData>,
                 ),
                 V6 {
+                    inputs,
+                    outputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                    ..
+                }
+                | V7 {
                     inputs,
                     outputs,
                     sapling_shielded_data,
