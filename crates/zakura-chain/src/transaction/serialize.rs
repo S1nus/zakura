@@ -913,6 +913,10 @@ impl ZcashSerialize for Transaction {
                     &mut writer,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
+                zcash_primitives::transaction::components::tachyon::write_v7_bundle(
+                    None,
+                    &mut writer,
+                )?;
             }
         }
         Ok(())
@@ -1305,6 +1309,15 @@ impl ZcashDeserialize for Transaction {
                     &mut limited_reader,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
+                if zcash_primitives::transaction::components::tachyon::read_v7_bundle(
+                    &mut limited_reader,
+                )?
+                .is_some()
+                {
+                    return Err(SerializationError::Parse(
+                        "Tachyon bundles are not yet supported",
+                    ));
+                }
 
                 Ok(Transaction::V7 {
                     network_upgrade,
