@@ -1830,6 +1830,7 @@ fn v6_version_group_id_matches_librustzcash_and_wire_format() {
 }
 
 #[test]
+#[cfg(zcash_unstable = "nutachyon")]
 fn v7_is_nu_tachyon_gated_and_matches_librustzcash() {
     use crate::parameters::TX_V7_VERSION_GROUP_ID;
 

@@ -913,10 +913,13 @@ impl ZcashSerialize for Transaction {
                     &mut writer,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
+                #[cfg(zcash_unstable = "nutachyon")]
                 zcash_primitives::transaction::components::tachyon::write_v7_bundle(
                     None,
                     &mut writer,
                 )?;
+                #[cfg(not(zcash_unstable = "nutachyon"))]
+                writer.write_u8(0)?;
             }
         }
         Ok(())
@@ -1309,6 +1312,7 @@ impl ZcashDeserialize for Transaction {
                     &mut limited_reader,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
+                #[cfg(zcash_unstable = "nutachyon")]
                 if zcash_primitives::transaction::components::tachyon::read_v7_bundle(
                     &mut limited_reader,
                 )?
@@ -1316,6 +1320,12 @@ impl ZcashDeserialize for Transaction {
                 {
                     return Err(SerializationError::Parse(
                         "Tachyon bundles are not yet supported",
+                    ));
+                }
+                #[cfg(not(zcash_unstable = "nutachyon"))]
+                if limited_reader.read_u8()? != 0 {
+                    return Err(SerializationError::Parse(
+                        "Tachyon bundles are not available in this build",
                     ));
                 }
 
