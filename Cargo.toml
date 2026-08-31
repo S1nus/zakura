@@ -183,6 +183,10 @@ zcash_note_encryption = "0.4.1"
 zcash_script = "0.4.5"
 config = { version = "0.15.14", default-features = false, features = ["toml"] }
 
+[patch.crates-io]
+zakura-pasta-curves = { git = "https://github.com/zakura-core/common.git", rev = "a22713f15769fd3dfcf0c1816fcde6114ac344e8" }
+zakura-reddsa = { git = "https://github.com/zakura-core/common.git", rev = "a22713f15769fd3dfcf0c1816fcde6114ac344e8" }
+
 # All cargo-release configuration lives in this table. Do not add a root
 # release.toml: it would silently shadow every setting here (cargo-release
 # reads a workspace release.toml in preference to this metadata table).
