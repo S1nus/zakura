@@ -2725,9 +2725,9 @@ where
             mempool_tx_deps,
         );
 
-        #[cfg(test)]
+        #[cfg(all(test, zcash_unstable = "nutachyon"))]
         let (dependency_depths, selected_txs): (Vec<_>, Vec<_>) = mempool_txs.into_iter().unzip();
-        #[cfg(not(test))]
+        #[cfg(all(not(test), zcash_unstable = "nutachyon"))]
         let selected_txs = mempool_txs;
 
         #[cfg(zcash_unstable = "nutachyon")]
@@ -2740,9 +2740,9 @@ where
         )
         .await;
 
-        #[cfg(test)]
+        #[cfg(all(test, zcash_unstable = "nutachyon"))]
         let mempool_txs: Vec<_> = dependency_depths.into_iter().zip(selected_txs).collect();
-        #[cfg(not(test))]
+        #[cfg(all(not(test), zcash_unstable = "nutachyon"))]
         let mempool_txs = selected_txs;
 
         tracing::debug!(
