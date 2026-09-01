@@ -104,6 +104,7 @@ impl VerifiedHeaderCommitmentRoots {
 pub enum SuppliedRootsError {
     /// The roots-only auxiliary format cannot reconstruct Tachyon history state.
     #[error("Tachyon history commitments require block bodies")]
+    #[cfg(zcash_unstable = "nutachyon")]
     TachyonDataUnavailable,
 
     /// A header commitment did not match its supplied auxiliary data.
@@ -147,6 +148,7 @@ where
     for (index, (header, roots)) in items.iter().enumerate() {
         let height = roots.height;
 
+        #[cfg(zcash_unstable = "nutachyon")]
         if NetworkUpgrade::current(network, height) >= NetworkUpgrade::NuTachyon {
             return Err((height, SuppliedRootsError::TachyonDataUnavailable));
         }
@@ -191,10 +193,12 @@ where
                 sapling_root: &roots.sapling_root,
                 orchard_root: &roots.orchard_root,
                 ironwood_root: &roots.ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
                 tachyon_anchor: &Default::default(),
                 sapling_tx: roots.sapling_tx,
                 orchard_tx: roots.orchard_tx,
                 ironwood_tx: roots.ironwood_tx,
+                #[cfg(zcash_unstable = "nutachyon")]
                 tachyon_tx: 0,
             },
         )
@@ -490,6 +494,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
             &Default::default(),
         )
         .expect("empty history tree for a pre-Heartwood block")
@@ -925,6 +930,7 @@ mod tests {
                 &act_root,
                 &empty_orchard_root,
                 &empty_ironwood_root(),
+                #[cfg(zcash_unstable = "nutachyon")]
                 &Default::default(),
             )
             .expect("activation block builds a history tree")
@@ -952,6 +958,7 @@ mod tests {
             &empty_sapling_root,
             &empty_orchard_root,
             &empty_ironwood_root(),
+            #[cfg(zcash_unstable = "nutachyon")]
             &Default::default(),
         )
         .expect("the parent history tree builds");

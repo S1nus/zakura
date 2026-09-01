@@ -486,7 +486,9 @@ where
             // Transaction parsing enforces the same rule. Repeat it here for
             // defense-in-depth and transactions constructed in memory.
             check::shielded_proof_size_is_canonical(&tx)?;
+            #[cfg(zcash_unstable = "nutachyon")]
             check::tachyon_actions_have_valid_digests(&tx)?;
+            #[cfg(zcash_unstable = "nutachyon")]
             if req.is_mempool() {
                 check::tachyon_bundle_is_autonome(&tx)?;
             }
@@ -616,7 +618,7 @@ where
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v5 transaction has a witnessed transaction ID"),
                 )?,
-                Transaction::V6 { .. } | Transaction::V7 { .. } => {
+                Transaction::V6 { .. } => {
                     Self::verify_v6_or_v7_transaction(
                         &req,
                         &network,
@@ -625,6 +627,14 @@ where
                         wtx_id.expect("a v6 or v7 transaction has a witnessed transaction ID"),
                     )?
                 }
+                #[cfg(zcash_unstable = "nutachyon")]
+                Transaction::V7 { .. } => Self::verify_v6_or_v7_transaction(
+                    &req,
+                    &network,
+                    script_verifier,
+                    cached_ffi_transaction.clone(),
+                    wtx_id.expect("a v6 or v7 transaction has a witnessed transaction ID"),
+                )?,
             };
 
             if let Some(unmined_tx) = mempool_transaction {
@@ -998,8 +1008,13 @@ where
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
-            | NetworkUpgrade::Nu7
-            | NetworkUpgrade::NuTachyon => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            )),
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
             )),
@@ -1085,8 +1100,10 @@ where
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
-            | NetworkUpgrade::Nu7
-            | NetworkUpgrade::NuTachyon => Ok(()),
+            | NetworkUpgrade::Nu7 => Ok(()),
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -1120,6 +1137,7 @@ where
             Transaction::V6 { .. } => {
                 Self::verify_v6_transaction_network_upgrade(&transaction, nu)?
             }
+            #[cfg(zcash_unstable = "nutachyon")]
             Transaction::V7 { .. } => {
                 Self::verify_v7_transaction_network_upgrade(&transaction, nu)?
             }
@@ -1134,7 +1152,7 @@ where
             .sighasher()
             .sighash(HashType::ALL, None);
 
-        Ok(Self::verify_transparent_inputs_and_outputs(
+        let async_checks = Self::verify_transparent_inputs_and_outputs(
             request,
             script_verifier,
             cached_ffi_transaction,
@@ -1155,8 +1173,13 @@ where
             &sighash,
             nu,
             wtx_id,
-        ))
-        .and(Self::verify_tachyon_signatures(&transaction, &sighash)))
+        ));
+
+        #[cfg(zcash_unstable = "nutachyon")]
+        let async_checks =
+            async_checks.and(Self::verify_tachyon_signatures(&transaction, &sighash));
+
+        Ok(async_checks)
     }
 
     /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
@@ -1175,6 +1198,7 @@ where
     }
 
     /// Verifies if a V7 `transaction` is supported by `network_upgrade`.
+    #[cfg(zcash_unstable = "nutachyon")]
     fn verify_v7_transaction_network_upgrade(
         transaction: &Transaction,
         network_upgrade: NetworkUpgrade,
@@ -1190,6 +1214,7 @@ where
     }
 
     /// Queues verification of a V7 transaction's Tachyon action and binding signatures.
+    #[cfg(zcash_unstable = "nutachyon")]
     fn verify_tachyon_signatures(tx: &Transaction, sighash: &SigHash) -> AsyncChecks {
         use zcash_tachyon::TachyonBundle;
 

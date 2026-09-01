@@ -240,6 +240,7 @@ pub enum RollbackFinalizedStateError {
 
     /// Rebuilding the Tachyon anchor failed.
     #[error("failed to rebuild the Tachyon anchor")]
+    #[cfg(zcash_unstable = "nutachyon")]
     TachyonAnchor(#[from] zcash_tachyon::AnchorError),
 
     /// Computing a block subsidy failed.
@@ -610,7 +611,9 @@ fn rebuild_history_tree_from_upgrade_activation(
 
     let (block, sapling_root, orchard_root, ironwood_root) =
         history_rebuild_inputs_at_height(db, start_height)?;
+    #[cfg(zcash_unstable = "nutachyon")]
     let mut tachyon_anchor = zakura_chain::tachyon::Anchor::default();
+    #[cfg(zcash_unstable = "nutachyon")]
     if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, start_height) {
         tachyon_anchor = tachyon_anchor
             .advance_with_block(pool_height, &block)?
@@ -622,6 +625,7 @@ fn rebuild_history_tree_from_upgrade_activation(
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
         &tachyon_anchor,
     )?;
 
@@ -629,6 +633,7 @@ fn rebuild_history_tree_from_upgrade_activation(
         let (block, sapling_root, orchard_root, ironwood_root) =
             history_rebuild_inputs_at_height(db, height)?;
 
+        #[cfg(zcash_unstable = "nutachyon")]
         if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, height) {
             tachyon_anchor = tachyon_anchor
                 .advance_with_block(pool_height, &block)?
@@ -641,6 +646,7 @@ fn rebuild_history_tree_from_upgrade_activation(
             &sapling_root,
             &orchard_root,
             &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
             &tachyon_anchor,
         )?;
     }
@@ -708,6 +714,7 @@ fn rebuild_treestate_to_height(
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
 
         note_commitment_trees.update_trees_parallel(&block)?;
+        #[cfg(zcash_unstable = "nutachyon")]
         if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, height) {
             let advance = note_commitment_trees
                 .tachyon_anchor
@@ -726,6 +733,7 @@ fn rebuild_treestate_to_height(
             &sapling_root,
             &orchard_root,
             &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
             &note_commitment_trees.tachyon_anchor,
         )?;
     }

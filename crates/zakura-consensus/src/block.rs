@@ -36,6 +36,7 @@ use crate::{error::*, primitives, transaction as tx, BoxError};
 pub mod check;
 pub mod request;
 pub mod subsidy;
+#[cfg(zcash_unstable = "nutachyon")]
 pub(crate) mod tachyon;
 
 pub use request::Request;
@@ -126,15 +127,21 @@ impl VerifyBlockError {
                     consensus("block.too_many_transparent_signature_operations")
                 }
                 BlockError::SummingMinerFees { .. } => consensus("block.summing_miner_fees"),
+                #[cfg(zcash_unstable = "nutachyon")]
                 BlockError::DuplicateTachygram => consensus("block.duplicate_tachygram"),
+                #[cfg(zcash_unstable = "nutachyon")]
                 BlockError::TachyonAggregateNotFound => {
                     consensus("block.tachyon_aggregate_not_found")
                 }
+                #[cfg(zcash_unstable = "nutachyon")]
                 BlockError::TachyonCoverageMismatch => consensus("block.tachyon_coverage_mismatch"),
+                #[cfg(zcash_unstable = "nutachyon")]
                 BlockError::TachyonDuplicateAction => consensus("block.tachyon_duplicate_action"),
+                #[cfg(zcash_unstable = "nutachyon")]
                 BlockError::TachyonTachygramArityMismatch => {
                     consensus("block.tachyon_tachygram_arity_mismatch")
                 }
+                #[cfg(zcash_unstable = "nutachyon")]
                 BlockError::TachyonProofInvalid(_) => consensus("block.tachyon_proof_invalid"),
                 BlockError::InvalidHeaderEncoding(_)
                 | BlockError::MissingHeight(_)
@@ -328,6 +335,7 @@ where
 
             check::merkle_root_validity(&network, &block, &transaction_hashes)?;
 
+            #[cfg(zcash_unstable = "nutachyon")]
             let mut tachyon_checks = tachyon::coherence(&block)?
                 .into_iter()
                 .map(primitives::tachyon::verify_proof_stamp)
@@ -419,6 +427,7 @@ where
 
             // Check the summed block totals
 
+            #[cfg(zcash_unstable = "nutachyon")]
             while let Some(result) = tachyon_checks.next().await {
                 result?;
             }

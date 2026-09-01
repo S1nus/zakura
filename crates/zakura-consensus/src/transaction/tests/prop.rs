@@ -331,6 +331,7 @@ fn mock_transparent_transaction(
             ironwood_shielded_data: None,
             network_upgrade,
         },
+        #[cfg(zcash_unstable = "nutachyon")]
         7 => Transaction::V7 {
             inputs,
             outputs,
@@ -371,6 +372,7 @@ fn sanitize_transaction_version(
             Nu5 | Nu6 | Nu6_1 | Nu6_2 => (4, 5),
             Nu6_3 => (4, 6),
             Nu7 => (5, 5),
+            #[cfg(zcash_unstable = "nutachyon")]
             NuTachyon => (5, 7),
 
             #[cfg(zcash_unstable = "zfuture")]
@@ -384,6 +386,7 @@ fn sanitize_transaction_version(
 }
 
 #[test]
+#[cfg(zcash_unstable = "nutachyon")]
 fn sanitize_transaction_version_handles_v6_and_v7_upgrades() {
     let network = zakura_chain::parameters::testnet::Parameters::build()
         .with_activation_heights(

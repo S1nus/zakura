@@ -18,6 +18,11 @@ mod tests;
 
 use ValueBalanceError::*;
 
+#[cfg(not(zcash_unstable = "nutachyon"))]
+const VALUE_BALANCE_BYTES: usize = 48;
+#[cfg(zcash_unstable = "nutachyon")]
+const VALUE_BALANCE_BYTES: usize = 56;
+
 /// A balance in each chain value pool or transaction value pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct ValueBalance<C> {
@@ -27,6 +32,7 @@ pub struct ValueBalance<C> {
     orchard: Amount<C>,
     deferred: Amount<C>,
     ironwood: Amount<C>,
+    #[cfg(zcash_unstable = "nutachyon")]
     tachyon: Amount<C>,
 }
 
@@ -75,6 +81,7 @@ where
     }
 
     /// Creates a [`ValueBalance`] from the given Tachyon amount.
+    #[cfg(zcash_unstable = "nutachyon")]
     pub fn from_tachyon_amount(tachyon_amount: Amount<C>) -> Self {
         ValueBalance {
             tachyon: tachyon_amount,
@@ -157,11 +164,13 @@ where
     }
 
     /// Get the Tachyon amount from the [`ValueBalance`].
+    #[cfg(zcash_unstable = "nutachyon")]
     pub fn tachyon_amount(&self) -> Amount<C> {
         self.tachyon
     }
 
     /// Insert a Tachyon value balance without changing the other pools.
+    #[cfg(zcash_unstable = "nutachyon")]
     pub fn set_tachyon_value_balance(&mut self, tachyon_value_balance: ValueBalance<C>) -> &Self {
         self.tachyon = tachyon_value_balance.tachyon;
         self
@@ -177,6 +186,7 @@ where
             orchard: zero,
             deferred: zero,
             ironwood: zero,
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon: zero,
         }
     }
@@ -194,6 +204,7 @@ where
             orchard: self.orchard.constrain().map_err(Orchard)?,
             deferred: self.deferred.constrain().map_err(Deferred)?,
             ironwood: self.ironwood.constrain().map_err(Ironwood)?,
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon: self.tachyon.constrain().map_err(Tachyon)?,
         })
     }
@@ -221,13 +232,12 @@ impl ValueBalance<NegativeAllowed> {
         // like the orchard bundle; it is zero for transactions without an ironwood bundle.
         //
         // This will error if the remaining value in the transaction value pool is negative.
-        (self.transparent
-            + self.sprout
-            + self.sapling
-            + self.orchard
-            + self.ironwood
-            + self.tachyon)?
-            .constrain::<NonNegative>()
+        let remaining =
+            self.transparent + self.sprout + self.sapling + self.orchard + self.ironwood;
+        #[cfg(zcash_unstable = "nutachyon")]
+        let remaining = remaining? + self.tachyon;
+
+        remaining?.constrain::<NonNegative>()
     }
 }
 
@@ -379,7 +389,7 @@ impl ValueBalance<NonNegative> {
     ///
     /// New pools are appended in activation order, so older records remain parsable by
     /// [`Self::from_bytes`].
-    pub fn to_bytes(self) -> [u8; 56] {
+    pub fn to_bytes(self) -> [u8; VALUE_BALANCE_BYTES] {
         match [
             self.transparent.to_bytes(),
             self.sprout.to_bytes(),
@@ -387,6 +397,7 @@ impl ValueBalance<NonNegative> {
             self.orchard.to_bytes(),
             self.deferred.to_bytes(),
             self.ironwood.to_bytes(),
+            #[cfg(zcash_unstable = "nutachyon")]
             self.tachyon.to_bytes(),
         ]
         .concat()
@@ -394,7 +405,7 @@ impl ValueBalance<NonNegative> {
         {
             Ok(bytes) => bytes,
             _ => unreachable!(
-                "seven [u8; 8] should always concat with no error into a single [u8; 56]"
+                "the value balance fields should concat into the configured fixed-width array"
             ),
         }
     }
@@ -408,10 +419,11 @@ impl ValueBalance<NonNegative> {
         let bytes_length = bytes.len();
 
         // Return an error early if bytes don't have the right length instead of panicking later.
-        match bytes_length {
-            32 | 40 | 48 | 56 => {}
-            _ => return Err(Unparsable),
-        };
+        let valid_length = matches!(bytes_length, 32 | 40 | 48)
+            || cfg!(zcash_unstable = "nutachyon") && bytes_length == 56;
+        if !valid_length {
+            return Err(Unparsable);
+        }
 
         let transparent = Amount::from_bytes(
             bytes[0..8]
@@ -463,6 +475,7 @@ impl ValueBalance<NonNegative> {
             _ => return Err(Unparsable),
         };
 
+        #[cfg(zcash_unstable = "nutachyon")]
         let tachyon = match bytes_length {
             32 | 40 | 48 => Amount::zero(),
             56 => Amount::from_bytes(
@@ -481,6 +494,7 @@ impl ValueBalance<NonNegative> {
             orchard,
             deferred,
             ironwood,
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon,
         })
     }
@@ -508,6 +522,7 @@ pub enum ValueBalanceError {
     Ironwood(amount::Error),
 
     /// Tachyon amount error {0}
+    #[cfg(zcash_unstable = "nutachyon")]
     Tachyon(amount::Error),
 
     /// ValueBalance is unparsable
@@ -523,6 +538,7 @@ impl fmt::Display for ValueBalanceError {
             Orchard(e) => format!("orchard amount err: {e}"),
             Deferred(e) => format!("deferred amount err: {e}"),
             Ironwood(e) => format!("ironwood amount err: {e}"),
+            #[cfg(zcash_unstable = "nutachyon")]
             Tachyon(e) => format!("tachyon amount err: {e}"),
             Unparsable => "value balance is unparsable".to_string(),
         })
@@ -542,6 +558,7 @@ where
             orchard: (self.orchard + rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred + rhs.deferred).map_err(Deferred)?,
             ironwood: (self.ironwood + rhs.ironwood).map_err(Ironwood)?,
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon: (self.tachyon + rhs.tachyon).map_err(Tachyon)?,
         })
     }
@@ -593,6 +610,7 @@ where
             orchard: (self.orchard - rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred - rhs.deferred).map_err(Deferred)?,
             ironwood: (self.ironwood - rhs.ironwood).map_err(Ironwood)?,
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon: (self.tachyon - rhs.tachyon).map_err(Tachyon)?,
         })
     }
@@ -664,6 +682,7 @@ where
             orchard: self.orchard.neg(),
             deferred: self.deferred.neg(),
             ironwood: self.ironwood.neg(),
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon: self.tachyon.neg(),
         }
     }

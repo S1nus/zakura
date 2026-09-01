@@ -62,7 +62,9 @@ pub(crate) fn no_duplicates_in_finalized_chain(
         }
     }
 
+    #[cfg(zcash_unstable = "nutachyon")]
     let network = finalized_state.network();
+    #[cfg(zcash_unstable = "nutachyon")]
     for transaction in &semantically_verified.block.transactions {
         for tachygram in transaction.tachyon_tachygrams() {
             if finalized_state

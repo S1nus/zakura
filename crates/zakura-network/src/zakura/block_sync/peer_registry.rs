@@ -563,12 +563,15 @@ impl PeerRegistry {
             return SessionAdmission::Parked;
         }
 
+        // Rust 1.97 replaces this API with `try_update`.
+        // Zakura supports Rust 1.91.
+        #[allow(deprecated)]
         let generation = self
             .next_generation
-            .try_update(
+            .fetch_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
-                |generation: u64| generation.checked_add(1),
+                |generation| generation.checked_add(1),
             )
             .unwrap_or_else(|_| panic!("block-sync routine generation counter is exhausted"));
         peers

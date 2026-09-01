@@ -2730,6 +2730,7 @@ where
         #[cfg(not(test))]
         let selected_txs = mempool_txs;
 
+        #[cfg(zcash_unstable = "nutachyon")]
         let selected_txs = types::get_block_template::tachyon::aggregate_transactions(
             self.network.clone(),
             height,

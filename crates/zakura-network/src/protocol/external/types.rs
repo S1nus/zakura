@@ -128,9 +128,11 @@ impl Version {
             (Mainnet, Nu6_3) => 170_160,
             (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_170,
             (Mainnet, Nu7) => 170_180,
+            #[cfg(zcash_unstable = "nutachyon")]
             (Testnet(params), NuTachyon) if params.is_default_testnet() || params.is_regtest() => {
                 170_190
             }
+            #[cfg(zcash_unstable = "nutachyon")]
             (Mainnet, NuTachyon) => 170_190,
 
             // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
@@ -223,6 +225,13 @@ mod test {
         let _init_guard = zakura_test::init();
 
         let highest_network_upgrade = NetworkUpgrade::current(network, block::Height::MAX);
+        #[cfg(not(zcash_unstable = "nutachyon"))]
+        assert!(
+            matches!(highest_network_upgrade, Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7),
+            "expected coverage of all network upgrades: \
+            add the new network upgrade to the list in this test"
+        );
+        #[cfg(zcash_unstable = "nutachyon")]
         assert!(
             matches!(
                 highest_network_upgrade,
@@ -245,6 +254,7 @@ mod test {
             Nu6_2,
             Nu6_3,
             Nu7,
+            #[cfg(zcash_unstable = "nutachyon")]
             NuTachyon,
         ] {
             let height = network_upgrade.activation_height(network);
@@ -258,6 +268,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn nu_tachyon_protocol_versions_match_current_version() {
         let _init_guard = zakura_test::init();
 
@@ -274,6 +285,21 @@ mod test {
                 &Network::new_regtest(Default::default()),
                 NuTachyon
             ),
+            CURRENT_NETWORK_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    #[cfg(not(zcash_unstable = "nutachyon"))]
+    fn nu63_protocol_versions_match_current_version() {
+        let _init_guard = zakura_test::init();
+
+        assert_eq!(
+            Version::min_specified_for_upgrade(&Mainnet, Nu6_3),
+            CURRENT_NETWORK_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_3),
             CURRENT_NETWORK_PROTOCOL_VERSION
         );
     }

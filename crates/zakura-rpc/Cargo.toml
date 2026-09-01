@@ -107,7 +107,6 @@ zcash_primitives = { workspace = true, features = ["transparent-inputs", "non-st
 zcash_protocol = { workspace = true }
 zcash_script = { workspace = true }
 zcash_transparent = { workspace = true }
-zcash_tachyon = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "6.0.0", features = [
     "json-conversion",
@@ -124,6 +123,12 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 # Only used to read the validity dates of the configured RPC TLS certificates.
 der = "0.7.10"
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dependencies]
+zcash_tachyon = { workspace = true }
+
+[target.'cfg(zcash_unstable = "nutachyon")'.dev-dependencies]
+ragu = { workspace = true }
+
 [dev-dependencies]
 blake2b_simd = { workspace = true }
 bytes = { workspace = true }
@@ -134,7 +139,6 @@ tempfile = { workspace = true }
 toml = { workspace = true }
 
 proptest = { workspace = true }
-ragu = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 

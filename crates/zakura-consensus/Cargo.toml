@@ -74,7 +74,6 @@ zakura-chain = { path = "../zakura-chain", version = "6.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0" }
 
 zcash_protocol.workspace = true
-zcash_tachyon.workspace = true
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }
@@ -83,8 +82,13 @@ howudoin = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
-[dev-dependencies]
+[target.'cfg(zcash_unstable = "nutachyon")'.dependencies]
+zcash_tachyon.workspace = true
+
+[target.'cfg(zcash_unstable = "nutachyon")'.dev-dependencies]
 ragu = { workspace = true }
+
+[dev-dependencies]
 color-eyre = { workspace = true }
 
 hex = { workspace = true }

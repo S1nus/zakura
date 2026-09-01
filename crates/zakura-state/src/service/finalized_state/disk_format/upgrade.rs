@@ -111,8 +111,8 @@ fn format_upgrades(
     let min_version = move || min_version.clone().unwrap_or(Version::new(0, 0, 0));
 
     // Note: Disk format upgrades must be run in order of database version.
-    ([
-        Box::new(block_info_and_address_received::Upgrade),
+    vec![
+        Box::new(block_info_and_address_received::Upgrade) as Box<dyn DiskFormatUpgrade>,
         Box::new(no_migration::NoMigration::new(
             "add pruning metadata column family",
             Version::new(27, 1, 0),
@@ -144,17 +144,19 @@ fn format_upgrades(
         )),
         Box::new(drop_header_root_auth_frontier::Upgrade),
         Box::new(unauthenticated_commitment_roots::Upgrade),
+        #[cfg(zcash_unstable = "nutachyon")]
         Box::new(no_migration::NoMigration::new(
             "widen history tree entries for NuTachyon",
             Version::new(28, 2, 5),
         )),
+        #[cfg(zcash_unstable = "nutachyon")]
         Box::new(no_migration::NoMigration::new(
             "add Tachyon state and widen chain value balance and history entries",
             Version::new(29, 0, 0),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 12])
-        .into_iter()
-        .filter(move |upgrade| upgrade.version() > min_version())
+    ]
+    .into_iter()
+    .filter(move |upgrade| upgrade.version() > min_version())
 }
 
 /// Returns a list of all the major db format versions that can restored from the

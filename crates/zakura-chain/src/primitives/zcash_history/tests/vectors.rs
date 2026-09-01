@@ -14,6 +14,7 @@ const U32_SIZE: usize = 4;
 const V1_FIXED_NODE_DATA_SIZE: usize = HISTORY_HASH_SIZE + U32_SIZE * 4 + HISTORY_HASH_SIZE * 3;
 const V2_EXTRA_FIXED_NODE_DATA_SIZE: usize = HISTORY_HASH_SIZE * 2;
 const V3_EXTRA_FIXED_NODE_DATA_SIZE: usize = HISTORY_HASH_SIZE * 2;
+#[cfg(zcash_unstable = "nutachyon")]
 const V4_EXTRA_FIXED_NODE_DATA_SIZE: usize = HISTORY_HASH_SIZE * 2;
 
 /// Test the MMR tree using the activation block of a network upgrade
@@ -59,6 +60,7 @@ fn tree_for_network_upgrade(network: &Network, network_upgrade: NetworkUpgrade) 
         &sapling_root0,
         &Default::default(),
         &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     )?;
 
@@ -90,6 +92,7 @@ fn tree_for_network_upgrade(network: &Network, network_upgrade: NetworkUpgrade) 
             &sapling_root1,
             &Default::default(),
             &Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
             &Default::default(),
         )
         .unwrap();
@@ -117,6 +120,7 @@ fn old_history_versions_ignore_ironwood_root() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &default_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     );
     let v1_non_default = <V1 as ZebraHistoryVersion>::block_to_history_node(
@@ -125,6 +129,7 @@ fn old_history_versions_ignore_ironwood_root() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &non_default_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     );
 
@@ -143,6 +148,7 @@ fn old_history_versions_ignore_ironwood_root() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &default_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     );
     let v2_non_default = <V2 as ZebraHistoryVersion>::block_to_history_node(
@@ -151,6 +157,7 @@ fn old_history_versions_ignore_ironwood_root() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &non_default_ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     );
 
@@ -180,6 +187,7 @@ fn v3_history_node_hash_input_has_exact_serialized_size() -> Result<()> {
         &sapling_root,
         &orchard_root,
         &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
         &Default::default(),
     );
 
@@ -194,12 +202,16 @@ fn v3_history_node_hash_input_has_exact_serialized_size() -> Result<()> {
     // value in a V3 node.
     assert_eq!(encoded.len(), serialized_v3_node_data_size(&node_data));
     assert_eq!(encoded.last(), Some(&1));
+    #[cfg(zcash_unstable = "nutachyon")]
     assert_eq!(::zcash_history::MAX_NODE_DATA_SIZE, 390);
+    #[cfg(not(zcash_unstable = "nutachyon"))]
+    assert_eq!(::zcash_history::MAX_NODE_DATA_SIZE, 317);
 
     Ok(())
 }
 
 #[test]
+#[cfg(zcash_unstable = "nutachyon")]
 fn v4_history_node_commits_to_tachyon_state() -> Result<()> {
     let network = Network::Mainnet;
     let (block, sapling_root) = block_and_sapling_root(&network, NetworkUpgrade::Canopy)?;
@@ -272,6 +284,7 @@ fn serialized_v3_node_data_size(data: &::zcash_history::NodeDataV3) -> usize {
         + compact_size(data.ironwood_tx)
 }
 
+#[cfg(zcash_unstable = "nutachyon")]
 fn serialized_v4_node_data_size(data: &::zcash_history::NodeDataV4) -> usize {
     serialized_v3_node_data_size(&data.v3)
         + V4_EXTRA_FIXED_NODE_DATA_SIZE

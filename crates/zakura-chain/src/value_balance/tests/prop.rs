@@ -6,6 +6,7 @@ use crate::{amount::*, value_balance::*};
 
 proptest! {
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_blance_add(
         value_balance1 in any::<ValueBalance<NegativeAllowed>>(),
         value_balance2 in any::<ValueBalance<NegativeAllowed>>())
@@ -48,6 +49,7 @@ proptest! {
         }
     }
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_balance_sub(
         value_balance1 in any::<ValueBalance<NegativeAllowed>>(),
         value_balance2 in any::<ValueBalance<NegativeAllowed>>())
@@ -89,6 +91,7 @@ proptest! {
     }
 
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_balance_sum(
         value_balance1 in any::<ValueBalance<NegativeAllowed>>(),
         value_balance2 in any::<ValueBalance<NegativeAllowed>>(),
@@ -141,6 +144,7 @@ proptest! {
     }
 
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_balance_deserialization(bytes in any::<[u8; 56]>()) {
         let _init_guard = zakura_test::init();
 
@@ -158,7 +162,7 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 56];
+            let mut extended_bytes = [0u8; VALUE_BALANCE_BYTES];
             extended_bytes[..32].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
@@ -174,7 +178,7 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 56];
+            let mut extended_bytes = [0u8; VALUE_BALANCE_BYTES];
             extended_bytes[..40].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
@@ -182,6 +186,7 @@ proptest! {
 
     /// The pre-Tachyon value balance was a 48-byte prefix of the current format.
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn pre_tachyon_value_balance_deserialization(bytes in any::<[u8; 48]>()) {
         let _init_guard = zakura_test::init();
 

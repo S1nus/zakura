@@ -271,6 +271,7 @@ impl Block {
 
     /// Count how many Tachyon transactions exist in a block,
     /// i.e. transactions carrying a tachyon bundle (NuTachyon).
+    #[cfg(zcash_unstable = "nutachyon")]
     pub fn tachyon_transactions_count(&self) -> u64 {
         self.transactions
             .iter()

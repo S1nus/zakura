@@ -473,6 +473,7 @@ impl NonFinalizedState {
                 finalized_state.sapling_tree_for_tip(),
                 finalized_state.orchard_tree_for_tip(),
                 finalized_state.ironwood_tree_for_tip(),
+                #[cfg(zcash_unstable = "nutachyon")]
                 finalized_state.tachyon_anchor_for_tip(),
                 finalized_state.history_tree(),
                 finalized_state.finalized_value_pool(),
@@ -539,6 +540,7 @@ impl NonFinalizedState {
             finalized_state.sapling_tree_for_tip(),
             finalized_state.orchard_tree_for_tip(),
             finalized_state.ironwood_tree_for_tip(),
+            #[cfg(zcash_unstable = "nutachyon")]
             finalized_state.tachyon_anchor_for_tip(),
             finalized_state.history_tree(),
             finalized_state.finalized_value_pool(),

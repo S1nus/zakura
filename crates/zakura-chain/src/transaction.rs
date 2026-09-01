@@ -11,6 +11,7 @@ mod lock_time;
 mod memo;
 mod serialize;
 mod sighash;
+#[cfg(zcash_unstable = "nutachyon")]
 mod tachyon_shielded;
 mod txid;
 mod unmined;
@@ -34,13 +35,16 @@ pub use serialize::{
     MIN_TRANSPARENT_TX_V5_SIZE,
 };
 pub use sighash::{HashType, SigHash, SigHasher};
+#[cfg(zcash_unstable = "nutachyon")]
 pub use tachyon_shielded::TachyonShieldedData;
 pub use unmined::{
     zip317, UnminedTx, UnminedTxId, VerifiedUnminedTx, MEMPOOL_TRANSACTION_COST_THRESHOLD,
 };
 use zcash_protocol::consensus;
 
-use crate::parameters::{TX_V6_VERSION_GROUP_ID, TX_V7_VERSION_GROUP_ID};
+use crate::parameters::TX_V6_VERSION_GROUP_ID;
+#[cfg(zcash_unstable = "nutachyon")]
+use crate::parameters::TX_V7_VERSION_GROUP_ID;
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
     block, ironwood,
@@ -172,6 +176,7 @@ pub enum Transaction {
         ironwood_shielded_data: Option<ironwood::ShieldedData>,
     },
     /// A `version = 7` transaction enabled by NuTachyon.
+    #[cfg(zcash_unstable = "nutachyon")]
     V7 {
         /// The Network Upgrade for this transaction.
         ///
@@ -282,6 +287,7 @@ impl AttributedMemorySize for Transaction {
                             .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
                     ),
             ),
+            #[cfg(zcash_unstable = "nutachyon")]
             V7 {
                 inputs,
                 outputs,
@@ -443,7 +449,9 @@ impl Transaction {
             | Transaction::V3 { .. }
             | Transaction::V4 { .. } => None,
             Transaction::V5 { .. } => Some(AuthDigest::from(self)),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Some(AuthDigest::from(self)),
+            Transaction::V6 { .. } => Some(AuthDigest::from(self)),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Some(AuthDigest::from(self)),
         }
     }
 
@@ -463,7 +471,13 @@ impl Transaction {
                     crate::primitives::zcash_primitives::txid_and_auth_digest(self);
                 (txid, Some(auth_digest))
             }
-            Transaction::V6 { .. } | Transaction::V7 { .. } => {
+            Transaction::V6 { .. } => {
+                let (txid, auth_digest) =
+                    crate::primitives::zcash_primitives::txid_and_auth_digest(self);
+                (txid, Some(auth_digest))
+            }
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => {
                 let (txid, auth_digest) =
                     crate::primitives::zcash_primitives::txid_and_auth_digest(self);
                 (txid, Some(auth_digest))
@@ -580,7 +594,9 @@ impl Transaction {
         match self {
             Transaction::V1 { .. } | Transaction::V2 { .. } => false,
             Transaction::V3 { .. } | Transaction::V4 { .. } | Transaction::V5 { .. } => true,
-            Transaction::V6 { .. } | Transaction::V7 { .. } => true,
+            Transaction::V6 { .. } => true,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => true,
         }
     }
 
@@ -603,6 +619,7 @@ impl Transaction {
             Transaction::V4 { .. } => 4,
             Transaction::V5 { .. } => 5,
             Transaction::V6 { .. } => 6,
+            #[cfg(zcash_unstable = "nutachyon")]
             Transaction::V7 { .. } => 7,
         }
     }
@@ -615,7 +632,9 @@ impl Transaction {
             | Transaction::V3 { lock_time, .. }
             | Transaction::V4 { lock_time, .. }
             | Transaction::V5 { lock_time, .. } => *lock_time,
-            Transaction::V6 { lock_time, .. } | Transaction::V7 { lock_time, .. } => *lock_time,
+            Transaction::V6 { lock_time, .. } => *lock_time,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { lock_time, .. } => *lock_time,
         };
 
         // `zcashd` checks that the block height is greater than the lock height.
@@ -663,7 +682,9 @@ impl Transaction {
             | Transaction::V3 { lock_time, .. }
             | Transaction::V4 { lock_time, .. }
             | Transaction::V5 { lock_time, .. } => *lock_time,
-            Transaction::V6 { lock_time, .. } | Transaction::V7 { lock_time, .. } => *lock_time,
+            Transaction::V6 { lock_time, .. } => *lock_time,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { lock_time, .. } => *lock_time,
         };
         let mut lock_time_bytes = Vec::new();
         lock_time
@@ -700,7 +721,7 @@ impl Transaction {
                 block::Height(0) => None,
                 block::Height(expiry_height) => Some(block::Height(*expiry_height)),
             },
-            Transaction::V6 { expiry_height, .. } | Transaction::V7 { expiry_height, .. } => {
+            Transaction::V6 { expiry_height, .. } => {
                 match expiry_height {
                     // # Consensus
                     //
@@ -710,6 +731,11 @@ impl Transaction {
                     block::Height(expiry_height) => Some(block::Height(*expiry_height)),
                 }
             }
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { expiry_height, .. } => match expiry_height {
+                block::Height(0) => None,
+                block::Height(expiry_height) => Some(block::Height(*expiry_height)),
+            },
         }
     }
 
@@ -728,8 +754,9 @@ impl Transaction {
             } => Some(*network_upgrade),
             Transaction::V6 {
                 network_upgrade, ..
-            }
-            | Transaction::V7 {
+            } => Some(*network_upgrade),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 network_upgrade, ..
             } => Some(*network_upgrade),
         }
@@ -745,7 +772,9 @@ impl Transaction {
             Transaction::V3 { ref inputs, .. } => inputs,
             Transaction::V4 { ref inputs, .. } => inputs,
             Transaction::V5 { ref inputs, .. } => inputs,
-            Transaction::V6 { ref inputs, .. } | Transaction::V7 { ref inputs, .. } => inputs,
+            Transaction::V6 { ref inputs, .. } => inputs,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { ref inputs, .. } => inputs,
         }
     }
 
@@ -764,7 +793,9 @@ impl Transaction {
             Transaction::V3 { ref outputs, .. } => outputs,
             Transaction::V4 { ref outputs, .. } => outputs,
             Transaction::V5 { ref outputs, .. } => outputs,
-            Transaction::V6 { ref outputs, .. } | Transaction::V7 { ref outputs, .. } => outputs,
+            Transaction::V6 { ref outputs, .. } => outputs,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { ref outputs, .. } => outputs,
         }
     }
 
@@ -813,7 +844,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Box::new(std::iter::empty()),
+            Transaction::V6 { .. } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Box::new(std::iter::empty()),
         }
     }
 
@@ -849,7 +882,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Box::new(std::iter::empty()),
+            Transaction::V6 { .. } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Box::new(std::iter::empty()),
         }
     }
 
@@ -885,7 +920,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => 0,
-            Transaction::V6 { .. } | Transaction::V7 { .. } => 0,
+            Transaction::V6 { .. } => 0,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => 0,
         }
     }
 
@@ -925,7 +962,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Box::new(std::iter::empty()),
+            Transaction::V6 { .. } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Box::new(std::iter::empty()),
         }
     }
 
@@ -962,7 +1001,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => None,
-            Transaction::V6 { .. } | Transaction::V7 { .. } => None,
+            Transaction::V6 { .. } => None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => None,
         }
     }
 
@@ -971,7 +1012,9 @@ impl Transaction {
         match self {
             // No JoinSplits
             Transaction::V1 { .. } | Transaction::V5 { .. } => false,
-            Transaction::V6 { .. } | Transaction::V7 { .. } => false,
+            Transaction::V6 { .. } => false,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => false,
 
             // JoinSplits-on-BCTV14
             Transaction::V2 { joinsplit_data, .. } | Transaction::V3 { joinsplit_data, .. } => {
@@ -1019,7 +1062,9 @@ impl Transaction {
             }
             | Transaction::V1 { .. }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Box::new(std::iter::empty()),
+            Transaction::V6 { .. } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Box::new(std::iter::empty()),
         }
     }
 
@@ -1036,8 +1081,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data,
                 ..
-            }
-            | Transaction::V7 {
+            } => sapling_shielded_data.as_ref(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data,
                 ..
             } => sapling_shielded_data.as_ref(),
@@ -1064,8 +1110,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(sapling_shielded_data.anchors()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Box::new(sapling_shielded_data.anchors()),
@@ -1085,8 +1132,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
@@ -1118,8 +1166,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(sapling_shielded_data.spends_per_anchor()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Box::new(sapling_shielded_data.spends_per_anchor()),
@@ -1139,8 +1188,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
@@ -1162,8 +1212,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(sapling_shielded_data.outputs()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Box::new(sapling_shielded_data.outputs()),
@@ -1183,8 +1234,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
@@ -1208,8 +1260,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(sapling_shielded_data.nullifiers()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Box::new(sapling_shielded_data.nullifiers()),
@@ -1229,8 +1282,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
@@ -1256,8 +1310,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(sapling_shielded_data.note_commitments()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Box::new(sapling_shielded_data.note_commitments()),
@@ -1277,8 +1332,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
-            }
-            | Transaction::V7 {
+            } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
@@ -1300,8 +1356,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data,
                 ..
-            }
-            | Transaction::V7 {
+            } => sapling_shielded_data.is_some(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data,
                 ..
             } => sapling_shielded_data.is_some(),
@@ -1329,8 +1386,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => sapling_shielded_data.point_encodings_are_valid(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => sapling_shielded_data.point_encodings_are_valid(),
@@ -1352,8 +1410,9 @@ impl Transaction {
             Transaction::V6 {
                 orchard_shielded_data,
                 ..
-            }
-            | Transaction::V7 {
+            } => orchard_shielded_data.as_ref(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 orchard_shielded_data,
                 ..
             } => orchard_shielded_data.as_ref(),
@@ -1412,8 +1471,9 @@ impl Transaction {
             Transaction::V6 {
                 ironwood_shielded_data,
                 ..
-            }
-            | Transaction::V7 {
+            } => ironwood_shielded_data.as_ref(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 ironwood_shielded_data,
                 ..
             } => ironwood_shielded_data.as_ref(),
@@ -1466,6 +1526,7 @@ impl Transaction {
     // Tachyon
 
     /// Access the Tachyon shielded data in this transaction, if present.
+    #[cfg(zcash_unstable = "nutachyon")]
     pub fn tachyon_shielded_data(&self) -> Option<&TachyonShieldedData> {
         match self {
             Transaction::V7 {
@@ -1477,11 +1538,13 @@ impl Transaction {
     }
 
     /// Returns `true` if this transaction carries a Tachyon bundle.
+    #[cfg(zcash_unstable = "nutachyon")]
     pub fn has_tachyon_shielded_data(&self) -> bool {
         self.tachyon_shielded_data().is_some()
     }
 
     /// Returns the tachygrams revealed by this transaction's proof stamp.
+    #[cfg(zcash_unstable = "nutachyon")]
     pub fn tachyon_tachygrams(&self) -> Vec<crate::tachyon::Tachygram> {
         match self.tachyon_shielded_data() {
             Some(shielded_data) => match &shielded_data.0 {
@@ -1500,9 +1563,15 @@ impl Transaction {
     }
 
     /// Returns `true` if this transaction has any Tachyon actions.
+    #[cfg(zcash_unstable = "nutachyon")]
     pub fn has_tachyon_actions(&self) -> bool {
         self.tachyon_shielded_data()
             .is_some_and(|data| !data.actions().is_empty())
+    }
+
+    #[cfg(not(zcash_unstable = "nutachyon"))]
+    fn has_tachyon_actions(&self) -> bool {
+        false
     }
 
     // value balances
@@ -1616,7 +1685,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Box::new(std::iter::empty()),
+            Transaction::V6 { .. } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Box::new(std::iter::empty()),
         }
     }
 
@@ -1664,7 +1735,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Box::new(std::iter::empty()),
+            Transaction::V6 { .. } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Box::new(std::iter::empty()),
         }
     }
 
@@ -1706,7 +1779,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(iter::empty()),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Box::new(iter::empty()),
+            Transaction::V6 { .. } => Box::new(iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Box::new(iter::empty()),
         };
 
         joinsplit_value_balances.map(ValueBalance::from_sprout_amount)
@@ -1751,8 +1826,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => sapling_shielded_data.value_balance,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => sapling_shielded_data.value_balance,
@@ -1771,8 +1847,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
-            }
-            | Transaction::V7 {
+            } => Amount::zero(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: None,
                 ..
             } => Amount::zero(),
@@ -1798,8 +1875,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => Some(sapling_shielded_data.binding_sig),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Some(sapling_shielded_data.binding_sig),
@@ -1892,6 +1970,7 @@ impl Transaction {
 
     /// Return the Tachyon value balance, the change in the transaction value pool due to
     /// Tachyon actions.
+    #[cfg(zcash_unstable = "nutachyon")]
     pub fn tachyon_value_balance(&self) -> ValueBalance<NegativeAllowed> {
         let tachyon_value_balance = self
             .tachyon_shielded_data()
@@ -1902,6 +1981,11 @@ impl Transaction {
             .unwrap_or_else(Amount::zero);
 
         ValueBalance::from_tachyon_amount(tachyon_value_balance)
+    }
+
+    #[cfg(not(zcash_unstable = "nutachyon"))]
+    fn tachyon_value_balance(&self) -> ValueBalance<NegativeAllowed> {
+        ValueBalance::zero()
     }
 
     /// Returns the value balances for this transaction using the provided transparent outputs.
@@ -2022,6 +2106,7 @@ impl Transaction {
             Transaction::V4 { .. } => Some(SAPLING_VERSION_GROUP_ID),
             Transaction::V5 { .. } => Some(TX_V5_VERSION_GROUP_ID),
             Transaction::V6 { .. } => Some(TX_V6_VERSION_GROUP_ID),
+            #[cfg(zcash_unstable = "nutachyon")]
             Transaction::V7 { .. } => Some(TX_V7_VERSION_GROUP_ID),
         }
     }
@@ -2052,8 +2137,12 @@ impl Transaction {
             Transaction::V6 {
                 ref mut network_upgrade,
                 ..
+            } => {
+                *network_upgrade = nu;
+                Ok(())
             }
-            | Transaction::V7 {
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 ref mut network_upgrade,
                 ..
             } => {
@@ -2088,8 +2177,9 @@ impl Transaction {
             Transaction::V6 {
                 ref mut expiry_height,
                 ..
-            }
-            | Transaction::V7 {
+            } => expiry_height,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 ref mut expiry_height,
                 ..
             } => expiry_height,
@@ -2104,9 +2194,9 @@ impl Transaction {
             Transaction::V3 { ref mut inputs, .. } => inputs,
             Transaction::V4 { ref mut inputs, .. } => inputs,
             Transaction::V5 { ref mut inputs, .. } => inputs,
-            Transaction::V6 { ref mut inputs, .. } | Transaction::V7 { ref mut inputs, .. } => {
-                inputs
-            }
+            Transaction::V6 { ref mut inputs, .. } => inputs,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { ref mut inputs, .. } => inputs,
         }
     }
 
@@ -2136,8 +2226,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => Some(&mut sapling_shielded_data.value_balance),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Some(&mut sapling_shielded_data.value_balance),
@@ -2155,8 +2246,9 @@ impl Transaction {
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
-            }
-            | Transaction::V7 {
+            } => None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 sapling_shielded_data: None,
                 ..
             } => None,
@@ -2208,7 +2300,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Box::new(std::iter::empty()),
+            Transaction::V6 { .. } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Box::new(std::iter::empty()),
         }
     }
 
@@ -2257,7 +2351,9 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            Transaction::V6 { .. } | Transaction::V7 { .. } => Box::new(std::iter::empty()),
+            Transaction::V6 { .. } => Box::new(std::iter::empty()),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => Box::new(std::iter::empty()),
         }
     }
 
@@ -2279,8 +2375,9 @@ impl Transaction {
             Transaction::V6 {
                 orchard_shielded_data: Some(orchard_shielded_data),
                 ..
-            }
-            | Transaction::V7 {
+            } => Some(orchard_shielded_data),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 orchard_shielded_data: Some(orchard_shielded_data),
                 ..
             } => Some(orchard_shielded_data),
@@ -2296,8 +2393,9 @@ impl Transaction {
             Transaction::V6 {
                 orchard_shielded_data: None,
                 ..
-            }
-            | Transaction::V7 {
+            } => None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 orchard_shielded_data: None,
                 ..
             } => None,
@@ -2324,8 +2422,9 @@ impl Transaction {
             } => outputs,
             Transaction::V6 {
                 ref mut outputs, ..
-            }
-            | Transaction::V7 {
+            } => outputs,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
                 ref mut outputs, ..
             } => outputs,
         }

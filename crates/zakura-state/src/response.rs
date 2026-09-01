@@ -1,12 +1,16 @@
 //! State [`tower::Service`] response types.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
 
+#[cfg(zcash_unstable = "nutachyon")]
+use std::collections::HashMap;
+#[cfg(zcash_unstable = "nutachyon")]
+use zakura_chain::tachyon;
 use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, ChainHistoryMmrRootHash},
@@ -14,7 +18,6 @@ use zakura_chain::{
     ironwood, orchard, sapling,
     serialization::DateTime32,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
-    tachyon,
     transaction::{self, Transaction},
     transparent,
     value_balance::ValueBalance,
@@ -38,6 +41,7 @@ mod tests;
 
 /// Best-chain data used to aggregate selected autonome Tachyon transactions.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(zcash_unstable = "nutachyon")]
 pub struct TachyonMiningData {
     /// Heights that created the requested anchors. Unknown anchors are omitted.
     pub anchor_heights: HashMap<tachyon::Anchor, block::Height>,
@@ -443,6 +447,7 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::TachyonMiningData`], or `None` when the requested chain tip is
     /// no longer current.
+    #[cfg(zcash_unstable = "nutachyon")]
     TachyonMiningData(Option<TachyonMiningData>),
 
     /// Response to [`ReadRequest::BlockInfo`] with
@@ -719,7 +724,6 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
             | ReadResponse::TipPoolValues { .. }
-            | ReadResponse::TachyonMiningData(_)
             | ReadResponse::BlockInfo(_)
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
@@ -745,6 +749,11 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::Blocks(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            ReadResponse::TachyonMiningData(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 

@@ -7,11 +7,12 @@
 
 use bincode::Options;
 
+#[cfg(zcash_unstable = "nutachyon")]
+use zakura_chain::tachyon;
 use zakura_chain::{
     block::{merkle::AuthDataRoot, Height},
     ironwood, orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
-    tachyon,
 };
 
 use crate::service::finalized_state::disk_format::{FromDisk, IntoDisk};
@@ -88,6 +89,7 @@ impl FromDisk for orchard::tree::Root {
     }
 }
 
+#[cfg(zcash_unstable = "nutachyon")]
 impl IntoDisk for tachyon::Anchor {
     type Bytes = [u8; 32];
 
@@ -96,6 +98,7 @@ impl IntoDisk for tachyon::Anchor {
     }
 }
 
+#[cfg(zcash_unstable = "nutachyon")]
 impl FromDisk for tachyon::Anchor {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let bytes: [u8; 32] = bytes
@@ -106,6 +109,7 @@ impl FromDisk for tachyon::Anchor {
     }
 }
 
+#[cfg(zcash_unstable = "nutachyon")]
 impl IntoDisk for tachyon::Tachygram {
     type Bytes = [u8; 32];
 
@@ -114,6 +118,7 @@ impl IntoDisk for tachyon::Tachygram {
     }
 }
 
+#[cfg(zcash_unstable = "nutachyon")]
 impl FromDisk for tachyon::Tachygram {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let bytes: [u8; 32] = bytes
@@ -126,8 +131,10 @@ impl FromDisk for tachyon::Tachygram {
 
 /// An on-disk Tachyon epoch index, encoded big-endian for sort order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(zcash_unstable = "nutachyon")]
 pub struct TachyonEpoch(pub u32);
 
+#[cfg(zcash_unstable = "nutachyon")]
 impl IntoDisk for TachyonEpoch {
     type Bytes = [u8; 4];
 
@@ -136,6 +143,7 @@ impl IntoDisk for TachyonEpoch {
     }
 }
 
+#[cfg(zcash_unstable = "nutachyon")]
 impl FromDisk for TachyonEpoch {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let bytes: [u8; 4] = bytes

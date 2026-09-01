@@ -64,9 +64,11 @@ pub use request::{
 #[cfg(feature = "indexer")]
 pub use request::Spend;
 
+#[cfg(zcash_unstable = "nutachyon")]
+pub use response::TachyonMiningData;
 pub use response::{
     AnyTx, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock, MinedTx,
-    NonFinalizedBlocksListener, ReadResponse, Response, TachyonMiningData,
+    NonFinalizedBlocksListener, ReadResponse, Response,
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};

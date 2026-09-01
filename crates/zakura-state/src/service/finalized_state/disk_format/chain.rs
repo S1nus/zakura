@@ -58,6 +58,9 @@ pub enum HistoryTreeDecodeError {
 }
 
 impl IntoDisk for ValueBalance<NonNegative> {
+    #[cfg(not(zcash_unstable = "nutachyon"))]
+    type Bytes = [u8; 48];
+    #[cfg(zcash_unstable = "nutachyon")]
     type Bytes = [u8; 56];
 
     fn as_bytes(&self) -> Self::Bytes {
@@ -263,10 +266,12 @@ impl FromDisk for BlockInfo {
         // We have different DB formats for NU6.1, Ironwood, and NuTachyon onward.
         const NU6_1_VALUE_BALANCE_LEN: usize = 40;
         const IRONWOOD_VALUE_BALANCE_LEN: usize = 48;
+        #[cfg(zcash_unstable = "nutachyon")]
         const TACHYON_VALUE_BALANCE_LEN: usize = 56;
         const BLOCK_SIZE_LEN: usize = 4;
         const NU6_1_BLOCK_INFO_LEN: usize = NU6_1_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
         const IRONWOOD_BLOCK_INFO_LEN: usize = IRONWOOD_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
+        #[cfg(zcash_unstable = "nutachyon")]
         const TACHYON_BLOCK_INFO_LEN: usize = TACHYON_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
 
         let bytes = bytes.as_ref();
@@ -274,6 +279,7 @@ impl FromDisk for BlockInfo {
         // We want to be forward-compatible, so this must work even if the
         // size of the buffer is larger than expected.
         match bytes.len() {
+            #[cfg(zcash_unstable = "nutachyon")]
             TACHYON_BLOCK_INFO_LEN.. => {
                 let value_pools =
                     ValueBalance::<NonNegative>::from_bytes(&bytes[..TACHYON_VALUE_BALANCE_LEN])

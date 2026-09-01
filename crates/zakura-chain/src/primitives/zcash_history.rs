@@ -9,13 +9,17 @@ mod tests;
 use std::{collections::BTreeMap, io, sync::Arc};
 
 use serde_big_array::BigArray;
-pub use zcash_history::{MAX_ENTRY_SIZE, V1, V2, V3, V4};
+#[cfg(zcash_unstable = "nutachyon")]
+pub use zcash_history::V4;
+pub use zcash_history::{MAX_ENTRY_SIZE, V1, V2, V3};
 
+#[cfg(zcash_unstable = "nutachyon")]
+use crate::tachyon;
 use crate::{
     block::{Block, ChainHistoryMmrRootHash, Header, Height},
     ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
-    sapling, tachyon,
+    sapling,
 };
 
 /// The block data needed to build a ZIP-221 history tree leaf.
@@ -32,6 +36,7 @@ pub struct HistoryTreeBlockParts<'a> {
     /// The block's Ironwood note commitment tree root.
     pub ironwood_root: &'a ironwood::tree::Root,
     /// The Tachyon pool anchor after the block.
+    #[cfg(zcash_unstable = "nutachyon")]
     pub tachyon_anchor: &'a tachyon::Anchor,
     /// The number of Sapling transactions in the block.
     pub sapling_tx: u64,
@@ -40,6 +45,7 @@ pub struct HistoryTreeBlockParts<'a> {
     /// The number of Ironwood transactions in the block.
     pub ironwood_tx: u64,
     /// The number of Tachyon transactions in the block.
+    #[cfg(zcash_unstable = "nutachyon")]
     pub tachyon_tx: u64,
 }
 
@@ -50,7 +56,7 @@ impl<'a> HistoryTreeBlockParts<'a> {
         sapling_root: &'a sapling::tree::Root,
         orchard_root: &'a orchard::tree::Root,
         ironwood_root: &'a ironwood::tree::Root,
-        tachyon_anchor: &'a tachyon::Anchor,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: &'a tachyon::Anchor,
     ) -> Self {
         let height = block
             .coinbase_height()
@@ -62,10 +68,12 @@ impl<'a> HistoryTreeBlockParts<'a> {
             sapling_root,
             orchard_root,
             ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon_anchor,
             sapling_tx: block.sapling_transactions_count(),
             orchard_tx: block.orchard_transactions_count(),
             ironwood_tx: block.ironwood_transactions_count(),
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon_tx: block.tachyon_transactions_count(),
         }
     }
@@ -80,7 +88,7 @@ pub trait Version: zcash_history::Version {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
-        tachyon_anchor: &tachyon::Anchor,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: &tachyon::Anchor,
     ) -> Self::NodeData {
         Self::parts_to_history_node(
             HistoryTreeBlockParts::from_block(
@@ -88,6 +96,7 @@ pub trait Version: zcash_history::Version {
                 sapling_root,
                 orchard_root,
                 ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
                 tachyon_anchor,
             ),
             network,
@@ -160,7 +169,7 @@ impl Entry {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
-        tachyon_anchor: &tachyon::Anchor,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: &tachyon::Anchor,
     ) -> Self {
         let node_data = V::block_to_history_node(
             block,
@@ -168,6 +177,7 @@ impl Entry {
             sapling_root,
             orchard_root,
             ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon_anchor,
         );
         Self::from_node_data::<V>(node_data)
@@ -248,7 +258,7 @@ impl<V: Version> Tree<V> {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
-        tachyon_anchor: &tachyon::Anchor,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: &tachyon::Anchor,
     ) -> Result<(Self, Entry), io::Error> {
         let height = block
             .coinbase_height()
@@ -260,6 +270,7 @@ impl<V: Version> Tree<V> {
             sapling_root,
             orchard_root,
             ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon_anchor,
         );
         let mut peaks = BTreeMap::new();
@@ -311,7 +322,7 @@ impl<V: Version> Tree<V> {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
-        tachyon_anchor: &tachyon::Anchor,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: &tachyon::Anchor,
     ) -> Result<Vec<Entry>, zcash_history::Error> {
         let height = block
             .coinbase_height()
@@ -331,6 +342,7 @@ impl<V: Version> Tree<V> {
             sapling_root,
             orchard_root,
             ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
             tachyon_anchor,
         );
         let appended = self.inner.append_leaf(node_data)?;
@@ -452,8 +464,9 @@ impl Version for zcash_history::V1 {
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
-            | NetworkUpgrade::Nu7
-            | NetworkUpgrade::NuTachyon => {}
+            | NetworkUpgrade::Nu7 => {}
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => {}
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => {}
         };
@@ -517,6 +530,7 @@ impl Version for V3 {
     }
 }
 
+#[cfg(zcash_unstable = "nutachyon")]
 impl Version for V4 {
     fn parts_to_history_node(
         parts: HistoryTreeBlockParts<'_>,

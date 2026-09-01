@@ -2499,6 +2499,7 @@ impl Service<ReadRequest> for ReadStateService {
                 })
             }
 
+            #[cfg(zcash_unstable = "nutachyon")]
             ReadRequest::TachyonMiningData {
                 anchors,
                 tachygrams,

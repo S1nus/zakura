@@ -154,6 +154,7 @@ fn sapling_orchard_ironwood_anchors_refer_to_final_treestates(
         );
     }
 
+    #[cfg(zcash_unstable = "nutachyon")]
     if let Some(tachyon_shielded_data) = transaction.tachyon_shielded_data() {
         if let zcash_tachyon::TachyonBundle::Proven(bundle) = &tachyon_shielded_data.0 {
             let anchor = zakura_chain::tachyon::Anchor::from(bundle.stamp.anchor);

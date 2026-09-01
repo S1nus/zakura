@@ -68,6 +68,7 @@ pub enum NetworkUpgrade {
     #[serde(rename = "NU7")]
     Nu7,
     /// The Zcash protocol after the NuTachyon upgrade.
+    #[cfg(zcash_unstable = "nutachyon")]
     NuTachyon,
 
     #[cfg(zcash_unstable = "zfuture")]
@@ -243,6 +244,7 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     #[cfg(any(test, feature = "zakura-test"))]
     (Nu7, ConsensusBranchId(0xfffffffe)),
+    #[cfg(zcash_unstable = "nutachyon")]
     (NuTachyon, ConsensusBranchId(0xfffffffc)),
     #[cfg(zcash_unstable = "zfuture")]
     (ZFuture, ConsensusBranchId(0xfffffffd)),
@@ -405,9 +407,12 @@ impl NetworkUpgrade {
     pub fn target_spacing(&self) -> Duration {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
-            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 | NuTachyon => {
+            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            NuTachyon => POST_BLOSSOM_POW_TARGET_SPACING.into(),
 
             #[cfg(zcash_unstable = "zfuture")]
             ZFuture => POST_BLOSSOM_POW_TARGET_SPACING.into(),

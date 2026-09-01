@@ -576,6 +576,7 @@ fn roundtrip_value_balance() {
 }
 
 #[test]
+#[cfg(zcash_unstable = "nutachyon")]
 fn roundtrip_block_info_with_tachyon_value_pool() {
     let _init_guard = zakura_test::init();
 
@@ -604,6 +605,7 @@ fn block_info_decodes_ironwood_value_pools() {
     let block_info = BlockInfo::from_bytes(ironwood_bytes);
 
     assert_eq!(block_info.value_pools().ironwood_amount(), ironwood_amount);
+    #[cfg(zcash_unstable = "nutachyon")]
     assert_eq!(
         block_info.value_pools().tachyon_amount(),
         Amount::<NonNegative>::zero()

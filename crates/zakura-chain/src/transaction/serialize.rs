@@ -21,7 +21,9 @@ use crate::{
     },
 };
 
-use crate::parameters::{TX_V6_VERSION_GROUP_ID, TX_V7_VERSION_GROUP_ID};
+use crate::parameters::TX_V6_VERSION_GROUP_ID;
+#[cfg(zcash_unstable = "nutachyon")]
+use crate::parameters::TX_V7_VERSION_GROUP_ID;
 
 use super::*;
 use crate::sapling;
@@ -875,6 +877,7 @@ impl ZcashSerialize for Transaction {
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
             }
+            #[cfg(zcash_unstable = "nutachyon")]
             Transaction::V7 {
                 network_upgrade,
                 lock_time,
@@ -914,13 +917,10 @@ impl ZcashSerialize for Transaction {
                     &mut writer,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
-                #[cfg(zcash_unstable = "nutachyon")]
                 zcash_primitives::transaction::components::tachyon::write_v7_bundle(
                     tachyon_shielded_data.as_ref().map(|bundle| &bundle.0),
                     &mut writer,
                 )?;
-                #[cfg(not(zcash_unstable = "nutachyon"))]
-                writer.write_u8(0)?;
             }
         }
         Ok(())
@@ -1282,6 +1282,7 @@ impl ZcashDeserialize for Transaction {
                     ironwood_shielded_data,
                 })
             }
+            #[cfg(zcash_unstable = "nutachyon")]
             (7, true) => {
                 let id = limited_reader.read_u32::<LittleEndian>()?;
                 if id != TX_V7_VERSION_GROUP_ID {
@@ -1313,22 +1314,11 @@ impl ZcashDeserialize for Transaction {
                     &mut limited_reader,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
-                #[cfg(zcash_unstable = "nutachyon")]
                 let tachyon_shielded_data =
                     zcash_primitives::transaction::components::tachyon::read_v7_bundle(
                         &mut limited_reader,
                     )?
                     .map(TachyonShieldedData::from);
-                #[cfg(not(zcash_unstable = "nutachyon"))]
-                let tachyon_shielded_data = match limited_reader.read_u8()? {
-                    0 => None,
-                    _ => {
-                        return Err(SerializationError::Parse(
-                            "Tachyon bundles are not available in this build",
-                        ));
-                    }
-                };
-
                 Ok(Transaction::V7 {
                     network_upgrade,
                     lock_time,

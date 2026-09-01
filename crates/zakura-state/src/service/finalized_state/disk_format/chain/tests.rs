@@ -40,10 +40,12 @@ fn valid_history_tree() -> NonEmptyHistoryTree {
                 sapling_root: &sapling_root,
                 orchard_root: &orchard_root,
                 ironwood_root: &ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
                 tachyon_anchor: &Default::default(),
                 sapling_tx: 0,
                 orchard_tx: 0,
                 ironwood_tx: 0,
+                #[cfg(zcash_unstable = "nutachyon")]
                 tachyon_tx: 0,
             },
         )

@@ -402,7 +402,10 @@ fn lazy_verifier_for(network_upgrade: NetworkUpgrade) -> &'static Lazy<VerifierS
         // restriction applies regardless of transaction version, so it cannot
         // be bypassed with a V5 transaction. The NU6.2 fixed key would both
         // reject honest NU6.3 proofs and fail to enforce this constraint.
-        Nu6_3 | Nu7 | NuTachyon => &VERIFIER_NU6_3_ONWARD,
+        Nu6_3 | Nu7 => &VERIFIER_NU6_3_ONWARD,
+
+        #[cfg(zcash_unstable = "nutachyon")]
+        NuTachyon => &VERIFIER_NU6_3_ONWARD,
 
         // `ZFuture` is post-NU6.3 and inherits the NU6.3 circuit. Keep the
         // cfg-gated arm explicit so a future upgrade cannot silently fall back
