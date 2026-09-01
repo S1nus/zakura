@@ -11,6 +11,7 @@ mod lock_time;
 mod memo;
 mod serialize;
 mod sighash;
+mod tachyon_shielded;
 mod txid;
 mod unmined;
 pub(crate) mod zip244;
@@ -33,6 +34,7 @@ pub use serialize::{
     MIN_TRANSPARENT_TX_V5_SIZE,
 };
 pub use sighash::{HashType, SigHash, SigHasher};
+pub use tachyon_shielded::TachyonShieldedData;
 pub use unmined::{
     zip317, UnminedTx, UnminedTxId, VerifiedUnminedTx, MEMPOOL_TRANSACTION_COST_THRESHOLD,
 };
@@ -170,8 +172,6 @@ pub enum Transaction {
         ironwood_shielded_data: Option<ironwood::ShieldedData>,
     },
     /// A `version = 7` transaction enabled by NuTachyon.
-    ///
-    /// V7 initially has the same fields and behavior as V6.
     V7 {
         /// The Network Upgrade for this transaction.
         ///
@@ -191,6 +191,8 @@ pub enum Transaction {
         orchard_shielded_data: Option<orchard::ShieldedData>,
         /// The Ironwood data for this transaction, if any.
         ironwood_shielded_data: Option<ironwood::ShieldedData>,
+        /// The Tachyon data for this transaction, if any.
+        tachyon_shielded_data: Option<TachyonShieldedData>,
     },
 }
 
@@ -263,13 +265,30 @@ impl AttributedMemorySize for Transaction {
                 orchard_shielded_data,
                 ironwood_shielded_data,
                 ..
-            }
-            | V7 {
+            } => (
+                inputs,
+                outputs,
+                sapling_shielded_data
+                    .as_ref()
+                    .map_or(0, AttributedMemorySize::attributed_memory_size_bytes)
+                    .saturating_add(
+                        orchard_shielded_data
+                            .as_ref()
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
+                    )
+                    .saturating_add(
+                        ironwood_shielded_data
+                            .as_ref()
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
+                    ),
+            ),
+            V7 {
                 inputs,
                 outputs,
                 sapling_shielded_data,
                 orchard_shielded_data,
                 ironwood_shielded_data,
+                tachyon_shielded_data,
                 ..
             } => (
                 inputs,
@@ -284,6 +303,11 @@ impl AttributedMemorySize for Transaction {
                     )
                     .saturating_add(
                         ironwood_shielded_data
+                            .as_ref()
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
+                    )
+                    .saturating_add(
+                        tachyon_shielded_data
                             .as_ref()
                             .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
                     ),
@@ -485,6 +509,7 @@ impl Transaction {
                     .ironwood_flags()
                     .unwrap_or_else(ironwood::Flags::empty)
                     .contains(ironwood::Flags::ENABLE_SPENDS))
+            || self.has_tachyon_actions()
     }
 
     /// Does this transaction have shielded outputs?
@@ -503,6 +528,7 @@ impl Transaction {
                     .ironwood_flags()
                     .unwrap_or_else(ironwood::Flags::empty)
                     .contains(ironwood::Flags::ENABLE_OUTPUTS))
+            || self.has_tachyon_actions()
     }
 
     /// Does this transaction have transparent or shielded outputs?
@@ -1437,6 +1463,48 @@ impl Transaction {
         self.ironwood_shielded_data().is_some()
     }
 
+    // Tachyon
+
+    /// Access the Tachyon shielded data in this transaction, if present.
+    pub fn tachyon_shielded_data(&self) -> Option<&TachyonShieldedData> {
+        match self {
+            Transaction::V7 {
+                tachyon_shielded_data,
+                ..
+            } => tachyon_shielded_data.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this transaction carries a Tachyon bundle.
+    pub fn has_tachyon_shielded_data(&self) -> bool {
+        self.tachyon_shielded_data().is_some()
+    }
+
+    /// Returns the tachygrams revealed by this transaction's proof stamp.
+    pub fn tachyon_tachygrams(&self) -> Vec<crate::tachyon::Tachygram> {
+        match self.tachyon_shielded_data() {
+            Some(shielded_data) => match &shielded_data.0 {
+                zcash_tachyon::TachyonBundle::Proven(bundle) => bundle
+                    .stamp
+                    .tachygrams
+                    .iter()
+                    .copied()
+                    .map(crate::tachyon::Tachygram::from)
+                    .collect(),
+                zcash_tachyon::TachyonBundle::NoBundle
+                | zcash_tachyon::TachyonBundle::Adjunct(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns `true` if this transaction has any Tachyon actions.
+    pub fn has_tachyon_actions(&self) -> bool {
+        self.tachyon_shielded_data()
+            .is_some_and(|data| !data.actions().is_empty())
+    }
+
     // value balances
 
     /// Return the transparent value balance,
@@ -1822,6 +1890,20 @@ impl Transaction {
         ValueBalance::from_ironwood_amount(ironwood_value_balance)
     }
 
+    /// Return the Tachyon value balance, the change in the transaction value pool due to
+    /// Tachyon actions.
+    pub fn tachyon_value_balance(&self) -> ValueBalance<NegativeAllowed> {
+        let tachyon_value_balance = self
+            .tachyon_shielded_data()
+            .map(|shielded_data| {
+                Amount::try_from(i64::from(shielded_data.value_balance()))
+                    .expect("Tachyon value balances are range-checked when the bundle is parsed")
+            })
+            .unwrap_or_else(Amount::zero);
+
+        ValueBalance::from_tachyon_amount(tachyon_value_balance)
+    }
+
     /// Returns the value balances for this transaction using the provided transparent outputs.
     #[cfg(any(test, feature = "proptest-impl"))]
     pub(crate) fn value_balance_from_outputs(
@@ -1833,6 +1915,7 @@ impl Transaction {
             + self.sapling_value_balance()
             + self.orchard_value_balance()
             + self.ironwood_value_balance()
+            + self.tachyon_value_balance()
     }
 
     /// Returns the value balances for this transaction.
@@ -1891,6 +1974,7 @@ impl Transaction {
             + self.sapling_value_balance()
             + self.orchard_value_balance()
             + self.ironwood_value_balance()
+            + self.tachyon_value_balance()
     }
 
     /// Converts [`Transaction`] to [`zcash_primitives::transaction::Transaction`].

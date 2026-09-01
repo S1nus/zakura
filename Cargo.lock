@@ -7890,6 +7890,7 @@ dependencies = [
  "zcash_note_encryption",
  "zcash_protocol",
  "zcash_script",
+ "zcash_tachyon",
  "zcash_transparent",
 ]
 
@@ -7912,6 +7913,7 @@ dependencies = [
  "once_cell",
  "proptest",
  "proptest-derive",
+ "ragu",
  "rand 0.10.2",
  "rand 0.8.6",
  "rayon",
@@ -7939,6 +7941,7 @@ dependencies = [
  "zakura-tower-fallback",
  "zcash_protocol",
  "zcash_script",
+ "zcash_tachyon",
  "zcash_transparent",
 ]
 
@@ -8268,6 +8271,7 @@ version = "8.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "blake2b_simd",
  "bytes",
  "chrono",
  "color-eyre",
@@ -8291,6 +8295,7 @@ dependencies = [
  "phf",
  "proptest",
  "prost",
+ "ragu",
  "rand 0.10.2",
  "rand 0.8.6",
  "rustls",
@@ -8327,6 +8332,7 @@ dependencies = [
  "zcash_address",
  "zcash_protocol",
  "zcash_script",
+ "zcash_tachyon",
  "zcash_transparent",
 ]
 
@@ -8440,6 +8446,7 @@ dependencies = [
  "zakura-orchard",
  "zakura-sapling-crypto",
  "zakura-test",
+ "zcash_tachyon",
 ]
 
 [[package]]

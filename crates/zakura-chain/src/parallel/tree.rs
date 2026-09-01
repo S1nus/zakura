@@ -8,6 +8,7 @@ use crate::{
     block::Block,
     ironwood, orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
+    tachyon,
 };
 
 /// An argument wrapper struct for note commitment trees.
@@ -35,6 +36,12 @@ pub struct NoteCommitmentTrees {
 
     /// The Ironwood note commitment subtree.
     pub ironwood_subtree: Option<NoteCommitmentSubtree<ironwood::tree::Node>>,
+
+    /// The Tachyon pool anchor after this block.
+    pub tachyon_anchor: tachyon::Anchor,
+
+    /// The epoch-boundary anchor if this block starts a Tachyon epoch.
+    pub tachyon_epoch_anchor: Option<tachyon::Anchor>,
 }
 
 /// Note commitment tree errors.

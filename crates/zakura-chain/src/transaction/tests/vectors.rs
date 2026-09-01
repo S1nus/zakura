@@ -1854,6 +1854,7 @@ fn v7_is_nu_tachyon_gated_and_matches_librustzcash() {
         sapling_shielded_data: None,
         orchard_shielded_data: None,
         ironwood_shielded_data: None,
+        tachyon_shielded_data: None,
     };
 
     empty_v7(NetworkUpgrade::Nu6_3)
@@ -1901,6 +1902,71 @@ fn v7_is_nu_tachyon_gated_and_matches_librustzcash() {
         error,
         SerializationError::Parse(message) if message.contains("NuTachyon")
     ));
+}
+
+#[test]
+#[cfg(zcash_unstable = "nutachyon")]
+fn v7_tachyon_bundle_round_trips() {
+    use group::{
+        ff::{FromUniformBytes, PrimeField},
+        CurveAffine, GroupEncoding,
+    };
+    use halo2::pasta::pallas;
+    use reddsa::{orchard::SpendAuth, SigningKey, VerificationKey};
+
+    let _init_guard = zakura_test::init();
+
+    let signing_key = SigningKey::<SpendAuth>::try_from(
+        pallas::Scalar::from_uniform_bytes(&[0x42; 64]).to_repr(),
+    )
+    .expect("the reduced scalar is a valid signing key");
+    let verification_key = VerificationKey::<SpendAuth>::from(&signing_key);
+    let verification_key = Option::<pallas::Affine>::from(pallas::Affine::from_bytes(
+        &<[u8; 32]>::from(verification_key),
+    ))
+    .expect("the verification key is a valid curve point");
+
+    let bundle = zcash_tachyon::TachyonBundle::Adjunct(zcash_tachyon::Bundle {
+        actions: vec![zcash_tachyon::Action {
+            cv: zcash_tachyon::value::Commitment::from(pallas::Affine::generator()),
+            rk: zcash_tachyon::keys::public::ActionVerificationKey::try_from(verification_key)
+                .expect("a non-identity verification key is valid"),
+            sig: zcash_tachyon::action::Signature::read(&[0x01; 64][..])
+                .expect("test signature bytes are canonical"),
+        }],
+        value_balance: zcash_tachyon::value::Balance::try_from(100i64)
+            .expect("100 is a valid Tachyon value balance"),
+        binding_sig: zcash_tachyon::bundle::Signature::read(&[0x02; 64][..])
+            .expect("test signature bytes are canonical"),
+        memo: vec![0xAB; 5],
+        stamp: zcash_tachyon::PointerStamp::try_from([0xEE; 64])
+            .expect("a 64-byte witnessed transaction ID is valid"),
+    });
+    let tx = Transaction::V7 {
+        network_upgrade: NetworkUpgrade::NuTachyon,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+        tachyon_shielded_data: Some(TachyonShieldedData(bundle)),
+    };
+
+    let bytes = tx
+        .zcash_serialize_to_vec()
+        .expect("a V7 transaction with a Tachyon bundle serializes");
+    let decoded = Transaction::zcash_deserialize(&bytes[..])
+        .expect("a serialized V7 Tachyon transaction deserializes");
+
+    assert_eq!(decoded, tx);
+    assert_eq!(decoded.hash(), tx.hash());
+    assert_eq!(decoded.auth_digest(), tx.auth_digest());
+    assert_eq!(
+        decoded.tachyon_value_balance().tachyon_amount(),
+        Amount::<NegativeAllowed>::try_from(100).expect("100 zatoshi is valid"),
+    );
 }
 
 #[test]

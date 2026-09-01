@@ -9,13 +9,13 @@ mod tests;
 use std::{collections::BTreeMap, io, sync::Arc};
 
 use serde_big_array::BigArray;
-pub use zcash_history::{MAX_ENTRY_SIZE, V1, V2, V3};
+pub use zcash_history::{MAX_ENTRY_SIZE, V1, V2, V3, V4};
 
 use crate::{
     block::{Block, ChainHistoryMmrRootHash, Header, Height},
     ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
-    sapling,
+    sapling, tachyon,
 };
 
 /// The block data needed to build a ZIP-221 history tree leaf.
@@ -31,12 +31,16 @@ pub struct HistoryTreeBlockParts<'a> {
     pub orchard_root: &'a orchard::tree::Root,
     /// The block's Ironwood note commitment tree root.
     pub ironwood_root: &'a ironwood::tree::Root,
+    /// The Tachyon pool anchor after the block.
+    pub tachyon_anchor: &'a tachyon::Anchor,
     /// The number of Sapling transactions in the block.
     pub sapling_tx: u64,
     /// The number of Orchard transactions in the block.
     pub orchard_tx: u64,
     /// The number of Ironwood transactions in the block.
     pub ironwood_tx: u64,
+    /// The number of Tachyon transactions in the block.
+    pub tachyon_tx: u64,
 }
 
 impl<'a> HistoryTreeBlockParts<'a> {
@@ -46,6 +50,7 @@ impl<'a> HistoryTreeBlockParts<'a> {
         sapling_root: &'a sapling::tree::Root,
         orchard_root: &'a orchard::tree::Root,
         ironwood_root: &'a ironwood::tree::Root,
+        tachyon_anchor: &'a tachyon::Anchor,
     ) -> Self {
         let height = block
             .coinbase_height()
@@ -57,9 +62,11 @@ impl<'a> HistoryTreeBlockParts<'a> {
             sapling_root,
             orchard_root,
             ironwood_root,
+            tachyon_anchor,
             sapling_tx: block.sapling_transactions_count(),
             orchard_tx: block.orchard_transactions_count(),
             ironwood_tx: block.ironwood_transactions_count(),
+            tachyon_tx: block.tachyon_transactions_count(),
         }
     }
 }
@@ -73,9 +80,16 @@ pub trait Version: zcash_history::Version {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
+        tachyon_anchor: &tachyon::Anchor,
     ) -> Self::NodeData {
         Self::parts_to_history_node(
-            HistoryTreeBlockParts::from_block(&block, sapling_root, orchard_root, ironwood_root),
+            HistoryTreeBlockParts::from_block(
+                &block,
+                sapling_root,
+                orchard_root,
+                ironwood_root,
+                tachyon_anchor,
+            ),
             network,
         )
     }
@@ -146,9 +160,16 @@ impl Entry {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
+        tachyon_anchor: &tachyon::Anchor,
     ) -> Self {
-        let node_data =
-            V::block_to_history_node(block, network, sapling_root, orchard_root, ironwood_root);
+        let node_data = V::block_to_history_node(
+            block,
+            network,
+            sapling_root,
+            orchard_root,
+            ironwood_root,
+            tachyon_anchor,
+        );
         Self::from_node_data::<V>(node_data)
     }
 
@@ -227,13 +248,20 @@ impl<V: Version> Tree<V> {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
+        tachyon_anchor: &tachyon::Anchor,
     ) -> Result<(Self, Entry), io::Error> {
         let height = block
             .coinbase_height()
             .expect("block must have coinbase height during contextual verification");
         let network_upgrade = NetworkUpgrade::current(network, height);
-        let entry0 =
-            Entry::new_leaf::<V>(block, network, sapling_root, orchard_root, ironwood_root);
+        let entry0 = Entry::new_leaf::<V>(
+            block,
+            network,
+            sapling_root,
+            orchard_root,
+            ironwood_root,
+            tachyon_anchor,
+        );
         let mut peaks = BTreeMap::new();
         peaks.insert(0u32, entry0);
         Ok((
@@ -283,6 +311,7 @@ impl<V: Version> Tree<V> {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
+        tachyon_anchor: &tachyon::Anchor,
     ) -> Result<Vec<Entry>, zcash_history::Error> {
         let height = block
             .coinbase_height()
@@ -302,6 +331,7 @@ impl<V: Version> Tree<V> {
             sapling_root,
             orchard_root,
             ironwood_root,
+            tachyon_anchor,
         );
         let appended = self.inner.append_leaf(node_data)?;
 
@@ -483,6 +513,22 @@ impl Version for V3 {
             start_ironwood_root: ironwood_root,
             end_ironwood_root: ironwood_root,
             ironwood_tx: parts.ironwood_tx,
+        }
+    }
+}
+
+impl Version for V4 {
+    fn parts_to_history_node(
+        parts: HistoryTreeBlockParts<'_>,
+        network: &Network,
+    ) -> Self::NodeData {
+        let node_data_v3 = V3::parts_to_history_node(parts, network);
+        let tachyon_anchor: [u8; 32] = parts.tachyon_anchor.into();
+        Self::NodeData {
+            v3: node_data_v3,
+            start_tachyon_anchor: tachyon_anchor,
+            end_tachyon_anchor: tachyon_anchor,
+            tachyon_tx: parts.tachyon_tx,
         }
     }
 }

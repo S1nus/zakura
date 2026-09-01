@@ -148,7 +148,11 @@ fn format_upgrades(
             "widen history tree entries for NuTachyon",
             Version::new(28, 2, 5),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 11])
+        Box::new(no_migration::NoMigration::new(
+            "add Tachyon state and widen chain value balance and history entries",
+            Version::new(29, 0, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 12])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -1113,7 +1117,7 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 7);
+    assert_eq!(upgrades.len(), 8);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
@@ -1121,6 +1125,7 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
     assert_eq!(upgrades[4].version(), Version::new(28, 1, 4));
     assert_eq!(upgrades[5].version(), Version::new(28, 1, 5));
     assert_eq!(upgrades[6].version(), Version::new(28, 2, 5));
+    assert_eq!(upgrades[7].version(), Version::new(29, 0, 0));
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"

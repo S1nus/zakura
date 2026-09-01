@@ -486,6 +486,10 @@ where
             // Transaction parsing enforces the same rule. Repeat it here for
             // defense-in-depth and transactions constructed in memory.
             check::shielded_proof_size_is_canonical(&tx)?;
+            check::tachyon_actions_have_valid_digests(&tx)?;
+            if req.is_mempool() {
+                check::tachyon_bundle_is_autonome(&tx)?;
+            }
 
             // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {
@@ -1151,7 +1155,8 @@ where
             &sighash,
             nu,
             wtx_id,
-        )))
+        ))
+        .and(Self::verify_tachyon_signatures(&transaction, &sighash)))
     }
 
     /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
@@ -1182,6 +1187,29 @@ where
         }
 
         Ok(())
+    }
+
+    /// Queues verification of a V7 transaction's Tachyon action and binding signatures.
+    fn verify_tachyon_signatures(tx: &Transaction, sighash: &SigHash) -> AsyncChecks {
+        use zcash_tachyon::TachyonBundle;
+
+        let mut async_checks = AsyncChecks::new();
+        let Some(tachyon_shielded_data) = tx.tachyon_shielded_data() else {
+            return async_checks;
+        };
+
+        let bundle = tachyon_shielded_data.0.clone();
+        let sighash_bytes = sighash.0;
+        async_checks.push(primitives::spawn_fifo_and_convert(move || {
+            match &bundle {
+                TachyonBundle::NoBundle => Ok(()),
+                TachyonBundle::Proven(bundle) => bundle.verify_signatures(&sighash_bytes),
+                TachyonBundle::Adjunct(bundle) => bundle.verify_signatures(&sighash_bytes),
+            }
+            .map_err(|error| TransactionError::TachyonSignatureInvalid(error.to_string()))
+        }));
+
+        async_checks
     }
 
     /// Verifies if a transaction's transparent inputs are valid using the provided

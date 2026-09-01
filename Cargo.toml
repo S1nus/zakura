@@ -32,7 +32,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/zakura-core/zakura"
 homepage = "https://github.com/zakura-core/zakura"
 keywords = ["zakura", "zcash"]
-rust-version = "1.91"
+rust-version = "1.97"
 edition = "2021"
 
 [workspace.dependencies]
@@ -58,6 +58,8 @@ zcash_primitives = { git = "https://github.com/zakura-core/common.git", rev = "6
 zcash_proofs = { git = "https://github.com/zakura-core/common.git", rev = "69d1bc64b8ef3bbb885a94f70d66725fa6cc028b", package = "zakura-proofs" }
 zcash_transparent = { git = "https://github.com/zcash/librustzcash.git", rev = "c7235b1fc4b4296b8af2e26bf2f6adb24f873f56" }
 zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "c7235b1fc4b4296b8af2e26bf2f6adb24f873f56" }
+zcash_tachyon = { git = "https://github.com/tachyon-zcash/tachyon", rev = "2dc7010c3e7771c539fd1c03a06bc6be1a7316c7", version = "0.0.0", default-features = false }
+ragu = { git = "https://github.com/tachyon-zcash/ragu", rev = "f4f6315b10ed96944c40b2bbdbca0fe06af66ce0", default-features = false, features = ["mock"] }
 abscissa_core = { version = "0.7", default-features = false }
 base64 = "0.22.1"
 bech32 = "0.11.0"

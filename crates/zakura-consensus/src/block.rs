@@ -36,6 +36,7 @@ use crate::{error::*, primitives, transaction as tx, BoxError};
 pub mod check;
 pub mod request;
 pub mod subsidy;
+pub(crate) mod tachyon;
 
 pub use request::Request;
 
@@ -125,6 +126,16 @@ impl VerifyBlockError {
                     consensus("block.too_many_transparent_signature_operations")
                 }
                 BlockError::SummingMinerFees { .. } => consensus("block.summing_miner_fees"),
+                BlockError::DuplicateTachygram => consensus("block.duplicate_tachygram"),
+                BlockError::TachyonAggregateNotFound => {
+                    consensus("block.tachyon_aggregate_not_found")
+                }
+                BlockError::TachyonCoverageMismatch => consensus("block.tachyon_coverage_mismatch"),
+                BlockError::TachyonDuplicateAction => consensus("block.tachyon_duplicate_action"),
+                BlockError::TachyonTachygramArityMismatch => {
+                    consensus("block.tachyon_tachygram_arity_mismatch")
+                }
+                BlockError::TachyonProofInvalid(_) => consensus("block.tachyon_proof_invalid"),
                 BlockError::InvalidHeaderEncoding(_)
                 | BlockError::MissingHeight(_)
                 | BlockError::MaxHeight(_, _, _)
@@ -317,6 +328,11 @@ where
 
             check::merkle_root_validity(&network, &block, &transaction_hashes)?;
 
+            let mut tachyon_checks = tachyon::coherence(&block)?
+                .into_iter()
+                .map(primitives::tachyon::verify_proof_stamp)
+                .collect::<FuturesUnordered<_>>();
+
             // Since errors cause an early exit, try to do the
             // quick checks first.
 
@@ -402,6 +418,10 @@ where
             }
 
             // Check the summed block totals
+
+            while let Some(result) = tachyon_checks.next().await {
+                result?;
+            }
 
             if sigops > MAX_BLOCK_SIGOPS {
                 Err(BlockError::TooManyTransparentSignatureOperations {

@@ -2725,6 +2725,25 @@ where
             mempool_tx_deps,
         );
 
+        #[cfg(test)]
+        let (dependency_depths, selected_txs): (Vec<_>, Vec<_>) = mempool_txs.into_iter().unzip();
+        #[cfg(not(test))]
+        let selected_txs = mempool_txs;
+
+        let selected_txs = types::get_block_template::tachyon::aggregate_transactions(
+            self.network.clone(),
+            height,
+            chain_info.tip_hash,
+            read_state,
+            selected_txs,
+        )
+        .await;
+
+        #[cfg(test)]
+        let mempool_txs: Vec<_> = dependency_depths.into_iter().zip(selected_txs).collect();
+        #[cfg(not(test))]
+        let mempool_txs = selected_txs;
+
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs
                 .iter()

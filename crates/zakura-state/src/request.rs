@@ -26,6 +26,7 @@ use zakura_chain::{
     serialization::SerializationError,
     sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
+    tachyon,
     transaction::{self, UnminedTx},
     transparent,
     value_balance::{ValueBalance, ValueBalanceError},
@@ -370,6 +371,8 @@ impl Treestate {
         sapling_subtree: Option<NoteCommitmentSubtree<sapling_crypto::Node>>,
         orchard_subtree: Option<NoteCommitmentSubtree<orchard::tree::Node>>,
         ironwood_subtree: Option<NoteCommitmentSubtree<ironwood::tree::Node>>,
+        tachyon_anchor: zakura_chain::tachyon::Anchor,
+        tachyon_epoch_anchor: Option<zakura_chain::tachyon::Anchor>,
         history_tree: Arc<HistoryTree>,
     ) -> Self {
         Self {
@@ -381,6 +384,8 @@ impl Treestate {
                 orchard_subtree,
                 ironwood,
                 ironwood_subtree,
+                tachyon_anchor,
+                tachyon_epoch_anchor,
             },
             history_tree,
         }
@@ -1460,6 +1465,23 @@ pub enum ReadRequest {
     /// with the pool values of the current best chain tip.
     TipPoolValues,
 
+    /// Returns the chain data needed to aggregate transactions rooted at Tachyon anchors.
+    ///
+    /// Returns [`ReadResponse::TachyonMiningData`] if `tip_hash` is still the current best-chain
+    /// tip. Unknown anchors are omitted. For every epoch represented by a known anchor, the
+    /// response also contains the blocks between the earliest and latest requested anchors and
+    /// any requested tachygrams already revealed within the candidate's two-epoch window.
+    TachyonMiningData {
+        /// Anchors referenced by the selected autonome transactions.
+        anchors: HashSet<tachyon::Anchor>,
+        /// Tachygrams revealed by the selected autonome transactions.
+        tachygrams: HashSet<tachyon::Tachygram>,
+        /// The chain tip on which the block template is being built.
+        tip_hash: block::Hash,
+        /// The height of the candidate block being built on `tip_hash`.
+        candidate_height: block::Height,
+    },
+
     /// Looks up the block info after a block by hash or height in the current best chain.
     ///
     /// * [`ReadResponse::BlockInfo(Some(pool_values))`](ReadResponse::BlockInfo) if the block is in the best chain;
@@ -1936,6 +1958,7 @@ impl ReadRequest {
             ReadRequest::Tip => "tip",
             ReadRequest::FinalizedTip => "finalized_tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
+            ReadRequest::TachyonMiningData { .. } => "tachyon_mining_data",
             ReadRequest::BlockInfo(_) => "block_info",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",

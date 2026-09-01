@@ -72,6 +72,7 @@ tower = { workspace = true, features = ["buffer", "util"] }
 tracing = { workspace = true }
 
 sapling-crypto = { workspace = true }
+zcash_tachyon = { workspace = true }
 
 zakura-assets = { workspace = true }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.1" }

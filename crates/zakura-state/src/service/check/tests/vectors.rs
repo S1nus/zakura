@@ -89,6 +89,7 @@ fn block_commitment_uses_the_precomputed_auth_data_root() {
         &sapling_root,
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .expect("NU5 parent builds a history tree");
 

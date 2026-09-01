@@ -884,6 +884,7 @@ impl ZcashSerialize for Transaction {
                 sapling_shielded_data,
                 orchard_shielded_data,
                 ironwood_shielded_data,
+                tachyon_shielded_data,
             } => {
                 if *network_upgrade < NetworkUpgrade::NuTachyon {
                     return Err(io::Error::new(
@@ -915,7 +916,7 @@ impl ZcashSerialize for Transaction {
                 )?;
                 #[cfg(zcash_unstable = "nutachyon")]
                 zcash_primitives::transaction::components::tachyon::write_v7_bundle(
-                    None,
+                    tachyon_shielded_data.as_ref().map(|bundle| &bundle.0),
                     &mut writer,
                 )?;
                 #[cfg(not(zcash_unstable = "nutachyon"))]
@@ -1313,21 +1314,20 @@ impl ZcashDeserialize for Transaction {
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
                 #[cfg(zcash_unstable = "nutachyon")]
-                if zcash_primitives::transaction::components::tachyon::read_v7_bundle(
-                    &mut limited_reader,
-                )?
-                .is_some()
-                {
-                    return Err(SerializationError::Parse(
-                        "Tachyon bundles are not yet supported",
-                    ));
-                }
+                let tachyon_shielded_data =
+                    zcash_primitives::transaction::components::tachyon::read_v7_bundle(
+                        &mut limited_reader,
+                    )?
+                    .map(TachyonShieldedData::from);
                 #[cfg(not(zcash_unstable = "nutachyon"))]
-                if limited_reader.read_u8()? != 0 {
-                    return Err(SerializationError::Parse(
-                        "Tachyon bundles are not available in this build",
-                    ));
-                }
+                let tachyon_shielded_data = match limited_reader.read_u8()? {
+                    0 => None,
+                    _ => {
+                        return Err(SerializationError::Parse(
+                            "Tachyon bundles are not available in this build",
+                        ));
+                    }
+                };
 
                 Ok(Transaction::V7 {
                     network_upgrade,
@@ -1338,6 +1338,7 @@ impl ZcashDeserialize for Transaction {
                     sapling_shielded_data,
                     orchard_shielded_data,
                     ironwood_shielded_data,
+                    tachyon_shielded_data,
                 })
             }
             (_, _) => Err(SerializationError::Parse("bad tx header")),

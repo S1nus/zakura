@@ -290,6 +290,15 @@ pub enum TransactionError {
     #[error("Ironwood proof has a non-canonical size")]
     IronwoodProofSize,
 
+    #[error("Tachyon action value commitment and verification key must not be identity: {0}")]
+    TachyonIdentityAction(String),
+
+    #[error("Tachyon action and binding signatures must verify: {0}")]
+    TachyonSignatureInvalid(String),
+
+    #[error("the mempool only accepts autonome Tachyon transactions")]
+    NonAutonomeTachyon,
+
     #[error("unexpected error")]
     Other(String),
 }
@@ -492,6 +501,11 @@ impl TransactionError {
             Self::Balance(_) => consensus("transaction.balance"),
             Self::OrchardProofSize => consensus("transaction.orchard_proof_size"),
             Self::IronwoodProofSize => consensus("transaction.ironwood_proof_size"),
+            Self::TachyonIdentityAction(_) => consensus("transaction.tachyon_identity_action"),
+            Self::TachyonSignatureInvalid(_) => consensus("transaction.tachyon_signature_invalid"),
+            Self::NonAutonomeTachyon => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
             Self::ImmatureTransparentCoinbaseSpend { .. } => {
                 consensus("transaction.immature_transparent_coinbase_spend")
             }
@@ -545,6 +559,8 @@ impl TransactionError {
             | OrchardHasEnableCrossAddress
             | OrchardProofSize
             | IronwoodProofSize
+            | TachyonIdentityAction(_)
+            | TachyonSignatureInvalid(_)
             | WrongConsensusBranchId
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)
@@ -717,6 +733,24 @@ pub enum BlockError {
         source: amount::Error,
     },
 
+    #[error("all Tachygrams in a block must be distinct")]
+    DuplicateTachygram,
+
+    #[error("a Tachyon pointer stamp must refer to a proof-stamped transaction in the same block")]
+    TachyonAggregateNotFound,
+
+    #[error("a Tachyon proof stamp's covered-actions digest does not match its aggregate")]
+    TachyonCoverageMismatch,
+
+    #[error("action descriptors covered by a Tachyon proof stamp must be distinct")]
+    TachyonDuplicateAction,
+
+    #[error("a Tachyon proof stamp must publish exactly two Tachygrams per covered action")]
+    TachyonTachygramArityMismatch,
+
+    #[error("a Tachyon proof stamp must verify: {0}")]
+    TachyonProofInvalid(String),
+
     #[error("unexpected error occurred: {0}")]
     Other(String),
 }
@@ -755,6 +789,12 @@ impl BlockError {
             | BadMerkleRoot { .. }
             | WrongTransactionConsensusBranchId
             | TooManyTransparentSignatureOperations { .. } => 100,
+            DuplicateTachygram
+            | TachyonAggregateNotFound
+            | TachyonCoverageMismatch
+            | TachyonDuplicateAction
+            | TachyonTachygramArityMismatch
+            | TachyonProofInvalid(_) => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             _other => 0,
         }

@@ -23,6 +23,7 @@ use zakura_chain::{
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
+    tachyon,
     transaction::Transaction,
 };
 
@@ -30,7 +31,7 @@ use crate::{
     request::{FinalizedBlock, Treestate},
     service::finalized_state::{
         disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
-        disk_format::RawBytes,
+        disk_format::{shielded::TachyonEpoch, RawBytes},
         vct::VctWriteData,
         zakura_db::ZakuraDb,
     },
@@ -180,6 +181,48 @@ impl ZakuraDb {
     pub fn contains_ironwood_anchor(&self, ironwood_anchor: &ironwood::tree::Root) -> bool {
         let ironwood_anchors = self.db.cf_handle("ironwood_anchors").unwrap();
         self.db.zs_contains(&ironwood_anchors, &ironwood_anchor)
+    }
+
+    /// Returns the finalized height that created `tachyon_anchor` while it remains retained.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn tachyon_anchor_height(&self, tachyon_anchor: &tachyon::Anchor) -> Option<Height> {
+        let tachyon_anchors = self.db.cf_handle("tachyon_anchors").unwrap();
+        self.db.zs_get(&tachyon_anchors, tachyon_anchor)
+    }
+
+    /// Returns the Tachyon pool anchor after the finalized tip.
+    pub fn tachyon_anchor_for_tip(&self) -> tachyon::Anchor {
+        let anchors_by_height = self.db.cf_handle("tachyon_anchor_by_height").unwrap();
+        self.db
+            .zs_last_key_value(&anchors_by_height)
+            .map(|(_height, anchor): (Height, tachyon::Anchor)| anchor)
+            .unwrap_or_default()
+    }
+
+    /// Returns the finalized height that revealed `tachygram` while it remains retained.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn tachyon_tachygram_revealed_height(
+        &self,
+        tachygram: &tachyon::Tachygram,
+    ) -> Option<Height> {
+        let tachygrams = self.db.cf_handle("tachyon_tachygrams").unwrap();
+        self.db.zs_get(&tachygrams, tachygram)
+    }
+
+    /// Returns the boundary anchor for a finalized Tachyon epoch.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn tachyon_epoch_anchor(&self, epoch: u32) -> Option<tachyon::Anchor> {
+        let anchors = self.db.cf_handle("tachyon_epoch_anchor_by_epoch").unwrap();
+        self.db.zs_get(&anchors, &TachyonEpoch(epoch))
+    }
+
+    /// Returns the latest finalized Tachyon epoch.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn tachyon_current_epoch(&self) -> Option<u32> {
+        let anchors = self.db.cf_handle("tachyon_epoch_anchor_by_epoch").unwrap();
+        self.db
+            .zs_last_key_value(&anchors)
+            .map(|(epoch, _anchor): (TachyonEpoch, tachyon::Anchor)| epoch.0)
     }
 
     // # Sprout trees
@@ -716,6 +759,8 @@ impl ZakuraDb {
             orchard_subtree: self.orchard_subtree_for_tip(),
             ironwood: self.ironwood_tree_for_tip(),
             ironwood_subtree: self.ironwood_subtree_for_tip(),
+            tachyon_anchor: self.tachyon_anchor_for_tip(),
+            tachyon_epoch_anchor: None,
         })
     }
 }
@@ -744,6 +789,58 @@ impl DiskWriteBatch {
         #[cfg(not(feature = "indexer"))]
         for transaction in &finalized.block.transactions {
             self.prepare_nullifier_batch(zakura_db, transaction);
+        }
+
+        self.prepare_tachyon_tachygram_batch(zakura_db, finalized);
+    }
+
+    /// Stores this block's Tachygrams and prunes data outside the two-epoch scan window.
+    pub fn prepare_tachyon_tachygram_batch(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        finalized: &FinalizedBlock,
+    ) {
+        let height = finalized.height;
+        let block_tachygrams: Vec<_> = finalized
+            .block
+            .transactions
+            .iter()
+            .flat_map(|transaction| transaction.tachyon_tachygrams())
+            .collect();
+        let starts_epoch =
+            tachyon::pool_height(&zakura_db.network(), height).is_some_and(tachyon::is_epoch_first);
+
+        if !starts_epoch && block_tachygrams.is_empty() {
+            return;
+        }
+
+        let tachyon_tachygrams = zakura_db.db.cf_handle("tachyon_tachygrams").unwrap();
+        if starts_epoch {
+            let cutoff = Height(height.0.saturating_sub(tachyon::EPOCH_LENGTH));
+            let expired_tachygrams: Vec<tachyon::Tachygram> = zakura_db
+                .db
+                .zs_forward_range_iter(&tachyon_tachygrams, ..)
+                .filter(|&(_, revealed): &(tachyon::Tachygram, Height)| revealed < cutoff)
+                .map(|(tachygram, _)| tachygram)
+                .collect();
+            for tachygram in expired_tachygrams {
+                self.zs_delete(&tachyon_tachygrams, tachygram);
+            }
+
+            let tachyon_anchors = zakura_db.db.cf_handle("tachyon_anchors").unwrap();
+            let expired_anchors: Vec<tachyon::Anchor> = zakura_db
+                .db
+                .zs_forward_range_iter(&tachyon_anchors, ..)
+                .filter(|&(_, anchor_height): &(tachyon::Anchor, Height)| anchor_height < cutoff)
+                .map(|(anchor, _)| anchor)
+                .collect();
+            for anchor in expired_anchors {
+                self.zs_delete(&tachyon_anchors, anchor);
+            }
+        }
+
+        for tachygram in block_tachygrams {
+            self.zs_insert(&tachyon_tachygrams, tachygram, height);
         }
     }
 
@@ -824,6 +921,23 @@ impl DiskWriteBatch {
         let sapling_tx = finalized.block.sapling_transactions_count();
         let orchard_tx = finalized.block.orchard_transactions_count();
         let ironwood_tx = finalized.block.ironwood_transactions_count();
+
+        let previous_tachyon_anchor = prev_note_commitment_trees.as_ref().map_or_else(
+            || zakura_db.tachyon_anchor_for_tip(),
+            |trees| trees.tachyon_anchor,
+        );
+        if previous_tachyon_anchor != note_commitment_trees.tachyon_anchor {
+            self.create_tachyon_anchor(zakura_db, height, &note_commitment_trees.tachyon_anchor);
+        }
+        if let Some(epoch_anchor) = note_commitment_trees.tachyon_epoch_anchor {
+            let epoch = tachyon::epoch(&zakura_db.network(), *height)
+                .expect("a block carrying a Tachyon epoch anchor is NuTachyon-onward");
+            let epoch_anchors = zakura_db
+                .db
+                .cf_handle("tachyon_epoch_anchor_by_epoch")
+                .unwrap();
+            self.zs_insert(&epoch_anchors, TachyonEpoch(epoch), epoch_anchor);
+        }
 
         // Record the upgrade height `U` once, on the first block this binary commits: the lowest
         // height in the serving index, and the boundary below which roots are served from the
@@ -1095,6 +1209,19 @@ impl DiskWriteBatch {
             .cf_handle("sapling_note_commitment_subtree")
             .unwrap();
         self.zs_insert(&sapling_subtree_cf, subtree.index, subtree.into_data());
+    }
+
+    /// Stores an end-of-block Tachyon anchor by value and height.
+    pub fn create_tachyon_anchor(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        height: &Height,
+        anchor: &tachyon::Anchor,
+    ) {
+        let anchors = zakura_db.db.cf_handle("tachyon_anchors").unwrap();
+        let anchors_by_height = zakura_db.db.cf_handle("tachyon_anchor_by_height").unwrap();
+        self.zs_insert(&anchors, anchor, height);
+        self.zs_insert(&anchors_by_height, height, anchor);
     }
 
     /// Deletes the Sapling note commitment tree at the given [`Height`].

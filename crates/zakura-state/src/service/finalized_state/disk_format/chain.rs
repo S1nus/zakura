@@ -58,7 +58,7 @@ pub enum HistoryTreeDecodeError {
 }
 
 impl IntoDisk for ValueBalance<NonNegative> {
-    type Bytes = [u8; 48];
+    type Bytes = [u8; 56];
 
     fn as_bytes(&self) -> Self::Bytes {
         self.to_bytes()
@@ -260,18 +260,31 @@ impl IntoDisk for BlockInfo {
 
 impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        // We have two different DB formats, one from NU6_1 (Lockbox) one for Ironwood and onwards.
+        // We have different DB formats for NU6.1, Ironwood, and NuTachyon onward.
         const NU6_1_VALUE_BALANCE_LEN: usize = 40;
         const IRONWOOD_VALUE_BALANCE_LEN: usize = 48;
+        const TACHYON_VALUE_BALANCE_LEN: usize = 56;
         const BLOCK_SIZE_LEN: usize = 4;
         const NU6_1_BLOCK_INFO_LEN: usize = NU6_1_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
         const IRONWOOD_BLOCK_INFO_LEN: usize = IRONWOOD_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
+        const TACHYON_BLOCK_INFO_LEN: usize = TACHYON_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
 
         let bytes = bytes.as_ref();
 
         // We want to be forward-compatible, so this must work even if the
         // size of the buffer is larger than expected.
         match bytes.len() {
+            TACHYON_BLOCK_INFO_LEN.. => {
+                let value_pools =
+                    ValueBalance::<NonNegative>::from_bytes(&bytes[..TACHYON_VALUE_BALANCE_LEN])
+                        .expect("must work for 56 bytes");
+                let size = u32::from_le_bytes(
+                    bytes[TACHYON_VALUE_BALANCE_LEN..TACHYON_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
+                        .try_into()
+                        .expect("must be 4 bytes"),
+                );
+                BlockInfo::new(value_pools, size)
+            }
             IRONWOOD_BLOCK_INFO_LEN.. => {
                 let value_pools =
                     ValueBalance::<NonNegative>::from_bytes(&bytes[..IRONWOOD_VALUE_BALANCE_LEN])
