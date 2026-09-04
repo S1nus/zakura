@@ -20,6 +20,13 @@ const ACTION_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// misbehavior actions.
 const BS_ACTION_SPARE_POOL: usize = 128;
 
+/// Action slots that expendable peer traffic cannot consume.
+///
+/// The Sequencer's submission bound accounts for its data-plane actions. This
+/// reservation protects a reactor-local needed-body refill from untrusted
+/// serving and misbehavior-report floods that occupy the spare pool.
+pub(super) const BS_ACTION_CONTROL_RESERVE: usize = 1;
+
 /// Bound on the shared routine→reactor channel (status-advertise / serve /
 /// re-query / serving-misbehavior). Sized generously so a transient burst of
 /// per-peer events never makes a routine's `try_send` drop a serving/status
@@ -228,6 +235,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_input_bytes: sequencer_input_bytes.clone(),
         sequencer_input_decoded_attributed_memory_bytes:
             sequencer_input_decoded_attributed_memory_bytes.clone(),
+        #[cfg(test)]
         actions: actions_tx.clone(),
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),
@@ -378,10 +386,9 @@ impl BlockSyncReactor {
         let mut header_tip_open = header_tip.is_some();
         let mut committed_views = self.startup.committed_views.clone();
         set_block_reactor_active_connection_gauge(self.state.peers.len());
-        // Metrics/trace snapshot cadence only. Per-peer request timeouts are owned
-        // by the routines (each sleeps to its own earliest deadline), so this timer
-        // no longer drives any timeout; it reuses `request_timeout` purely as a
-        // reasonable periodic refresh interval.
+        // Per-peer request timeouts are owned by the routines. This local tick
+        // also retries the level-triggered needed-body query, so a lost routine
+        // notification or a full action queue cannot consume the refill need.
         let mut metrics_ticks = time::interval(self.startup.config.request_timeout);
         let mut status_ticks = time::interval(
             self.startup
@@ -479,6 +486,7 @@ impl BlockSyncReactor {
                     }
                 }
                 _ = metrics_ticks.tick() => {
+                    self.query_needed_blocks().await;
                     self.publish_metrics();
                     self.refresh_throughput();
                     self.trace_sync_state(true);
@@ -2285,6 +2293,28 @@ impl BlockSyncReactor {
             .actions
             .max_capacity()
             .saturating_sub(self.actions.capacity());
+        let peer_action_permits = if matches!(
+            action,
+            BlockSyncAction::QueryBlocksByHeightRange { .. } | BlockSyncAction::Misbehavior { .. }
+        ) {
+            // Acquire the peer-action slot and protected control capacity in one
+            // semaphore operation. The Sequencer sends concurrently, so a
+            // separate capacity check followed by `try_send` has a race.
+            match self.actions.try_reserve_many(BS_ACTION_CONTROL_RESERVE + 1) {
+                Ok(permits) => Some(permits),
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    metrics::counter!(
+                        "sync.block.action.control_capacity_reserved",
+                        "action" => action_label
+                    )
+                    .increment(1);
+                    return false;
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => return false,
+            }
+        } else {
+            None
+        };
         // Metrics accepts f64 samples; this lossy conversion is observability-only.
         metrics::histogram!(
             "sync.block.action.queue.depth",
@@ -2294,6 +2324,13 @@ impl BlockSyncReactor {
         self.startup
             .trace
             .emit_event(|| BlockActionDispatched::new(&action));
+        if let Some(mut permits) = peer_action_permits {
+            permits
+                .next()
+                .expect("the atomic reservation includes one peer-action permit")
+                .send(action);
+            return true;
+        }
         match self.actions.try_send(action) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {

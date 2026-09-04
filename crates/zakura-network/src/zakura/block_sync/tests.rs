@@ -18,7 +18,7 @@ use super::{
     },
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
-        node_id_from_block_peer_id, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
+        node_id_from_block_peer_id, BS_ACTION_CONTROL_RESERVE, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
         EMPTY_STATE_HEADER_QUIET_PERIOD,
     },
     reorder::*,
@@ -13880,6 +13880,234 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
         })
         .await
         .expect("serving slot release queues");
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn serving_flood_cannot_consume_needed_query_retry() {
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = ZakuraBlockSyncConfig {
+        request_timeout: Duration::from_secs(2),
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.peer_limits.outbound_queue_depth = 16;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        62,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring");
+    await_until(
+        "the peer status reaches the registry",
+        Duration::from_secs(1),
+        || wiring.registry.has_received_status(&peer_id),
+    )
+    .await
+    .expect("the valid serving peer becomes ready");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    while wiring.actions.capacity() > 0 {
+        wiring
+            .actions
+            .try_send(BlockSyncAction::Misbehavior {
+                peer: peer(0xfe),
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            })
+            .expect("the test fills one available action slot");
+    }
+
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(2),
+            hash: blocks[1].hash(),
+        })
+        .await
+        .expect("the higher header tip queues");
+    let (barrier_send, _barrier_recv) = framed_channel(1);
+    handle
+        .send(BlockSyncEvent::PeerConnected(
+            BlockSyncPeerSession::for_test(peer(0xfd), barrier_send, CancellationToken::new()),
+        ))
+        .await
+        .expect("the event-order barrier queues");
+    await_until(
+        "the reactor handles the full-queue refill attempt",
+        Duration::from_secs(1),
+        || handle.peer_snapshot().outbound_peers == 2,
+    )
+    .await
+    .expect("the peer event follows the header-tip event");
+    assert_eq!(
+        wiring.actions.capacity(),
+        0,
+        "the first needed-body query loses to the full action queue",
+    );
+
+    let _ = actions.recv().await.expect("one flooded action drains");
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::GetBlocks {
+            start_height: block::Height(1),
+            count: 1,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match actions.recv().await {
+                Some(BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(2),
+                    best_header_tip: block::Height(2),
+                    ..
+                }) => break,
+                Some(BlockSyncAction::QueryBlocksByHeightRange { .. }) => {
+                    panic!("peer serving consumed the refill control reservation")
+                }
+                Some(_) => {}
+                None => panic!("the action stream closed before the refill retry"),
+            }
+        }
+    })
+    .await
+    .expect("the local tick retries the needed-body query");
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = ZakuraBlockSyncConfig {
+        request_timeout: Duration::from_secs(2),
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.peer_limits.outbound_queue_depth = 16;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        63,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring");
+    await_until(
+        "the peer status reaches the registry",
+        Duration::from_secs(1),
+        || wiring.registry.has_received_status(&peer_id),
+    )
+    .await
+    .expect("the peer becomes ready");
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    while wiring.actions.capacity() > BS_ACTION_CONTROL_RESERVE {
+        wiring
+            .actions
+            .try_send(BlockSyncAction::Misbehavior {
+                peer: peer(0xfe),
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            })
+            .expect("the test fills one unreserved action slot");
+    }
+
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(2),
+            tip_hash: blocks[1].hash(),
+            max_blocks_per_response: 16,
+            max_inflight_requests: 1,
+            max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        }),
+    )
+    .await;
+    await_until(
+        "the download routine handles the unsolicited body before its status barrier",
+        Duration::from_secs(1),
+        || {
+            wiring.registry.candidate_snapshot().iter().any(
+                |(peer, received_status, _, servable_high)| {
+                    peer == &peer_id && *received_status && *servable_high == block::Height(2)
+                },
+            )
+        },
+    )
+    .await
+    .expect("the download routine reports the attacker-controlled body");
+    assert_eq!(
+        wiring.actions.capacity(),
+        BS_ACTION_CONTROL_RESERVE,
+        "peer-triggered misbehavior retained the refill control reservation",
+    );
+
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(2),
+            hash: blocks[1].hash(),
+        })
+        .await
+        .expect("the higher header tip queues");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match actions.recv().await {
+                Some(BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(2),
+                    best_header_tip: block::Height(2),
+                    ..
+                }) => break,
+                Some(_) => {}
+                None => panic!("the action stream closed before the needed-body query"),
+            }
+        }
+    })
+    .await
+    .expect("the needed-body query uses the reserved capacity");
 
     reactor_task.abort();
 }
