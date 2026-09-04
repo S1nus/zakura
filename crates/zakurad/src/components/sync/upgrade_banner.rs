@@ -53,6 +53,8 @@ fn crossed_network_upgrades(
 }
 
 fn network_upgrade_banner(network_upgrade: NetworkUpgrade, activation_height: Height) -> String {
+    let activation_height = activation_height.0;
+
     format!(
         "\n\
 ============================================================\n\
