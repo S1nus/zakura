@@ -153,6 +153,9 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
 zakura-test = { path = "../zakura-test/", version = "2.1.0" }
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dev-dependencies]
+ragu = { workspace = true }
+
 [[bench]]
 name = "block"
 harness = false

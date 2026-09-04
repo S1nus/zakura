@@ -917,8 +917,11 @@ impl ZcashSerialize for Transaction {
                     &mut writer,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
+                let tachyon_bundle = tachyon_shielded_data
+                    .as_ref()
+                    .map_or(&zcash_tachyon::TachyonBundle::NoBundle, |bundle| &bundle.0);
                 zcash_primitives::transaction::components::tachyon::write_v7_bundle(
-                    tachyon_shielded_data.as_ref().map(|bundle| &bundle.0),
+                    tachyon_bundle,
                     &mut writer,
                 )?;
             }
@@ -1315,10 +1318,12 @@ impl ZcashDeserialize for Transaction {
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
                 let tachyon_shielded_data =
-                    zcash_primitives::transaction::components::tachyon::read_v7_bundle(
+                    match zcash_primitives::transaction::components::tachyon::read_v7_bundle(
                         &mut limited_reader,
-                    )?
-                    .map(TachyonShieldedData::from);
+                    )? {
+                        zcash_tachyon::TachyonBundle::NoBundle => None,
+                        bundle => Some(TachyonShieldedData::from(bundle)),
+                    };
                 Ok(Transaction::V7 {
                     network_upgrade,
                     lock_time,
