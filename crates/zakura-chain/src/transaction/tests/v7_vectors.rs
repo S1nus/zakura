@@ -136,7 +136,7 @@ fn fixtures() -> [(&'static str, Transaction); 4] {
 }
 
 #[test]
-fn v7_is_nu_tachyon_gated_and_matches_librustzcash() {
+fn v7_is_nu_tachyon_gated_and_matches_zakura_primitives() {
     let _init_guard = zakura_test::init();
 
     assert_eq!(
@@ -175,14 +175,14 @@ fn v7_is_nu_tachyon_gated_and_matches_librustzcash() {
     let decoded = Transaction::zcash_deserialize(&bytes[..])
         .expect("Zakura must deserialize its NuTachyon V7 encoding");
     assert_eq!(decoded, transaction);
-    let librustzcash_transaction = transaction
+    let zakura_primitives_transaction = transaction
         .to_librustzcash(NetworkUpgrade::NuTachyon)
-        .expect("librustzcash must accept Zakura's NuTachyon V7 encoding");
+        .expect("zakura-primitives must accept Zakura's NuTachyon V7 encoding");
     assert_eq!(
         transaction.hash().0,
-        *librustzcash_transaction.txid().as_ref()
+        *zakura_primitives_transaction.txid().as_ref()
     );
-    let librustzcash_auth_digest: [u8; 32] = librustzcash_transaction
+    let zakura_primitives_auth_digest: [u8; 32] = zakura_primitives_transaction
         .auth_commitment()
         .as_ref()
         .try_into()
@@ -192,7 +192,7 @@ fn v7_is_nu_tachyon_gated_and_matches_librustzcash() {
             .auth_digest()
             .expect("V7 transactions have an authorizing-data digest")
             .0,
-        librustzcash_auth_digest,
+        zakura_primitives_auth_digest,
     );
 
     let mut pre_nu_tachyon_bytes = bytes;
