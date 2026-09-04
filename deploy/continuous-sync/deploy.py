@@ -90,9 +90,20 @@ def load_nodes(path: Path, selected: list[str] | None) -> list[Node]:
     for raw_node in data.get("nodes", []):
         merged = dict(defaults)
         merged.update(raw_node)
-        for required in ("name", "ssh_string", "hostname", "mode_label", "p2p_stack"):
+        for required in (
+            "name",
+            "ssh_string",
+            "hostname",
+            "mode_label",
+            "p2p_stack",
+            "public_ip",
+        ):
             if required not in merged:
                 raise DeployError(f"node missing required field {required!r}: {raw_node}")
+        if not str(merged["public_ip"]).strip():
+            raise DeployError(
+                f"node {merged['name']!r} has empty required field 'public_ip'"
+            )
         if merged["name"] in seen:
             raise DeployError(f"duplicate node name: {merged['name']}")
         seen.add(merged["name"])
@@ -163,6 +174,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "MAX_RUN_SECONDS": str(raw["max_run_seconds"]),
         "READY_SAMPLES": str(raw["ready_samples"]),
         "READY_SAMPLE_INTERVAL_SECONDS": str(raw["ready_sample_interval_seconds"]),
+        "HEALTH_MIN_CONNECTED_PEERS": str(raw["health_min_connected_peers"]),
         "MIN_FREE_BYTES": str(raw["min_free_bytes"]),
         "RETENTION_RUNS": str(raw["retention_runs"]),
         "COOLDOWN_SECONDS": str(raw["cooldown_seconds"]),
