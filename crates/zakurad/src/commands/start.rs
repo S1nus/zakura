@@ -824,6 +824,16 @@ impl StartCmd {
         );
         node_tasks.track(&progress_task_handle);
 
+        info!("spawning network upgrade announcement task");
+        let network_upgrade_announcement_task_handle = tokio::spawn(
+            sync::show_network_upgrade_banners(
+                config.network.network.clone(),
+                latest_chain_tip.clone(),
+            )
+            .in_current_span(),
+        );
+        node_tasks.track(&network_upgrade_announcement_task_handle);
+
         // Start health server if configured
         info!("initializing health endpoints");
         let (health_task_handle, _) = health::init(

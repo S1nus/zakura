@@ -47,6 +47,7 @@ mod legacy_trace;
 mod progress;
 mod recent_sync_lengths;
 mod status;
+mod upgrade_banner;
 
 #[cfg(test)]
 mod tests;
@@ -59,6 +60,7 @@ pub use gossip::{gossip_best_tip_block_hashes, BlockGossipError};
 pub use progress::show_block_chain_progress;
 pub use recent_sync_lengths::RecentSyncLengths;
 pub use status::SyncStatus;
+pub use upgrade_banner::show_network_upgrade_banners;
 
 /// Controls the number of peers used for each ObtainTips and ExtendTips request.
 const FANOUT: usize = 3;
