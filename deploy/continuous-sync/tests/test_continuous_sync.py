@@ -75,6 +75,29 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertEqual(status["sync.downloads.in_flight"], 17)
         self.assertEqual(status["sync.downloads.verifying"], 4)
 
+    def test_final_ready_sample_supplies_confirmed_height_without_stale_fallback(self):
+        for final_height in (101, None, -1, True, 2**32):
+            with self.subTest(final_height=final_height), tempfile.TemporaryDirectory() as tmp:
+                config = make_config(Path(tmp))
+                run_dir = Path(tmp) / "run"
+                run_dir.mkdir()
+                early = {"ready": True, "height": 100, "zcash_chain_verified_block_height": 100}
+                final = {"ready": True, "height": 105, "height_source": "estimated_tip_minus_distance",
+                         "zcash_chain_verified_block_height": final_height}
+                run_state = {}
+                with (
+                    patch.object(sync, "service_active", return_value=True),
+                    patch.object(sync, "check_free_space"),
+                    patch.object(sync, "rotate_run_logs"),
+                    patch.object(sync, "now", return_value=1000),
+                    patch.object(sync.time, "sleep"),
+                    patch.object(sync, "sample_status", side_effect=[early] * 5 + [final]),
+                ):
+                    sync.wait_for_completion(config, run_dir, run_state, {})
+                self.assertEqual(run_state["end_height"], 101 if final_height == 101 else None)
+                # Progress tracking can still use estimates; throughput cannot.
+                self.assertEqual(run_state["height"], 105)
+
     def test_alert_status_falls_back_to_estimated_height(self):
         metrics = "\n".join(
             [
@@ -1465,10 +1488,10 @@ class NotificationTests(unittest.TestCase):
             _, post = self.audit(path, data, 87400, posted=False)
             text = post.call_args.args[0]
             self.assertIn("unresolved", text)
-            self.assertIn("3 completed run(s)", text)
+            self.assertIn("3 completed", text)
             self.assertEqual(path.read_text(), old)
             _, post = self.audit(path, data, 87460)
-            self.assertIn("3 completed run(s)", post.call_args.args[0])
+            self.assertIn("3 completed", post.call_args.args[0])
             _, post = self.audit(path, data, 88000)
             post.assert_not_called()
 
@@ -1492,7 +1515,10 @@ class NotificationTests(unittest.TestCase):
                     result, post = self.audit(path, data, boundary)
                     self.assertEqual(result, 1)
                     if age < 86400:
-                        post.assert_not_called()
+                        post.assert_called_once()
+                        self.assertIn("0 completed", post.call_args.args[0])
+                        self.assertNotIn("unresolved", post.call_args.args[0])
+                        self.assertNotIn("controller halted: boom", post.call_args.args[0])
                         self.assertEqual(deploy.load_audit_state(path)["problems"]["node"]["last_sent"], sent_at)
                     else:
                         post.assert_called_once()
@@ -1520,7 +1546,7 @@ class NotificationTests(unittest.TestCase):
             result, post = self.audit(path, data, 87400)
             self.assertEqual(result, 1)
             post.assert_called_once()
-            self.assertIn("3 completed run(s)", post.call_args.args[0])
+            self.assertIn("3 completed", post.call_args.args[0])
             self.assertNotIn("unresolved", post.call_args.args[0])
             self.assertEqual(deploy.load_audit_state(path)["problems"]["node"]["last_sent"], 87395)
 
@@ -1555,9 +1581,247 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(lines, [])
         self.assertEqual(records["node"]["pending"], 3)
         lines, records = deploy.completion_updates({}, {"completions": records}, True)
-        self.assertIn("3 completed run(s)", lines[0])
-        self.assertEqual(records["node"]["pending"], 0)
+        self.assertIn("3 completed", lines[0])
+        self.assertNotIn("node", records)
         self.assertEqual(previous["completions"]["node"]["pending"], 2)
+
+    def test_three_mode_summary_shows_one_three_and_one_runs(self):
+        statuses, labels = {}, {}
+        cases = (
+            ("dual", [24000], "Dual networking", [145]),
+            ("zakura", [25800, 25200, 26400], "Zakura networking only", [134, 138, 131]),
+            ("legacy", [28800], "Legacy networking only", [120]),
+        )
+        for mode, durations, label, rates in cases:
+            node = deploy.Node({"name": mode, "p2p_stack": mode})
+            labels[mode] = deploy.sync_label(node)
+            statuses[mode] = {"controller_state": {
+                "phase": "syncing", "completion_digest": True, "completion_digest_start_runs": 0,
+                "runs": len(durations), "last_success_run": f"{mode}-{len(durations)}",
+                "last_success_duration_seconds": durations[-1], "last_success_end_height": 3469999,
+                "completion_history": [
+                    {"number": n, "run_id": f"{mode}-{n}", "duration": duration, "end_height": 3469999}
+                    for n, duration in enumerate(durations, 1)
+                ],
+            }}
+        lines, _ = deploy.completion_updates(statuses, {}, True, labels)
+        self.assertEqual(len(lines), 3)
+        for mode, durations, label, rates in cases:
+            section = next(line for line in lines if f"({mode})" in line)
+            expected = [f"*{label} ({mode}) · {len(durations)} completed*"]
+            expected.extend(
+                f"• {duration // 3600}h {duration % 3600 // 60:02d}m · {rate} blocks/sec"
+                for duration, rate in zip(durations, rates)
+            )
+            expected.append("currently syncing")
+            self.assertEqual(section, "\n".join(expected))
+
+    def test_completion_throughput_requires_valid_height_and_nonzero_duration(self):
+        self.assertEqual(deploy.completion_run_text({"duration": 24000, "end_height": 3469999}),
+                         "6h 40m · 145 blocks/sec")
+        self.assertEqual(deploy.completion_run_text({"duration": 2, "end_height": 3}),
+                         "0h 00m · 2 blocks/sec")
+        self.assertEqual(deploy.completion_run_text({"duration": 1, "end_height": 0}),
+                         "0h 00m · 1 blocks/sec")
+        for height in (None, -1, True, "3469999", 2**32):
+            with self.subTest(height=height):
+                self.assertIn("BPS unavailable",
+                              deploy.completion_run_text({"duration": 3600, "end_height": height}))
+        for duration in (0, None, -1, True, "3600"):
+            with self.subTest(duration=duration):
+                self.assertIn("BPS unavailable",
+                              deploy.completion_run_text({"duration": duration, "end_height": 3469999}))
+
+    def test_retired_hosts_deliver_pending_once_then_leave_the_summary(self):
+        previous = {"completions": {name: {
+            "run_id": name, "total": 2, "pending": pending,
+            "sha": "abc", "duration": 3600,
+        } for name, pending in (("retired", 2), ("already-delivered", 0), ("active", 0))}}
+        labels = {"active": "Active host"}
+        before = json.dumps(previous, sort_keys=True)
+        _, waiting = deploy.completion_updates({}, previous, False, labels)
+        self.assertEqual(waiting, previous["completions"])
+        lines, records = deploy.completion_updates({}, previous, True, labels)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("retired · 2 completed", lines[1])
+        self.assertIn("Active host · 0 completed", lines[0])
+        self.assertEqual(set(records), {"active"})
+        # Failed delivery leaves the input cache intact, so a retry is identical.
+        self.assertEqual(json.dumps(previous, sort_keys=True), before)
+        retry, _ = deploy.completion_updates({}, previous, True, labels)
+        self.assertEqual(retry, lines)
+        later, _ = deploy.completion_updates({}, {"completions": records}, True, labels)
+        self.assertEqual(len(later), 1)
+        self.assertIn("Active host · 0 completed", later[0])
+
+    def test_digest_preserves_all_timings_across_missed_audits(self):
+        controller = {
+            "completion_digest": True, "completion_digest_start_runs": 0,
+            "last_success_run": "run-3", "runs": 3,
+            "last_success_duration_seconds": 25989, "phase": "syncing",
+            "completion_history": [
+                {"number": 1, "run_id": "run-1", "duration": 26979},
+                {"number": 2, "run_id": "run-2", "duration": 25696},
+                {"number": 3, "run_id": "run-3", "duration": 25989},
+            ],
+        }
+        data = {"node": {"controller_state": controller}}
+        label = deploy.sync_label(deploy.Node({"name": "node", "p2p_stack": "zakura"}))
+        _, records = deploy.completion_updates(data, {}, False, {"node": label})
+        before = json.dumps(records, sort_keys=True)
+        lines, delivered = deploy.completion_updates(data, {"completions": records}, True)
+        self.assertIn("Zakura networking only (node)", lines[0])
+        self.assertIn("3 completed", lines[0])
+        self.assertEqual([line.split(" · ")[0] for line in lines[0].splitlines()[1:4]],
+                         ["• 7h 29m", "• 7h 08m", "• 7h 13m"])
+        self.assertIn("currently syncing", lines[0])
+        self.assertEqual(json.dumps(records, sort_keys=True), before)
+        lines, _ = deploy.completion_updates(data, {"completions": delivered}, True)
+        self.assertIn("0 completed", lines[0])
+        self.assertNotIn("7h", lines[0])
+
+    def test_multiple_audits_and_failed_delivery_preserve_each_duration(self):
+        data = {"controller_state": {
+            "completion_digest": True, "completion_digest_start_runs": 0,
+            "last_success_run": "run-1", "last_success_duration_seconds": 3600,
+            "runs": 1, "phase": "syncing",
+            "last_success_end_height": 3599999,
+            "completion_history": [{"number": 1, "run_id": "run-1", "duration": 3600, "end_height": 3599999}],
+        }, "disk_free_bytes": 20 * 1024**3,
+            "service_active": True, "sample": {"metrics_status": "ok"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            _, post = self.audit(path, data, 1000)
+            post.assert_not_called()
+            data["controller_state"].update({
+                "last_success_run": "run-3", "last_success_duration_seconds": 10800,
+                "last_success_end_height": 3779999, "runs": 3,
+                "completion_history": [
+                    {"number": n, "run_id": f"run-{n}", "duration": n * 3600, "end_height": blocks - 1}
+                    for n, blocks in enumerate((3600000, 3240000, 3780000), 1)
+                ],
+            })
+            _, post = self.audit(path, data, 2000)
+            post.assert_not_called()
+            saved = path.read_text()
+            _, post = self.audit(path, data, 87400, posted=False)
+            expected = ("• 1h 00m · 1000 blocks/sec\n"
+                        "• 2h 00m · 450 blocks/sec\n"
+                        "• 3h 00m · 350 blocks/sec")
+            self.assertIn(expected, post.call_args.args[0])
+            self.assertEqual(path.read_text(), saved)
+            _, post = self.audit(path, data, 87460)
+            self.assertIn(expected, post.call_args.args[0])
+            _, post = self.audit(path, data, 88000)
+            post.assert_not_called()
+            self.assertEqual(deploy.load_audit_state(path)["completions"]["node"]["pending"], 0)
+
+    def test_invalid_cached_details_cannot_break_failure_notifications(self):
+        for details in (None, "bad", [None], [{}] * 257):
+            with self.subTest(details_type=type(details)), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "state.json"
+                deploy.save_audit_state(path, {
+                    "version": deploy.AUDIT_STATE_VERSION, "problems": {},
+                    "completions": {"node": {
+                        "run_id": "old", "total": 1, "pending": 1,
+                        "sha": "abc", "duration": 60, "details": details,
+                    }},
+                })
+                data = self.halted_status()
+                del data["controller_state"]["failure_notification"]
+                result, post = self.audit(path, data, 1000)
+                self.assertEqual(result, 1)
+                self.assertIn("controller halted", post.call_args.args[0])
+
+    def test_zero_completion_summary_does_not_reset_first_completion_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            data = {"controller_state": {"runs": 260, "phase": "complete"},
+                    "disk_free_bytes": 20 * 1024**3}
+            self.audit(path, data, 1000)
+            _, post = self.audit(path, data, 87400)
+            self.assertIn("0 completed", post.call_args.args[0])
+            data["controller_state"].update({
+                "runs": 261, "completion_digest": True, "completion_digest_start_runs": 260,
+                "last_success_run": "new", "last_success_duration_seconds": 3600,
+            })
+            self.audit(path, data, 88000)
+            records = deploy.load_audit_state(path)["completions"]
+            self.assertEqual(records["node"]["pending"], 1)
+            _, post = self.audit(path, data, 173800)
+            self.assertIn("1 completed*\n• 1h 00m", post.call_args.args[0])
+
+    def test_sync_status_does_not_hide_inactive_service_or_missing_metrics(self):
+        for extra, expected in (
+            ({"service_active": False}, "node service inactive"),
+            ({"sample": {"metrics_status": "connection refused"}},
+             "sync status unavailable (metrics unavailable)"),
+        ):
+            with self.subTest(expected=expected):
+                data = {"controller_state": {"phase": "syncing"}, **extra}
+                lines, _ = deploy.completion_updates({"node": data}, {}, True)
+                self.assertIn(expected, lines[0])
+                self.assertNotIn("currently syncing", lines[0])
+
+    def test_malformed_controller_history_preserves_counts_and_failure_alerts(self):
+        for history in (None, {}, "bad", 7, [None, {"number": "bad"}]):
+            with self.subTest(history_type=type(history)), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "state.json"
+                data = self.halted_status()
+                del data["controller_state"]["failure_notification"]
+                data["controller_state"].update({
+                    "completion_digest": True, "completion_digest_start_runs": 0,
+                    "runs": 3, "last_success_run": "run-3",
+                    "last_success_duration_seconds": 3600, "completion_history": history,
+                })
+                result, post = self.audit(path, data, 1000)
+                self.assertEqual(result, 1)
+                self.assertIn("controller halted", post.call_args.args[0])
+                records = deploy.load_audit_state(path)["completions"]
+                self.assertEqual(records["node"]["pending"], 3)
+                _, post = self.audit(path, data, 87400)
+                self.assertIn("3 completed*\n• 1h 00m", post.call_args.args[0])
+                self.assertIn("2 earlier run(s): details unavailable", post.call_args.args[0])
+
+    def test_digest_upgrade_and_retention_report_missing_timings(self):
+        previous = {"completions": {"node": {
+            "run_id": "old", "total": 4, "pending": 3, "duration": 3600,
+        }}}
+        data = {"node": {"controller_state": {
+            "completion_digest": True, "last_success_run": "new", "runs": 6,
+            "last_success_duration_seconds": 7200,
+        }}}
+        lines, _ = deploy.completion_updates(data, previous, True)
+        self.assertIn("5 completed*\n• 1h 00m", lines[0])
+        self.assertIn("• 2h 00m", lines[0])
+        self.assertIn("3 earlier run(s): details unavailable", lines[0])
+        controller = data["node"]["controller_state"]
+        controller.update({
+            "completion_digest_start_runs": 0, "runs": 300,
+            "completion_history": [
+                {"number": n, "run_id": f"run-{n}", "duration": 3600}
+                for n in range(1, 300)
+            ],
+        })
+        _, records = deploy.completion_updates(data, {}, False)
+        self.assertEqual(len(records["node"]["details"]), 256)
+        lines, _ = deploy.completion_updates({}, {"completions": records}, True)
+        self.assertIn("300 completed", lines[0])
+        self.assertIn("44 earlier run(s): details unavailable", lines[0])
+        self.assertIn("status unavailable", lines[0])
+
+    def test_digest_lists_zero_completions_with_observed_status(self):
+        data = {
+            "dual": {"controller_state": {"phase": "syncing"}},
+            "legacy": {"controller_state": {"phase": "syncing", "failed": True}},
+        }
+        labels = {name: deploy.sync_label(deploy.Node({"name": name, "p2p_stack": mode}))
+                  for name, mode in (("dual", "dual"), ("legacy", "legacy"), ("new", "zakura"))}
+        lines, _ = deploy.completion_updates(data, {}, True, labels)
+        self.assertEqual(len(lines), 3)
+        self.assertIn("Dual networking (dual) · 0 completed*\ncurrently syncing", lines[0])
+        self.assertIn("Legacy networking only (legacy) · 0 completed*\nhalted after failure", lines[1])
+        self.assertIn("Zakura networking only (new) · 0 completed*\nstatus unavailable", lines[2])
 
     def test_targeted_audit_cannot_recover_unobserved_nodes_or_consume_digest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1645,23 +1909,44 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(problem.delivered_at, receipt["sent_at"])
 
     def test_successful_cycle_records_digest_without_sending_routine_message(self):
-        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
-            config = make_config(Path(tmp))
-            for name in (
-                "preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
-                "safe_wipe_state", "render_config", "start_service", "wait_for_completion",
-                "cleanup_retention", "rotate_run_logs",
-            ):
-                stack.enter_context(patch.object(sync, name, return_value="test"))
-            stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
-            stack.enter_context(patch.object(sync, "now", return_value=1000))
-            post = stack.enter_context(patch.object(sync, "post_slack"))
-            path = config.paths.state_dir / "state.json"
-            state = sync.one_cycle(config, path, {"runs": 4})
-            post.assert_not_called()
-            self.assertEqual(state["runs"], 5)
-            self.assertEqual(state["completion_digest_start_runs"], 4)
-            self.assertEqual(sync.load_state(path)["last_success_run"], state["current_run"])
+        valid_history = [
+            {"number": n, "run_id": f"old-{n}", "duration": 100} for n in range(5, 261)
+        ]
+        for persisted_history in (valid_history, None, {}, "bad", 7, [None]):
+            with self.subTest(history_type=type(persisted_history)):
+                with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+                    config = make_config(Path(tmp))
+                    for name in (
+                        "preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
+                        "safe_wipe_state", "render_config", "start_service",
+                        "rotate_run_logs", "cleanup_retention",
+                    ):
+                        stack.enter_context(patch.object(sync, name, return_value="test"))
+                    stack.enter_context(patch.object(sync, "wait_for_completion",
+                        side_effect=lambda _config, _run_dir, run_state, _state: run_state.update(end_height=3469999)))
+                    stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
+                    stack.enter_context(patch.object(sync, "now", return_value=1000))
+                    post = stack.enter_context(patch.object(sync, "post_slack"))
+                    path = config.paths.state_dir / "state.json"
+                    state = sync.one_cycle(config, path, {
+                        "runs": 260, "completion_history": persisted_history,
+                    })
+                    post.assert_not_called()
+                    self.assertFalse(state["failed"])
+                    self.assertEqual(state["phase"], "complete")
+                    self.assertEqual(state["runs"], 261)
+                    history = sync.load_state(path)["completion_history"]
+                    self.assertEqual(len(history), min(
+                        len(persisted_history) + 1 if isinstance(persisted_history, list) else 1,
+                        sync.COMPLETION_HISTORY_LIMIT,
+                    ))
+                    self.assertEqual(history[-1], {
+                        "number": 261, "run_id": state["current_run"], "duration": 0,
+                        "end_height": 3469999,
+                    })
+                    self.assertEqual(state["last_success_end_height"], 3469999)
+                    self.assertEqual(state["completion_digest_start_runs"], 260)
+                    self.assertEqual(sync.load_state(path)["last_success_run"], state["current_run"])
 
 
 class CanaryNotificationTests(unittest.TestCase):

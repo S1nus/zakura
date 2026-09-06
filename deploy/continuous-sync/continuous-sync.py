@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 STATE_VERSION = 1
+COMPLETION_HISTORY_LIMIT = 256
 
 
 class ControllerError(Exception):
@@ -593,6 +594,12 @@ def wait_for_completion(
         if sample.get("ready") is True:
             ready_samples += 1
             if ready_samples >= config.policy.ready_samples:
+                # Use the final readiness sample, not a stale progress height or
+                # an estimated network tip. This gauge follows committed blocks.
+                height = sample.get("zcash_chain_verified_block_height")
+                run_state["end_height"] = (
+                    height if type(height) is int and 0 <= height <= 0xFFFFFFFF else None
+                )
                 return
             time.sleep(config.policy.ready_sample_interval_seconds)
         else:
@@ -770,6 +777,11 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
         }
     )
     write_run_json(run_dir, run_state)
+    completion_history = state.get("completion_history", [])
+    if not isinstance(completion_history, list):
+        # Optional reporting history must not turn a successful sync into a halt.
+        print("invalid completion history; preserving counts and starting new history", file=sys.stderr)
+        completion_history = []
     state.update(
         {
             "failed": False,
@@ -777,6 +789,14 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
             "last_success_at": completed_at,
             "last_success_run": run_id,
             "last_success_duration_seconds": run_state["sync_duration_seconds"],
+            "last_success_end_height": run_state.get("end_height"),
+            # Keep timings independently of run-log retention and audit cadence.
+            "completion_history": (completion_history + [{
+                "number": int(state.get("runs", 0)) + 1,
+                "run_id": run_id,
+                "duration": run_state["sync_duration_seconds"],
+                "end_height": run_state.get("end_height"),
+            }])[-COMPLETION_HISTORY_LIMIT:],
             "completion_digest": True,
             "completion_digest_start_runs": state.get(
                 "completion_digest_start_runs", int(state.get("runs", 0))

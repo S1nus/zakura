@@ -156,7 +156,49 @@ cadence. New failures and recoveries do not wait for the digest. Completion coun
 include runs since the controller enabled digest reporting, then since the last
 successful digest. An unchanged failure appears only in a digest at least 24 hours
 after its last alert or reminder; a recent alert waits for a later digest.
-Per-run logs and artifacts remain available on each host.
+The summary names each networking mode (dual, Zakura only, or legacy only),
+keeps the host ID for troubleshooting, and includes hosts with zero completions.
+It shows one row per completed run, with duration and average blocks
+per second (BPS), oldest first, plus the currently observed controller phase.
+Sync duration excludes the build and state cleanup; it includes startup, readiness
+confirmation, shutdown, and log archiving. Failures still alert immediately.
+
+Each cycle starts with empty chain state. The BPS calculation uses the confirmed height
+from the final readiness sample plus one for genesis, using the committed-block
+height gauge. The block count is retained for calculation but omitted from Slack. Average BPS
+divides that count by the full, unrounded duration in
+seconds. This is overall sync throughput, not instantaneous verifier speed;
+blocks differ in cost and the node may process more blocks during shutdown.
+An estimated tip or an earlier progress sample cannot supply the count. Missing
+heights and zero or missing durations produce an unavailable rate.
+
+For example, a digest can show these illustrative per-run results:
+
+```text
+Dual networking · 1 completed
+• 6h 40m · 145 blocks/sec
+
+Zakura networking only · 3 completed
+• 7h 10m · 134 blocks/sec
+• 7h 00m · 138 blocks/sec
+• 7h 20m · 131 blocks/sec
+
+Legacy networking only · 1 completed
+• 8h 00m · 120 blocks/sec
+```
+
+The Slack summary also retains host IDs and current status for troubleshooting.
+
+Controllers retain the latest 256 completion durations and ending heights in their
+state, independently of run-log cleanup. Audits accumulate up to 256 per-run
+records per host until delivery.
+Older controllers and existing audit caches still contribute their completion
+counts and latest timing, with BPS unavailable for old records.
+Missing records, including those beyond retention, are explicitly marked unavailable.
+Malformed optional controller history is discarded without failing a successful
+sync; completion counters remain authoritative. Retired hosts leave the summary
+after any pending completions have been delivered. Per-run logs and artifacts remain available
+on each host.
 A lost audit cache may repeat already summarized completions or alerts.
 
 Alert state is carried between workflow runs in the Actions cache. A failed Slack
