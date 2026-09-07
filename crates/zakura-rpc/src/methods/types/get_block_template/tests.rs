@@ -126,6 +126,59 @@ fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result
     Ok(())
 }
 
+/// The Tachyon workload is limited to internal mining on proof-of-work-disabled test networks and
+/// splits the miner reward into independently spendable outputs.
+#[cfg(zcash_unstable = "nutachyon")]
+#[test]
+fn tachyon_workload_coinbase_outputs() {
+    use crate::{
+        config::mining::Config,
+        methods::types::get_block_template::{REDEEM_SCRIPT_HASH, TRANSACTIONS_PER_BLOCK},
+    };
+
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        internal_miner: true,
+        tachyon_workload: true,
+        ..Default::default()
+    };
+    let miner_params = MinerParams::new(&network, config.clone())
+        .expect("proof-of-work-disabled test networks support the Tachyon workload");
+    let height = Height(20);
+    let template =
+        TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero())
+            .expect("workload coinbase can be built");
+    let coinbase: Transaction = template
+        .data()
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("workload coinbase deserializes");
+    let workload_script =
+        transparent::Address::from_script_hash(network.t_addr_kind(), REDEEM_SCRIPT_HASH).script();
+
+    assert_eq!(
+        coinbase
+            .outputs()
+            .iter()
+            .filter(|output| output.lock_script == workload_script)
+            .count(),
+        TRANSACTIONS_PER_BLOCK,
+    );
+
+    let mut missing_internal_miner = config;
+    missing_internal_miner.internal_miner = false;
+    assert!(MinerParams::new(&network, missing_internal_miner).is_err());
+    assert!(MinerParams::new(
+        &Network::Mainnet,
+        Config {
+            internal_miner: true,
+            tachyon_workload: true,
+            ..Default::default()
+        }
+    )
+    .is_err());
+}
+
 /// A NuTachyon template must convert into a mineable proposal block.
 #[cfg(zcash_unstable = "nutachyon")]
 #[test]

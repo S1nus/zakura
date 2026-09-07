@@ -3094,6 +3094,8 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         extra_coinbase_data: None,
         miner_memo: None,
         internal_miner: true,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon_workload: false,
     };
 
     // nu5 block height
@@ -3784,6 +3786,8 @@ async fn rpc_getdifficulty() {
         extra_coinbase_data: None,
         miner_memo: None,
         internal_miner: true,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon_workload: false,
     };
 
     // nu5 block height

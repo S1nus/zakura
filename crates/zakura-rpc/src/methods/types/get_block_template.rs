@@ -5,6 +5,8 @@ pub mod parameters;
 pub mod proposal;
 #[cfg(zcash_unstable = "nutachyon")]
 pub mod tachyon;
+#[cfg(zcash_unstable = "nutachyon")]
+mod tachyon_workload;
 pub mod zip317;
 
 #[cfg(test)]
@@ -66,6 +68,11 @@ pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
+#[cfg(zcash_unstable = "nutachyon")]
+pub(crate) use tachyon_workload::{
+    generate_transactions as generate_tachyon_workload_transactions, REDEEM_SCRIPT_HASH,
+    TRANSACTIONS_PER_BLOCK,
+};
 
 /// An alias to indicate that a usize value represents the depth of in-block dependencies of a
 /// transaction.
@@ -444,6 +451,10 @@ pub struct MinerParams {
     ///
     /// Applies only if [`Self::addr`] contains a shielded component.
     memo: Option<MemoBytes>,
+
+    /// Generate the internal miner's Tachyon test workload.
+    #[cfg(zcash_unstable = "nutachyon")]
+    tachyon_workload: bool,
 }
 
 /// Builds the coinbase input data for a block Zakura constructs.
@@ -465,6 +476,30 @@ impl MinerParams {
     // (`extra_coinbase_data` is length-validated), not a recoverable error.
     #[allow(clippy::unwrap_in_result)]
     pub fn new(net: &Network, conf: config::mining::Config) -> Result<Self, MinerParamsError> {
+        #[cfg(zcash_unstable = "nutachyon")]
+        if conf.tachyon_workload && !conf.internal_miner {
+            return Err(MinerParamsError::TachyonWorkloadNeedsInternalMiner);
+        }
+        #[cfg(zcash_unstable = "nutachyon")]
+        if conf.tachyon_workload && (!net.is_a_test_network() || !net.disable_pow()) {
+            return Err(MinerParamsError::UnsupportedTachyonWorkloadNetwork);
+        }
+
+        #[cfg(zcash_unstable = "nutachyon")]
+        let workload_enabled = conf.tachyon_workload;
+
+        #[cfg(zcash_unstable = "nutachyon")]
+        let addr = if workload_enabled {
+            Address::Transparent(zcash_transparent::address::TransparentAddress::ScriptHash(
+                REDEEM_SCRIPT_HASH,
+            ))
+        } else {
+            conf.miner_address
+                .map(|addr| Address::try_from_zcash_address(net, addr))
+                .ok_or(MinerParamsError::MissingAddr)??
+        };
+
+        #[cfg(not(zcash_unstable = "nutachyon"))]
         let addr = conf
             .miner_address
             .map(|addr| Address::try_from_zcash_address(net, addr))
@@ -485,7 +520,13 @@ impl MinerParams {
             .map(|memo| MemoBytes::from_bytes(memo.as_bytes()))
             .transpose()?;
 
-        Ok(Self { addr, data, memo })
+        Ok(Self {
+            addr,
+            data,
+            memo,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_workload: workload_enabled,
+        })
     }
 
     /// Returns the miner address.
@@ -501,6 +542,12 @@ impl MinerParams {
     /// Returns the miner memo.
     pub fn memo(&self) -> Option<&MemoBytes> {
         self.memo.as_ref()
+    }
+
+    /// Is the internal miner's Tachyon workload enabled?
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon_workload(&self) -> bool {
+        self.tachyon_workload
     }
 
     /// Randomizes the memo.
@@ -524,6 +571,8 @@ impl From<Address> for MinerParams {
             addr,
             data: None,
             memo: None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_workload: false,
         }
     }
 }
@@ -537,6 +586,12 @@ pub enum MinerParamsError {
     InvalidAddr(zcash_address::ConversionError<&'static str>),
     #[error(transparent)]
     InvalidMemo(#[from] zcash_protocol::memo::Error),
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[error("tachyon_workload requires internal_miner = true")]
+    TachyonWorkloadNeedsInternalMiner,
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[error("tachyon_workload is only supported on proof-of-work-disabled test networks")]
+    UnsupportedTachyonWorkloadNetwork,
 }
 
 impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {

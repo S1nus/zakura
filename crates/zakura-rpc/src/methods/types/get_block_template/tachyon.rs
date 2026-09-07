@@ -446,6 +446,7 @@ mod tests {
             .map(|tx| tx.transaction.id().mined_id())
             .collect::<Vec<_>>();
         let mining_data = TachyonMiningData {
+            tip_anchor: tachyon::Anchor::from(anchor),
             anchor_heights: HashMap::from([(tachyon::Anchor::from(anchor), Height(10))]),
             blocks: BTreeMap::new(),
             revealed_tachygrams: HashSet::new(),
@@ -485,6 +486,7 @@ mod tests {
                 .expect("hardcoded genesis block deserializes");
         intervening_block.transactions = vec![intervening_transaction];
         let mining_data = TachyonMiningData {
+            tip_anchor: tachyon::Anchor::from(target_anchor),
             anchor_heights: HashMap::from([
                 (tachyon::Anchor::from(start_anchor), Height(10)),
                 (tachyon::Anchor::from(target_anchor), Height(11)),
@@ -518,6 +520,7 @@ mod tests {
         let child = verified_dependent_transaction(parent.transaction.id().mined_id());
         let transactions = vec![parent, child];
         let mining_data = TachyonMiningData {
+            tip_anchor: tachyon::Anchor::from(anchor),
             anchor_heights: HashMap::from([(tachyon::Anchor::from(anchor), Height(10))]),
             blocks: BTreeMap::new(),
             revealed_tachygrams: HashSet::new(),
@@ -544,6 +547,7 @@ mod tests {
             .copied()
             .expect("test stamp has tachygrams");
         let mining_data = TachyonMiningData {
+            tip_anchor: tachyon::Anchor::from(anchor),
             anchor_heights: HashMap::from([(tachyon::Anchor::from(anchor), Height(10))]),
             blocks: BTreeMap::new(),
             revealed_tachygrams: HashSet::from([tachyon::Tachygram::from(revealed)]),
