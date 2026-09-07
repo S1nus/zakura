@@ -1477,8 +1477,9 @@ pub enum ReadRequest {
     ///
     /// Returns [`ReadResponse::TachyonMiningData`] if `tip_hash` is still the current best-chain
     /// tip. Unknown anchors are omitted. For every epoch represented by a known anchor, the
-    /// response also contains the blocks between the earliest and latest requested anchors and
-    /// any requested tachygrams already revealed within the candidate's two-epoch window.
+    /// response also contains the current tip anchor, the blocks between the earliest and latest
+    /// requested anchors, and any requested tachygrams already revealed within the candidate's
+    /// two-epoch window.
     #[cfg(zcash_unstable = "nutachyon")]
     TachyonMiningData {
         /// Anchors referenced by the selected autonome transactions.

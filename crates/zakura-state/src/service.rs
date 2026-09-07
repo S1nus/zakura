@@ -2528,6 +2528,11 @@ impl Service<ReadRequest> for ReadStateService {
                     })
                     .collect();
 
+                let tip_anchor = best_chain.as_ref().map_or_else(
+                    || state.db.tachyon_anchor_for_tip(),
+                    |chain| chain.tachyon_anchor_for_tip(),
+                );
+
                 let mut epoch_ranges = HashMap::new();
                 for &height in anchor_heights.values() {
                     let Some(epoch) = zakura_chain::tachyon::epoch(&state.network, height) else {
@@ -2583,6 +2588,7 @@ impl Service<ReadRequest> for ReadStateService {
 
                 Ok(ReadResponse::TachyonMiningData(Some(
                     crate::response::TachyonMiningData {
+                        tip_anchor,
                         anchor_heights,
                         blocks,
                         revealed_tachygrams,

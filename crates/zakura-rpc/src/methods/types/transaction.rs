@@ -220,6 +220,28 @@ impl TransactionTemplate<NegativeOrZero> {
         };
 
         let add_transparent_reward = |builder: &mut Builder<_, _>, addr| {
+            #[cfg(zcash_unstable = "nutachyon")]
+            if miner_params.tachyon_workload() {
+                let output_count = super::get_block_template::TRANSACTIONS_PER_BLOCK;
+                let output_count_u64 =
+                    u64::try_from(output_count).expect("the fixed workload count fits in u64");
+                let total = miner_reward.into_u64();
+                let quotient = total / output_count_u64;
+                let remainder = total % output_count_u64;
+
+                return (0..output_count)
+                    .try_for_each(|index| {
+                        let value = quotient + u64::from(index == 0) * remainder;
+                        builder.add_transparent_output(
+                            addr,
+                            Zatoshis::from_u64(value)
+                                .expect("parts of a valid miner reward remain valid"),
+                        )
+                    })
+                    .map_err(|err| tracing::error!("Failed to add transparent output: {err}"))
+                    .ok();
+            }
+
             trace_err!(
                 builder.add_transparent_output(addr, miner_reward),
                 "transparent"

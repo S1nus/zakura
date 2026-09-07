@@ -2762,6 +2762,14 @@ where
                 precomputed_coinbase = wait_for_new_tip => {
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
 
+                    // Each mature coinbase reward has one deterministic workload at its first
+                    // spendable height. Do not let the internal miner race that full template
+                    // with the usual empty, provisional tip-change template.
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    if miner_params.tachyon_workload() {
+                        continue;
+                    }
+
                     let server_long_poll_id = LongPollInput::new(
                         chain_info.tip_height,
                         chain_info.tip_hash,
@@ -2829,7 +2837,33 @@ where
 
         let height = chain_info.tip_height.next().map_misc_error()?;
 
-        // Randomly select some mempool transactions.
+        // Randomly select some mempool transactions, or replace them with the internal miner's
+        // self-funded Tachyon workload.
+        #[cfg(zcash_unstable = "nutachyon")]
+        let mempool_txs = if miner_params.tachyon_workload() {
+            let generated = types::get_block_template::generate_tachyon_workload_transactions(
+                &self.network,
+                height,
+                chain_info.tip_hash,
+                read_state.clone(),
+            )
+            .await;
+
+            #[cfg(test)]
+            let generated = generated.into_iter().map(|tx| (0, tx)).collect();
+
+            generated
+        } else {
+            select_mempool_transactions(
+                &self.network,
+                height,
+                miner_params,
+                mempool_txs,
+                mempool_tx_deps,
+            )
+        };
+
+        #[cfg(not(zcash_unstable = "nutachyon"))]
         let mempool_txs = select_mempool_transactions(
             &self.network,
             height,

@@ -57,12 +57,22 @@ pub struct Config {
 
     /// Mine blocks using Zakura's internal miner, without an external mining pool or equihash solver.
     ///
-    /// This experimental feature is only supported on regtest as it uses null solutions and skips checking
-    /// for a valid Proof of Work.
+    /// This experimental feature is only supported on proof-of-work-disabled test networks because
+    /// it uses null solutions.
     ///
     /// The internal miner is off by default.
     #[serde(default)]
     pub internal_miner: bool,
+
+    /// Generate a deterministic Tachyon transaction workload for every internally mined block.
+    ///
+    /// This test-only workload replaces externally submitted mempool transactions. It pays miner
+    /// rewards to anyone-can-spend outputs, then shields each output into an independently derived
+    /// Tachyon recipient as soon as the coinbase matures. It is only accepted together with
+    /// [`Self::internal_miner`] on a proof-of-work-disabled test network.
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[serde(default)]
+    pub tachyon_workload: bool,
 }
 
 impl Config {

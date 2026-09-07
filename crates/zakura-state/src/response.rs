@@ -43,6 +43,9 @@ mod tests;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg(zcash_unstable = "nutachyon")]
 pub struct TachyonMiningData {
+    /// The Tachyon anchor at the current best-chain tip.
+    pub tip_anchor: tachyon::Anchor,
+
     /// Heights that created the requested anchors. Unknown anchors are omitted.
     pub anchor_heights: HashMap<tachyon::Anchor, block::Height>,
 
