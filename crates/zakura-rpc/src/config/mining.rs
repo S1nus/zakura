@@ -34,7 +34,7 @@ pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
 
 /// Mining configuration section.
 #[serde_as]
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
@@ -73,6 +73,24 @@ pub struct Config {
     #[cfg(zcash_unstable = "nutachyon")]
     #[serde(default)]
     pub tachyon_workload: bool,
+
+    /// Advertise prepared mined block hashes after expected-work validation and state admission,
+    /// but before contextual commit completes.
+    pub optimistic_block_inventory: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            miner_address: None,
+            extra_coinbase_data: None,
+            miner_memo: None,
+            internal_miner: false,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_workload: false,
+            optimistic_block_inventory: true,
+        }
+    }
 }
 
 impl Config {
@@ -182,4 +200,19 @@ lazy_static::lazy_static! {
             (MinerAddressType::Transparent, "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"),
         ].into()),
     ].into();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn optimistic_block_inventory_defaults_on_and_can_be_disabled() {
+        let default: Config = toml::from_str("").expect("empty mining config uses defaults");
+        assert!(default.optimistic_block_inventory);
+
+        let disabled: Config = toml::from_str("optimistic_block_inventory = false")
+            .expect("the optimistic inventory option is valid");
+        assert!(!disabled.optimistic_block_inventory);
+    }
 }
