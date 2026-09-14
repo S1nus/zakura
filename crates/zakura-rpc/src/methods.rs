@@ -196,7 +196,7 @@ impl RpcSurface {
     pub(crate) fn exposes(self, method_name: &str) -> bool {
         match self {
             Self::Restricted => rpc_method_access(method_name) == Some(RpcAccess::Unauthenticated),
-            Self::Full => true,
+            Self::Full => rpc_method_access(method_name).is_some(),
         }
     }
 }
@@ -360,15 +360,6 @@ pub trait Rpc {
     /// entries, it can be present with a zero balance.
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
-
-    /// Returns the selected chain's current Tachyon accumulator and retention state.
-    ///
-    /// This method is only available in NuTachyon builds.
-    /// method: post
-    /// tags: blockchain
-    #[cfg(zcash_unstable = "nutachyon")]
-    #[method(name = "gettachyoninfo")]
-    async fn get_tachyon_info(&self) -> Result<GetTachyonInfoResponse>;
 
     /// Returns the total balance of provided `addresses` in a
     /// [`GetAddressBalanceResponse`] instance.
@@ -978,6 +969,17 @@ pub trait Rpc {
         n: u32,
         include_mempool: Option<bool>,
     ) -> Result<GetTxOutResponse>;
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+#[rpc(server)]
+/// NuTachyon-specific RPC method signatures.
+pub trait TachyonRpc {
+    /// Returns the selected chain's current Tachyon accumulator and retention state.
+    /// method: post
+    /// tags: blockchain
+    #[method(name = "gettachyoninfo")]
+    async fn get_tachyon_info(&self) -> Result<GetTachyonInfoResponse>;
 }
 
 /// RPC method implementations.
@@ -1690,34 +1692,6 @@ where
         };
 
         Ok(response)
-    }
-
-    #[cfg(zcash_unstable = "nutachyon")]
-    async fn get_tachyon_info(&self) -> Result<GetTachyonInfoResponse> {
-        const RECENT_TACHYGRAM_LIMIT: usize = 42;
-
-        let response = call_service(
-            self.read_state.clone(),
-            ReadRequest::TachyonPoolState {
-                recent_tachygram_limit: RECENT_TACHYGRAM_LIMIT,
-            },
-        )
-        .await?;
-        let ReadResponse::TachyonPoolState(Some(state)) = response else {
-            return Err(ErrorObject::owned(
-                server::error::LegacyCode::Misc.into(),
-                "Tachyon state is unavailable before the chain has a tip",
-                None::<()>,
-            ));
-        };
-
-        GetTachyonInfoResponse::from_state(&self.network, state).ok_or_else(|| {
-            ErrorObject::owned(
-                ErrorCode::InvalidRequest.code(),
-                "NuTachyon is disabled on the configured network",
-                None::<()>,
-            )
-        })
     }
 
     async fn get_address_balance(
@@ -3924,6 +3898,47 @@ where
             zakura_state::ReadResponse::Transaction(None) => Ok(GetTxOutResponse(None)),
             _ => unreachable!("unmatched response to a `Transaction` request"),
         }
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+#[async_trait]
+impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus> TachyonRpcServer
+    for RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+where
+    Mempool: MempoolService,
+    State: StateService,
+    ReadState: ReadStateService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+    AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
+    BlockVerifierRouter: BlockVerifierService,
+    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+{
+    async fn get_tachyon_info(&self) -> Result<GetTachyonInfoResponse> {
+        const RECENT_TACHYGRAM_LIMIT: usize = 42;
+
+        let response = call_service(
+            self.read_state.clone(),
+            ReadRequest::TachyonPoolState {
+                recent_tachygram_limit: RECENT_TACHYGRAM_LIMIT,
+            },
+        )
+        .await?;
+        let ReadResponse::TachyonPoolState(Some(state)) = response else {
+            return Err(ErrorObject::owned(
+                server::error::LegacyCode::Misc.into(),
+                "Tachyon state is unavailable before the chain has a tip",
+                None::<()>,
+            ));
+        };
+
+        GetTachyonInfoResponse::from_state(&self.network, state).ok_or_else(|| {
+            ErrorObject::owned(
+                ErrorCode::InvalidRequest.code(),
+                "NuTachyon is disabled on the configured network",
+                None::<()>,
+            )
+        })
     }
 }
 

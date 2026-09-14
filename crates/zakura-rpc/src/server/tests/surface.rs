@@ -14,7 +14,7 @@ use tower::buffer::Buffer;
 
 use crate::{
     config::rpc::Config,
-    methods::{RpcAccess, RpcImpl, RpcSurface, METHODS, RPC_METHOD_ACCESS},
+    methods::{rpc_method_access, RpcAccess, RpcImpl, RpcSurface, METHODS, RPC_METHOD_ACCESS},
     server::{configure_rpc_methods, primary_rpc_surface},
 };
 use zakura_chain::{chain_sync_status::MockSyncStatus, chain_tip::NoChainTip, parameters::Network};
@@ -40,7 +40,11 @@ fn classified_module() -> RpcModule<()> {
 #[test]
 fn access_policy_matches_the_openrpc_method_set() {
     let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
-    let documented: BTreeSet<_> = METHODS.keys().copied().collect();
+    let documented: BTreeSet<_> = METHODS
+        .keys()
+        .copied()
+        .filter(|name| rpc_method_access(name).is_some())
+        .collect();
 
     assert_eq!(
         classified.len(),

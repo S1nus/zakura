@@ -22,13 +22,6 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     result: |g| g.result::<openrpsee::openrpc::ResultType>("getblockchaininfo_result"),
     deprecated: false,
 },
-"gettachyoninfo" => openrpsee::openrpc::RpcMethod {
-    description: "Returns the selected chain\'s current Tachyon accumulator and retention state.\n\nThis method is only available in NuTachyon builds.\nmethod: post\ntags: blockchain\n",
-    params: |_g| vec![
-    ],
-    result: |g| g.result::<openrpsee::openrpc::ResultType>("gettachyoninfo_result"),
-    deprecated: false,
-},
 "getaddressbalance" => openrpsee::openrpc::RpcMethod {
     description: "Returns the total balance of provided `addresses` in a\n[`GetAddressBalanceResponse`] instance.\n\nzcashd reference: [`getaddressbalance`](https://zcash.github.io/rpc/getaddressbalance.html)\nmethod: post\ntags: address\n\n# Parameters\n\n- `address_strings`: (object, example={\"addresses\": [\"tmYXBYJj1K7vhejSec5osXK2QsGa5MTisUQ\"]}) A JSON map with a single entry\n    - `addresses`: (array of strings) A list of base-58 encoded addresses.\n\n# Notes\n\nzcashd also accepts a single string parameter instead of an array of strings, but Zebra\ndoesn\'t because lightwalletd always calls this RPC with an array of addresses.\n\nzcashd also returns the total amount of Zatoshis received by the addresses, but Zebra\ndoesn\'t because lightwalletd doesn\'t use that information.\n\nThe RPC documentation says that the returned object has a string `balance` field, but\nzcashd actually [returns an\ninteger](https://github.com/zcash/lightwalletd/blob/bdaac63f3ee0dbef62bde04f6817a9f90d483b00/common/common.go#L128-L130).\n",
     params: |_g| vec![
@@ -316,6 +309,13 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
         _g.param::<bool>("include_mempool", crate::methods::PARAM_INCLUDE_MEMPOOL_DESC, false),
     ],
     result: |g| g.result::<openrpsee::openrpc::ResultType>("gettxout_result"),
+    deprecated: false,
+},
+"gettachyoninfo" => openrpsee::openrpc::RpcMethod {
+    description: "Returns the selected chain\'s current Tachyon accumulator and retention state.\nmethod: post\ntags: blockchain\n",
+    params: |_g| vec![
+    ],
+    result: |g| g.result::<openrpsee::openrpc::ResultType>("gettachyoninfo_result"),
     deprecated: false,
 },
 };

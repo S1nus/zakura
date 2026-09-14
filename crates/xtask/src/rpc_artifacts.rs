@@ -77,7 +77,7 @@ fn generate(repo_root: &Path, output_dir: &Path) -> Result<(), BoxError> {
     let methods_source = methods_source
         .to_str()
         .ok_or("RPC methods source path should be valid UTF-8")?;
-    openrpsee::generate_openrpc(methods_source, &["Rpc"], false, output_dir)?;
+    openrpsee::generate_openrpc(methods_source, &["Rpc", "TachyonRpc"], false, output_dir)?;
 
     verify_generated_files(output_dir)
 }

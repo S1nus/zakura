@@ -61,7 +61,7 @@ pub struct RetainedTachygram {
 impl GetTachyonInfoResponse {
     pub(crate) fn from_state(
         network: &zakura_chain::parameters::Network,
-        state: zakura_state::response::TachyonPoolState,
+        state: zakura_state::TachyonPoolState,
     ) -> Option<Self> {
         use zakura_chain::parameters::NetworkUpgrade;
 
@@ -123,7 +123,7 @@ mod tests {
             }
             .into(),
         );
-        let state = zakura_state::response::TachyonPoolState {
+        let state = zakura_state::TachyonPoolState {
             tip_height: Height(8),
             tip_anchor: Anchor([1; 32]),
             retained_tachygram_count: 3,
