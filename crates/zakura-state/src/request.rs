@@ -1651,6 +1651,13 @@ pub enum ReadRequest {
     /// with the pool values of the current best chain tip.
     TipPoolValues,
 
+    /// Returns the current best chain's Tachyon accumulator and retained Tachygram summary.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonPoolState {
+        /// The maximum number of recently revealed Tachygrams to return.
+        recent_tachygram_limit: usize,
+    },
+
     /// Returns the chain data needed to aggregate transactions rooted at Tachyon anchors.
     ///
     /// Returns [`ReadResponse::TachyonMiningData`] if `tip_hash` is still the current best-chain
@@ -2149,6 +2156,8 @@ impl ReadRequest {
             ReadRequest::Tip => "tip",
             ReadRequest::FinalizedTip => "finalized_tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
+            #[cfg(zcash_unstable = "nutachyon")]
+            ReadRequest::TachyonPoolState { .. } => "tachyon_pool_state",
             #[cfg(zcash_unstable = "nutachyon")]
             ReadRequest::TachyonMiningData { .. } => "tachyon_mining_data",
             ReadRequest::BlockInfo(_) => "block_info",

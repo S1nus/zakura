@@ -142,6 +142,9 @@ use types::{
     z_validate_address::ZValidateAddressResponse,
 };
 
+#[cfg(zcash_unstable = "nutachyon")]
+use types::tachyon_info::GetTachyonInfoResponse;
+
 /// Value pool balances returned by the blockchain RPCs.
 #[cfg(not(zcash_unstable = "nutachyon"))]
 pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
@@ -193,7 +196,7 @@ impl RpcSurface {
     pub(crate) fn exposes(self, method_name: &str) -> bool {
         match self {
             Self::Restricted => rpc_method_access(method_name) == Some(RpcAccess::Unauthenticated),
-            Self::Full => true,
+            Self::Full => rpc_method_access(method_name).is_some(),
         }
     }
 }
@@ -212,6 +215,8 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getinfo", RpcAccess::Unauthenticated),
     ("getdeprecationinfo", RpcAccess::Unauthenticated),
     ("getblockchaininfo", RpcAccess::Unauthenticated),
+    #[cfg(zcash_unstable = "nutachyon")]
+    ("gettachyoninfo", RpcAccess::Unauthenticated),
     ("getaddressbalance", RpcAccess::Unauthenticated),
     ("sendrawtransaction", RpcAccess::Unauthenticated),
     ("getblock", RpcAccess::Unauthenticated),
@@ -964,6 +969,17 @@ pub trait Rpc {
         n: u32,
         include_mempool: Option<bool>,
     ) -> Result<GetTxOutResponse>;
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+#[rpc(server)]
+/// NuTachyon-specific RPC method signatures.
+pub trait TachyonRpc {
+    /// Returns the selected chain's current Tachyon accumulator and retention state.
+    /// method: post
+    /// tags: blockchain
+    #[method(name = "gettachyoninfo")]
+    async fn get_tachyon_info(&self) -> Result<GetTachyonInfoResponse>;
 }
 
 /// RPC method implementations.
@@ -3916,6 +3932,47 @@ where
             zakura_state::ReadResponse::Transaction(None) => Ok(GetTxOutResponse(None)),
             _ => unreachable!("unmatched response to a `Transaction` request"),
         }
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+#[async_trait]
+impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus> TachyonRpcServer
+    for RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+where
+    Mempool: MempoolService,
+    State: StateService,
+    ReadState: ReadStateService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+    AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
+    BlockVerifierRouter: BlockVerifierService,
+    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+{
+    async fn get_tachyon_info(&self) -> Result<GetTachyonInfoResponse> {
+        const RECENT_TACHYGRAM_LIMIT: usize = 42;
+
+        let response = call_service(
+            self.read_state.clone(),
+            ReadRequest::TachyonPoolState {
+                recent_tachygram_limit: RECENT_TACHYGRAM_LIMIT,
+            },
+        )
+        .await?;
+        let ReadResponse::TachyonPoolState(Some(state)) = response else {
+            return Err(ErrorObject::owned(
+                server::error::LegacyCode::Misc.into(),
+                "Tachyon state is unavailable before the chain has a tip",
+                None::<()>,
+            ));
+        };
+
+        GetTachyonInfoResponse::from_state(&self.network, state).ok_or_else(|| {
+            ErrorObject::owned(
+                ErrorCode::InvalidRequest.code(),
+                "NuTachyon is disabled on the configured network",
+                None::<()>,
+            )
+        })
     }
 }
 

@@ -56,6 +56,23 @@ pub struct TachyonMiningData {
     pub revealed_tachygrams: HashSet<tachyon::Tachygram>,
 }
 
+/// The current best chain's Tachyon accumulator and retained Tachygram summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(zcash_unstable = "nutachyon")]
+pub struct TachyonPoolState {
+    /// The current best-chain tip height.
+    pub tip_height: block::Height,
+
+    /// The Tachyon accumulator after the current best-chain tip.
+    pub tip_anchor: tachyon::Anchor,
+
+    /// The number of Tachygrams retained in the current two-epoch scan window.
+    pub retained_tachygram_count: usize,
+
+    /// The most recently revealed retained Tachygrams, newest first.
+    pub recent_tachygrams: Vec<(tachyon::Tachygram, block::Height)>,
+}
+
 /// State's decision for a prepared mined block's optimistic relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparedMinedRelayEligibility {
@@ -462,6 +479,10 @@ pub enum ReadResponse {
         value_balance: ValueBalance<NonNegative>,
     },
 
+    /// Response to [`ReadRequest::TachyonPoolState`], or `None` when state has no chain tip.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonPoolState(Option<TachyonPoolState>),
+
     /// Response to [`ReadRequest::TachyonMiningData`], or `None` when the requested chain tip is
     /// no longer current.
     #[cfg(zcash_unstable = "nutachyon")]
@@ -776,7 +797,7 @@ impl TryFrom<ReadResponse> for Response {
             }
 
             #[cfg(zcash_unstable = "nutachyon")]
-            ReadResponse::TachyonMiningData(_) => {
+            ReadResponse::TachyonMiningData(_) | ReadResponse::TachyonPoolState(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 

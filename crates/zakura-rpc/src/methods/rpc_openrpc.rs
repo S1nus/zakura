@@ -311,4 +311,11 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     result: |g| g.result::<openrpsee::openrpc::ResultType>("gettxout_result"),
     deprecated: false,
 },
+"gettachyoninfo" => openrpsee::openrpc::RpcMethod {
+    description: "Returns the selected chain\'s current Tachyon accumulator and retention state.\nmethod: post\ntags: blockchain\n",
+    params: |_g| vec![
+    ],
+    result: |g| g.result::<openrpsee::openrpc::ResultType>("gettachyoninfo_result"),
+    deprecated: false,
+},
 };

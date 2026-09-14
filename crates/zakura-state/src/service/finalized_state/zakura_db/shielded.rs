@@ -215,6 +215,13 @@ impl ZakuraDb {
         self.db.zs_get(&tachygrams, tachygram)
     }
 
+    /// Returns the Tachygrams retained in finalized state and their reveal heights.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn retained_tachyon_tachygrams(&self) -> Vec<(tachyon::Tachygram, Height)> {
+        let tachygrams = self.db.cf_handle("tachyon_tachygrams").unwrap();
+        self.db.zs_forward_range_iter(&tachygrams, ..).collect()
+    }
+
     /// Returns the boundary anchor for a finalized Tachyon epoch.
     #[allow(clippy::unwrap_in_result)]
     #[cfg(zcash_unstable = "nutachyon")]

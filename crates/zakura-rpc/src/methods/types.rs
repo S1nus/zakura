@@ -12,6 +12,8 @@ pub mod network_info;
 pub mod peer_info;
 pub mod submit_block;
 pub mod subsidy;
+#[cfg(zcash_unstable = "nutachyon")]
+pub mod tachyon_info;
 pub mod transaction;
 pub mod unified_address;
 pub mod validate_address;
