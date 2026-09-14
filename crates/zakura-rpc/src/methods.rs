@@ -142,6 +142,9 @@ use types::{
     z_validate_address::ZValidateAddressResponse,
 };
 
+#[cfg(zcash_unstable = "nutachyon")]
+use types::tachyon_info::GetTachyonInfoResponse;
+
 /// Value pool balances returned by the blockchain RPCs.
 #[cfg(not(zcash_unstable = "nutachyon"))]
 pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
@@ -212,6 +215,8 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getinfo", RpcAccess::Unauthenticated),
     ("getdeprecationinfo", RpcAccess::Unauthenticated),
     ("getblockchaininfo", RpcAccess::Unauthenticated),
+    #[cfg(zcash_unstable = "nutachyon")]
+    ("gettachyoninfo", RpcAccess::Unauthenticated),
     ("getaddressbalance", RpcAccess::Unauthenticated),
     ("sendrawtransaction", RpcAccess::Unauthenticated),
     ("getblock", RpcAccess::Unauthenticated),
@@ -355,6 +360,15 @@ pub trait Rpc {
     /// entries, it can be present with a zero balance.
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
+
+    /// Returns the selected chain's current Tachyon accumulator and retention state.
+    ///
+    /// This method is only available in NuTachyon builds.
+    /// method: post
+    /// tags: blockchain
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[method(name = "gettachyoninfo")]
+    async fn get_tachyon_info(&self) -> Result<GetTachyonInfoResponse>;
 
     /// Returns the total balance of provided `addresses` in a
     /// [`GetAddressBalanceResponse`] instance.
@@ -1676,6 +1690,34 @@ where
         };
 
         Ok(response)
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    async fn get_tachyon_info(&self) -> Result<GetTachyonInfoResponse> {
+        const RECENT_TACHYGRAM_LIMIT: usize = 42;
+
+        let response = call_service(
+            self.read_state.clone(),
+            ReadRequest::TachyonPoolState {
+                recent_tachygram_limit: RECENT_TACHYGRAM_LIMIT,
+            },
+        )
+        .await?;
+        let ReadResponse::TachyonPoolState(Some(state)) = response else {
+            return Err(ErrorObject::owned(
+                server::error::LegacyCode::Misc.into(),
+                "Tachyon state is unavailable before the chain has a tip",
+                None::<()>,
+            ));
+        };
+
+        GetTachyonInfoResponse::from_state(&self.network, state).ok_or_else(|| {
+            ErrorObject::owned(
+                ErrorCode::InvalidRequest.code(),
+                "NuTachyon is disabled on the configured network",
+                None::<()>,
+            )
+        })
     }
 
     async fn get_address_balance(

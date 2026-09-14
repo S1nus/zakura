@@ -2768,6 +2768,56 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             #[cfg(zcash_unstable = "nutachyon")]
+            ReadRequest::TachyonPoolState {
+                recent_tachygram_limit,
+            } => {
+                let best_chain = state.latest_best_chain();
+                let Some((tip_height, _)) = read::tip(best_chain.clone(), &state.db) else {
+                    return Ok(ReadResponse::TachyonPoolState(None));
+                };
+
+                let tip_anchor = best_chain.as_ref().map_or_else(
+                    || state.db.tachyon_anchor_for_tip(),
+                    |chain| chain.tachyon_anchor_for_tip(),
+                );
+                let mut retained_tachygrams: HashMap<_, _> =
+                    state.db.retained_tachyon_tachygrams().into_iter().collect();
+                if let Some(best_chain) = best_chain {
+                    retained_tachygrams.extend(best_chain.tachyon_tachygrams.iter().filter_map(
+                        |(tachygram, reveal_heights)| {
+                            reveal_heights
+                                .last()
+                                .copied()
+                                .map(|height| (*tachygram, height))
+                        },
+                    ));
+                }
+
+                retained_tachygrams.retain(|_, reveal_height| {
+                    zakura_chain::tachyon::within_scan_window(
+                        &state.network,
+                        *reveal_height,
+                        tip_height,
+                    )
+                });
+                let retained_tachygram_count = retained_tachygrams.len();
+                let mut recent_tachygrams: Vec<_> = retained_tachygrams.into_iter().collect();
+                recent_tachygrams.sort_unstable_by(|left, right| {
+                    right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0))
+                });
+                recent_tachygrams.truncate(recent_tachygram_limit);
+
+                Ok(ReadResponse::TachyonPoolState(Some(
+                    crate::response::TachyonPoolState {
+                        tip_height,
+                        tip_anchor,
+                        retained_tachygram_count,
+                        recent_tachygrams,
+                    },
+                )))
+            }
+
+            #[cfg(zcash_unstable = "nutachyon")]
             ReadRequest::TachyonMiningData {
                 anchors,
                 tachygrams,
