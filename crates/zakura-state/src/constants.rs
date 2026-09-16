@@ -98,7 +98,19 @@ pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 #[cfg(not(zcash_unstable = "nutachyon"))]
 const DATABASE_FORMAT_VERSION: u64 = 28;
 #[cfg(zcash_unstable = "nutachyon")]
-const DATABASE_FORMAT_VERSION: u64 = 29;
+const DATABASE_FORMAT_VERSION: u64 = RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION;
+
+/// Reserved for NuTachyon databases derived from production database format 28.
+///
+/// This reservation lives on `main` so a future production format cannot give version 29 a
+/// different meaning while NuTachyon development remains out of tree.
+const RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION: u64 = 29;
+
+#[cfg(not(zcash_unstable = "nutachyon"))]
+const _: () = assert!(
+    DATABASE_FORMAT_VERSION != RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION,
+    "production database format conflicts with reserved NuTachyon major version 29",
+);
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -114,14 +126,14 @@ const DATABASE_FORMAT_VERSION: u64 = 29;
 ///   Existing value-balance and history rows remain readable, so version 29 can reuse a version
 ///   28 database without a row migration.
 #[cfg(not(zcash_unstable = "nutachyon"))]
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 2;
 #[cfg(zcash_unstable = "nutachyon")]
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
 #[cfg(not(zcash_unstable = "nutachyon"))]
-const DATABASE_FORMAT_PATCH_VERSION: u64 = 5;
+const DATABASE_FORMAT_PATCH_VERSION: u64 = 0;
 #[cfg(zcash_unstable = "nutachyon")]
 const DATABASE_FORMAT_PATCH_VERSION: u64 = 0;
 
