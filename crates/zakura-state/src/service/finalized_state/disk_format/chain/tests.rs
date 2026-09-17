@@ -180,7 +180,11 @@ fn history_tree_parts_reads_ironwood_entry_width() {
         parts.as_bytes(),
         HistoryTreeParts::from(ironwood).as_bytes()
     );
-    assert!(parts.as_bytes().len() > ironwood_bytes.len());
+    if cfg!(zcash_unstable = "nutachyon") {
+        assert!(parts.as_bytes().len() > ironwood_bytes.len());
+    } else {
+        assert_eq!(parts.as_bytes(), ironwood_bytes);
+    }
 }
 
 /// A legacy-width row can fail current-width decoding with a non-EOF error if the wider entry
@@ -390,4 +394,27 @@ fn try_history_tree_propagates_malformed_snapshot() {
             legacy: _
         }
     ));
+}
+
+/// Exchange the actual serialized history snapshot between the two build modes.
+#[test]
+#[ignore = "requires scripts/test-tachyon-db-upgrade.sh"]
+fn cross_build_database_upgrade_history() {
+    let fixture = std::path::PathBuf::from(
+        std::env::var_os("ZAKURA_DB_UPGRADE_FIXTURE").expect("fixture directory is set"),
+    );
+    let path = fixture.join("ordinary-history.bin");
+    let tree = valid_history_tree();
+    #[cfg(not(zcash_unstable = "nutachyon"))]
+    std::fs::write(path, HistoryTreeParts::from(&tree).as_bytes()).unwrap();
+    #[cfg(zcash_unstable = "nutachyon")]
+    {
+        let bytes = std::fs::read(path).unwrap();
+        let restored = HistoryTreeParts::try_from_bytes(bytes)
+            .unwrap()
+            .with_network(&Network::Mainnet)
+            .unwrap();
+        assert_eq!(restored.hash(), tree.hash());
+        assert_eq!(restored.current_height(), tree.current_height());
+    }
 }
