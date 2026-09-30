@@ -241,9 +241,8 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_1, ConsensusBranchId(0x4dec4df0)),
     (Nu6_2, ConsensusBranchId(0x5437f330)),
     (Nu6_3, ConsensusBranchId(0x37a5165b)),
-    // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
-    #[cfg(any(test, feature = "zakura-test"))]
-    (Nu7, ConsensusBranchId(0xfffffffe)),
+    // The NU7 consensus branch ID from ZIP 259, matching zcash_protocol's `BranchId::Nu7`.
+    (Nu7, ConsensusBranchId(0x77190ad9)),
     #[cfg(zcash_unstable = "nutachyon")]
     (NuTachyon, ConsensusBranchId(0xfffffffc)),
     #[cfg(zcash_unstable = "zfuture")]
@@ -330,11 +329,15 @@ pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 0;
 /// outputs.
 pub const GLOBAL_SHIELDED_BUDGET: u32 = 330;
 
-/// The multiplier used to derive the testnet minimum difficulty block time gap
-/// threshold.
+/// The multiplier used to derive the Testnet minimum difficulty time gap before
+/// NU7.
 ///
 /// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
-const TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
+const PRE_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
+
+/// The multiplier used to derive the Testnet minimum difficulty time gap from
+/// NU7 onwards, preserving the pre-NU7 gap of 450 seconds.
+const POST_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 18;
 
 /// The start height for the testnet minimum difficulty consensus rule.
 ///
@@ -521,7 +524,8 @@ impl NetworkUpgrade {
     /// Returns the minimum difficulty block spacing for `network` and `height`.
     /// Returns `None` if the testnet minimum difficulty consensus rule is not active.
     ///
-    /// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
+    /// Uses six target spacings before NU7, as specified by ZIP 208, and 18
+    /// target spacings from NU7 onwards on Testnet.
     pub fn minimum_difficulty_spacing_for_height(
         network: &Network,
         height: block::Height,
@@ -536,7 +540,12 @@ impl NetworkUpgrade {
             (Network::Mainnet, _) => None,
             (Network::Testnet(_params), _) => {
                 let network_upgrade = NetworkUpgrade::current(network, height);
-                Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
+                let multiplier = if network_upgrade >= NetworkUpgrade::Nu7 {
+                    POST_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER
+                } else {
+                    PRE_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER
+                };
+                Some(network_upgrade.target_spacing() * multiplier)
             }
         }
     }
@@ -643,7 +652,6 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             zcash_protocol::consensus::NetworkUpgrade::Nu6_1 => Self::Nu6_1,
             zcash_protocol::consensus::NetworkUpgrade::Nu6_2 => Self::Nu6_2,
             zcash_protocol::consensus::NetworkUpgrade::Nu6_3 => Self::Nu6_3,
-            #[cfg(zcash_unstable = "nu7")]
             zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,
             #[cfg(zcash_unstable = "nutachyon")]
             zcash_protocol::consensus::NetworkUpgrade::NuTachyon => Self::NuTachyon,

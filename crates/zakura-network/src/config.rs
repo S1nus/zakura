@@ -1014,7 +1014,7 @@ struct DConfig {
     external_addr: Option<String>,
     network: DNetwork,
 
-    /// Legacy testnet parameters, kept for backwards compatibility.
+    /// Legacy Regtest parameters, kept for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     testnet_parameters: Option<DTestnetParameters>,
 
@@ -1201,24 +1201,28 @@ impl<'de> Deserialize<'de> for Config {
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
 
         let network = match (dnetwork, testnet_parameters) {
-            (DNetwork::ConfiguredTestnet(params), _) => {
+            (DNetwork::ConfiguredTestnet(params), None) => {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
-            (DNetwork::ConfiguredRegtest { params, .. }, _) => {
-                Network::new_regtest(build_regtest_params::<D>(*params)?)
+            (DNetwork::ConfiguredRegtest { params, .. }, None) => {
+                build_configured_regtest::<D>(*params)?
             }
-            (DNetwork::DefaultForKind(NetworkKind::Mainnet), _) => Network::Mainnet,
-            (DNetwork::DefaultForKind(NetworkKind::Testnet), Some(params)) => {
-                build_configured_testnet::<D>(params, &initial_testnet_peers)?
-            }
+            (DNetwork::DefaultForKind(NetworkKind::Mainnet), None) => Network::Mainnet,
             (DNetwork::DefaultForKind(NetworkKind::Testnet), None) => {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
-                Network::new_regtest(build_regtest_params::<D>(params)?)
+                build_configured_regtest::<D>(params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
+            }
+            (_, Some(_)) => {
+                return Err(de::Error::custom(
+                    "testnet_parameters can only be used with `network = \"Regtest\"`; \
+                     Mainnet and public Testnet parameters are fixed, and custom Testnet \
+                     parameters must use the explicit `network = { ... }` form",
+                ));
             }
         };
 
@@ -1423,7 +1427,7 @@ where
             .with_max_block_time_start_height(height.try_into().map_err(de::Error::custom)?);
     }
 
-    // Retain default Testnet activation heights unless there's an empty [testnet_parameters.activation_heights] section.
+    // Retain default Testnet activation heights unless an empty activation-height map is configured.
     if let Some(activation_heights) = activation_heights {
         params_builder = params_builder
             .with_activation_heights(activation_heights)
@@ -1437,6 +1441,10 @@ where
     }
 
     // Set configured funding streams after setting any parameters that affect the funding stream address period.
+    // An explicit empty `funding_streams` list clears the built-in Testnet streams.
+    let are_funding_streams_configured = funding_streams.is_some()
+        || pre_nu6_funding_streams.is_some()
+        || post_nu6_funding_streams.is_some();
     let mut funding_streams_vec = funding_streams.unwrap_or_default();
 
     if let Some(funding_streams) = post_nu6_funding_streams {
@@ -1447,7 +1455,7 @@ where
         funding_streams_vec.insert(0, funding_streams);
     }
 
-    if !funding_streams_vec.is_empty() {
+    if are_funding_streams_configured {
         params_builder = params_builder.with_funding_streams(funding_streams_vec);
     }
 
@@ -1500,9 +1508,11 @@ where
     params_builder.to_network().map_err(de::Error::custom)
 }
 
-fn build_regtest_params<'de, D: Deserializer<'de>>(
-    params: DTestnetParameters,
-) -> Result<RegtestParameters, D::Error> {
+/// Builds Regtest parameters while reporting invalid settings as configuration errors.
+fn build_configured_regtest<'de, D>(params: DTestnetParameters) -> Result<Network, D::Error>
+where
+    D: Deserializer<'de>,
+{
     let DTestnetParameters {
         activation_heights,
         pre_nu6_funding_streams,
@@ -1549,5 +1559,8 @@ fn build_regtest_params<'de, D: Deserializer<'de>>(
         initial_nsm_value_balance,
         ..Default::default()
     };
-    Ok(params)
+
+    testnet::Parameters::new_regtest(params)
+        .map(Network::new_configured_testnet)
+        .map_err(de::Error::custom)
 }

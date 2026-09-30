@@ -397,6 +397,11 @@ pub struct SemanticallyVerifiedBlock {
     /// finalized committer. `None` means the committer falls back to computing
     /// it from the block's transactions.
     pub auth_data_root: Option<AuthDataRoot>,
+    /// Original verifier receipt order, also forwarded by trusted mirrors.
+    ///
+    /// This is process-local metadata, not serialized block data. Restored
+    /// blocks have no order. Orders from different primary sessions cannot be compared.
+    pub receipt_order: Option<u64>,
 }
 
 /// Data required to check a prepared mined block before optimistic relay.
@@ -486,6 +491,8 @@ pub struct ContextuallyVerifiedBlock {
 
     /// The sum of the chain value pool changes of all transactions in this block.
     pub(crate) chain_value_pool_change: ValueBalance<NegativeAllowed>,
+    /// Original verifier receipt order, retained through forks and reconsideration.
+    pub(crate) receipt_order: Option<u64>,
 }
 
 /// Wraps note commitment trees and the history tree together.
@@ -676,6 +683,7 @@ impl ContextuallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change,
             auth_data_root: _,
+            receipt_order,
         } = semantically_verified;
 
         let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
@@ -692,6 +700,7 @@ impl ContextuallyVerifiedBlock {
             spent_outputs: Arc::new(spent_outputs),
             transaction_hashes,
             chain_value_pool_change,
+            receipt_order,
         })
     }
 }
@@ -728,6 +737,7 @@ impl CheckpointVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: None,
+            receipt_order: None,
         })
     }
 
@@ -767,6 +777,7 @@ impl SemanticallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
+            receipt_order: None,
         }
     }
 
@@ -803,6 +814,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
+            receipt_order: None,
         }
     }
 }
@@ -944,6 +956,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
                 valid.chain_value_pool_change.deferred_amount(),
             )),
             auth_data_root: None,
+            receipt_order: valid.receipt_order,
         }
     }
 }
@@ -958,6 +971,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
             auth_data_root: None,
+            receipt_order: None,
         }
     }
 }
@@ -1401,6 +1415,13 @@ pub enum Request {
     /// with the current best chain tip.
     Tip,
 
+    /// Reconciles durable checkpoint completion with queued semantic writes, including when
+    /// no further requests would drive the buffered state service.
+    ///
+    /// Returns [`Response::CheckpointHandoffChecked`] after checking the existing durable-state
+    /// handoff conditions. Repeated requests are safe. This does not wait for semantic commits.
+    CheckCheckpointHandoff,
+
     /// Computes a block locator object based on the current best chain.
     ///
     /// Returns [`Response::BlockLocator`] with hashes starting
@@ -1636,6 +1657,7 @@ impl Request {
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
+            Request::CheckCheckpointHandoff => "check_checkpoint_handoff",
             Request::BlockLocator => "block_locator",
             Request::Transaction(_) => "transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
@@ -1976,6 +1998,16 @@ pub enum ReadRequest {
         count: u32,
     },
 
+    /// Returns [`ReadResponse::BlockSizesByHash(Vec<Option<u32>>)`](ReadResponse::BlockSizesByHash)
+    /// with the committed serialized size of each requested block hash, parallel to `hashes`.
+    /// `None` marks a hash that is committed in neither the best chain nor the finalized
+    /// state. Scheduling metadata for header serving; verification never consults it.
+    /// Rejects more than `MAX_HEADER_SYNC_HEIGHT_RANGE` hashes.
+    BlockSizesByHash {
+        /// Block hashes to look up.
+        hashes: Vec<block::Hash>,
+    },
+
     /// Returns the highest header held on disk.
     BestHeaderTip,
 
@@ -2239,6 +2271,7 @@ impl ReadRequest {
             ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
             ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
             ReadRequest::BlockRoots { .. } => "block_roots",
+            ReadRequest::BlockSizesByHash { .. } => "block_sizes_by_hash",
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",
@@ -2334,6 +2367,7 @@ impl TryFrom<Request> for ReadRequest {
             | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
+            | Request::CheckCheckpointHandoff
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 

@@ -132,7 +132,10 @@ const _: () = assert!(
 ///   balance from 56 to 64 bytes, and widens history entries for the V4 history-node fields.
 ///   Existing value-balance and history rows remain readable, so version 30 can reuse a version
 ///   29 database without a row migration.
+#[cfg(zcash_unstable = "nutachyon")]
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
+#[cfg(not(zcash_unstable = "nutachyon"))]
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.

@@ -70,7 +70,9 @@ use zakura_chain::{
         },
         ConsensusBranchId, Network, NetworkUpgrade,
     },
-    serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
+    serialization::{
+        BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+    },
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address, OutputIndex},
@@ -1635,6 +1637,7 @@ where
             prune_height,
             (tip_height, tip_hash),
             value_balance,
+            nsm_value_balance_zat,
             difficulty,
         ) = {
             use zakura_state::ReadResponse::*;
@@ -1651,14 +1654,25 @@ where
                 unreachable!("unmatched response to a PruningInfo request")
             };
 
-            let (tip, value_balance) = match tip_pool_values_rsp {
+            // TipPoolValues soft-fails to genesis + a synthetic zero ValueBalance. The NSM
+            // counter is optional and distinguishes "not reported" from a legitimate zero, so
+            // only populate it when the query succeeded.
+            let (tip, value_balance, nsm_value_balance_zat) = match tip_pool_values_rsp {
                 Ok(TipPoolValues {
                     tip_height,
                     tip_hash,
                     value_balance,
-                }) => ((tip_height, tip_hash), value_balance),
+                }) => (
+                    (tip_height, tip_hash),
+                    value_balance,
+                    Some(value_balance.nsm_value_balance_amount()),
+                ),
                 Ok(_) => unreachable!("unmatched response to a TipPoolValues request"),
-                Err(_) => ((Height::MIN, network.genesis_hash()), Default::default()),
+                Err(_) => (
+                    (Height::MIN, network.genesis_hash()),
+                    Default::default(),
+                    None,
+                ),
             };
 
             let difficulty = chain_tip_difficulty
@@ -1670,6 +1684,7 @@ where
                 prune_height,
                 tip,
                 value_balance,
+                nsm_value_balance_zat,
                 difficulty,
             )
         };
@@ -1763,6 +1778,7 @@ where
             estimated_height,
             chain_supply: GetBlockchainInfoBalance::chain_supply(value_balance),
             value_pools: GetBlockchainInfoBalance::value_pools(value_balance, None),
+            nsm_value_balance_zat,
             upgrades,
             consensus,
             headers: header_height,
@@ -2986,6 +3002,8 @@ where
                 //
                 // We always return after 90 minutes on mainnet, even if we have the same response,
                 // because the max time has been reached.
+                let fetch_wall_time = Utc::now();
+                let fetch_instant = tokio::time::Instant::now();
                 let chain_info @ zakura_state::GetBlockTemplateChainInfo {
                     tip_hash,
                     tip_height,
@@ -3034,9 +3052,10 @@ where
                 // - the server long poll ID is different to the client long poll ID, or
                 // - the previous loop iteration waited until the max time.
                 if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
-                    // On testnet, the max time changes the block difficulty, so old shares are invalid.
-                    // On mainnet, this means there has been 90 minutes without a new block or mempool
-                    // transaction, which is very unlikely. So the miner should probably reset anyway.
+                    // The template's time range has expired. On testnet, this usually means
+                    // minimum difficulty work is now available. On mainnet, this means there has
+                    // been 90 minutes without a new block or mempool transaction, which is very
+                    // unlikely. So the miner should probably reset anyway.
                     let submit_old = if max_time_reached {
                         Some(false)
                     } else {
@@ -3115,24 +3134,38 @@ where
                     Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
                 };
 
-                // Wait for the maximum block time to elapse. This can change the block header
-                // on testnet. (On mainnet it can happen due to a network disconnection, or a
-                // rapid drop in hash rate.)
+                // Wait for the template's time range to expire. On testnet, minimum difficulty
+                // becomes valid one second after `max_time`, because the last standard difficulty
+                // second is still valid. Testnet measures that deadline from the wall clock at the
+                // state fetch, so a clamped `cur_time` can't restart it and a slow fetch can't
+                // skip it. (On mainnet the time range only expires after a network disconnection,
+                // or a rapid drop in hash rate.)
                 //
-                // This duration might be slightly lower than the actual maximum,
-                // if cur_time was clamped to min_time. In that case the wait is very long,
-                // and it's ok to return early.
-                //
-                // It can also be zero if cur_time was clamped to max_time. In that case,
-                // we want to wait for another change, and ignore this timeout. So we use an
-                // `OptionFuture::None`.
-                let duration_until_max_time = max_time.saturating_duration_since(cur_time);
-                let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
-                    Some(tokio::time::sleep(duration_until_max_time.to_std()))
-                } else {
-                    None
-                }
-                .into();
+                // A deadline that passed before the fetch, or a zero mainnet wait because
+                // `cur_time` was clamped to `max_time`, disables the timer. The request then
+                // waits for another change instead of spinning.
+                let wait_for_max_time: OptionFuture<_> =
+                    if NetworkUpgrade::minimum_difficulty_spacing_for_height(
+                        &self.network,
+                        tip_height.next().map_misc_error()?,
+                    )
+                    .is_some()
+                    {
+                        let wait = (max_time
+                            .saturating_add(Duration32::from_seconds(1))
+                            .to_chrono()
+                            - fetch_wall_time)
+                            .to_std()
+                            .ok();
+                        wait.filter(|wait| !wait.is_zero())
+                            .map(|wait| tokio::time::sleep_until(fetch_instant + wait))
+                    } else {
+                        // Preserve Mainnet's relative wait after the fetches. Its clock sample
+                        // can be later than `fetch_instant` if the state read was slow.
+                        let wait = max_time.saturating_duration_since(cur_time).to_std();
+                        (!wait.is_zero()).then(|| tokio::time::sleep(wait))
+                    }
+                    .into();
 
                 // Optional TODO:
                 // `zcashd` generates the next coinbase transaction while waiting for changes.
@@ -3204,8 +3237,8 @@ where
                         continue 'rebuild;
                     }
 
-                    // The max time does not elapse during normal operation on mainnet,
-                    // and it rarely elapses on testnet.
+                    // Testnet reaches this when minimum difficulty becomes valid.
+                    // Mainnet only reaches it after a long stall.
                     Some(_elapsed) = wait_for_max_time => {
                         // This log is very rare so it's ok to be info.
                         tracing::info!(
@@ -4423,6 +4456,32 @@ pub struct GetBlockchainInfoResponse {
     #[serde(deserialize_with = "deserialize_blockchain_value_pool_balances")]
     value_pools: BlockchainValuePoolBalances,
 
+    /// The ZIP 234 NSM value balance, in zatoshis.
+    ///
+    /// This is an accounting counter rather than a pool of spendable value: it tracks
+    /// historical unclaimed issuance plus scheduled issuance, minus issuance since NU7, and
+    /// is what funds reissuance. It is deliberately absent from
+    /// [`chain_supply`](Self::chain_supply) and [`value_pools`](Self::value_pools), which
+    /// report monetary supply, so that summing those fields still yields the supply.
+    ///
+    /// The stored counter is signed. Contextual validation requires it to stay non-negative
+    /// from NU7 onward, but it carries no such guarantee before then, so clients must accept
+    /// a negative value.
+    ///
+    /// Reported in zatoshis only. There is no `zcashd` field to stay compatible with, and a
+    /// ZEC `f64` cannot represent every zatoshi amount exactly.
+    ///
+    /// `None` means the responding node does not report the counter, which is not the same
+    /// as reporting zero: zero is a legitimate balance. Nodes that know the value always
+    /// send it. When tip pool values are unavailable, the field is omitted.
+    #[serde(
+        rename = "nsmValueBalanceZat",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getter(copy)]
+    nsm_value_balance_zat: Option<Amount<NegativeAllowed>>,
+
     /// Status of network upgrades
     upgrades: IndexMap<ConsensusBranchIdHex, NetworkUpgradeInfo>,
 
@@ -4570,6 +4629,7 @@ impl Default for GetBlockchainInfoResponse {
             estimated_height: Height(1),
             chain_supply: GetBlockchainInfoBalance::chain_supply(Default::default()),
             value_pools: GetBlockchainInfoBalance::zero_pools(),
+            nsm_value_balance_zat: None,
             upgrades: IndexMap::new(),
             consensus: TipConsensusBranch {
                 chain_tip: ConsensusBranchIdHex(ConsensusBranchId::default()),
@@ -4618,6 +4678,9 @@ impl GetBlockchainInfoResponse {
             estimated_height,
             chain_supply,
             value_pools,
+            // Left unset so this constructor's signature stays stable; callers that
+            // report the ZIP 234 counter set it with `with_nsm_value_balance_zat`.
+            nsm_value_balance_zat: None,
             upgrades,
             consensus,
             headers,
@@ -4630,6 +4693,18 @@ impl GetBlockchainInfoResponse {
             commitments,
             header_chain: None,
         }
+    }
+
+    /// Sets the ZIP 234 NSM value balance, in zatoshis.
+    ///
+    /// [`GetBlockchainInfoResponse::new`] predates this field and leaves it unset, so that
+    /// adding the field did not change its argument list.
+    pub fn with_nsm_value_balance_zat(
+        mut self,
+        nsm_value_balance_zat: Amount<NegativeAllowed>,
+    ) -> Self {
+        self.nsm_value_balance_zat = Some(nsm_value_balance_zat);
+        self
     }
 }
 

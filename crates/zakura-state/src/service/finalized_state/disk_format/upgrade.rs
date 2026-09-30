@@ -155,6 +155,10 @@ fn format_upgrades(
             Version::new(28, 2, 5),
         )),
         Box::new(nsm_value_balance_pool::Upgrade),
+        Box::new(no_migration::NoMigration::new(
+            "add Zakura header auxiliary body size corrections",
+            Version::new(29, 1, 0),
+        )),
         #[cfg(zcash_unstable = "nutachyon")]
         Box::new(no_migration::NoMigration::new(
             "add Tachyon state and widen chain value balance and history entries",
@@ -1142,9 +1146,9 @@ fn vct_format_changes_include_root_auth_and_node_metadata_updates() {
     assert_eq!(
         upgrades.len(),
         if cfg!(zcash_unstable = "nutachyon") {
-            10
+            11
         } else {
-            8
+            9
         }
     );
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
@@ -1159,13 +1163,25 @@ fn vct_format_changes_include_root_auth_and_node_metadata_updates() {
     {
         assert_eq!(upgrades[7].version(), Version::new(28, 2, 5));
         assert_eq!(upgrades[8].version(), Version::new(29, 0, 0));
-        assert_eq!(upgrades[9].version(), Version::new(30, 0, 0));
+        assert_eq!(upgrades[9].version(), Version::new(29, 1, 0));
+        assert_eq!(upgrades[10].version(), Version::new(30, 0, 0));
     }
     #[cfg(not(zcash_unstable = "nutachyon"))]
-    assert_eq!(upgrades[7].version(), Version::new(29, 0, 0));
+    {
+        assert_eq!(upgrades[7].version(), Version::new(29, 0, 0));
+        assert_eq!(upgrades[8].version(), Version::new(29, 1, 0));
+    }
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"
+    );
+    assert!(
+        !upgrades
+            .iter()
+            .find(|upgrade| upgrade.version() == Version::new(29, 1, 0))
+            .expect("header auxiliary body size correction upgrade should be present")
+            .needs_migration(),
+        "the sparse body size correction column family is created on open"
     );
     let mut current_schema_version = state_database_format_version_in_code();
     current_schema_version.build = semver::BuildMetadata::EMPTY;
