@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// Opt in to the provisional version-1 Tachyon aggregation relay protocol.
+    /// Requires a build with `zcash_unstable="nutachyon"`; disabled by default.
+    pub enable_tachyon_aggregation: bool,
     /// The mempool transaction cost limit.
     ///
     /// This limits the total serialized byte size of all transactions in the mempool.
@@ -58,6 +61,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            enable_tachyon_aggregation: false,
             // [ZIP-401] Consensus rules:
             //
             // > There MUST be a configuration option mempooltxcostlimit,

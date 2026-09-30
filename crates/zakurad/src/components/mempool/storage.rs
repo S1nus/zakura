@@ -771,6 +771,7 @@ impl Storage {
         tx_ids.into_iter().filter_map(|tx_id| {
             self.transactions()
                 .get(&tx_id.mined_id())
+                .filter(|tx| tx.transaction.id() == tx_id)
                 .map(|tx| &tx.transaction)
         })
     }
@@ -986,7 +987,11 @@ impl Storage {
     /// then it shouldn't be downloaded/verified.
     pub fn should_download_or_verify(&mut self, txid: UnminedTxId) -> Result<(), MempoolError> {
         // Check if the transaction is already in the mempool.
-        if self.contains_transaction_exact(&txid.mined_id()) {
+        if self
+            .transactions_exact(HashSet::from([txid]))
+            .next()
+            .is_some()
+        {
             return Err(MempoolError::InMempool);
         }
         if let Some(error) = self.rejection_error(&txid) {
