@@ -511,13 +511,25 @@ pub(crate) fn tx_anchors_refer_to_final_treestates(
     parent_chain: Option<&Arc<Chain>>,
     unmined_tx: &UnminedTx,
 ) -> Result<(), ValidateContextError> {
+    #[cfg(zcash_unstable = "nutachyon")]
+    let height = Some(
+        parent_chain
+            .filter(|chain| !chain.is_empty())
+            .map(|chain| chain.non_finalized_tip_height())
+            .or_else(|| finalized_state.finalized_tip_height())
+            .map_or(Height(0), |tip| {
+                (tip + 1).expect("chain tip is below the maximum height")
+            }),
+    );
+    #[cfg(not(zcash_unstable = "nutachyon"))]
+    let height = None;
     sapling_orchard_ironwood_anchors_refer_to_final_treestates(
         finalized_state,
         parent_chain,
         unmined_tx.transaction(),
         unmined_tx.id().mined_id(),
         None,
-        None,
+        height,
     )?;
 
     // If there are no sprout transactions in the block, avoid running a rayon scope

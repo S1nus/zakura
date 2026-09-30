@@ -3891,6 +3891,8 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     let conventional_actions = zip317::conventional_actions(unmined_tx.transaction());
 
     let verified_unmined_tx = VerifiedUnminedTx {
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon_originals: Vec::new(),
         transaction: unmined_tx,
         miner_fee: 0.try_into().unwrap(),
         legacy_sigop_count: 0,

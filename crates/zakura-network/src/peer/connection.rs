@@ -49,6 +49,7 @@ mod tests;
 
 #[derive(Debug)]
 pub(super) enum Handler {
+    AggregateDependencies(zakura_chain::transaction::WtxId),
     /// Indicates that the handler has finished processing the request.
     /// An error here is scoped to the request.
     Finished(Result<Response, PeerError>),
@@ -78,6 +79,7 @@ impl fmt::Display for Handler {
 
             Handler::Ping { .. } => "Ping".to_string(),
             Handler::Peers => "Peers".to_string(),
+            Handler::AggregateDependencies(_) => "AggregateDependencies".to_string(),
 
             Handler::FindBlocks => "FindBlocks".to_string(),
             Handler::FindHeaders => "FindHeaders".to_string(),
@@ -112,6 +114,7 @@ impl Handler {
 
             Handler::Ping { .. } => "Ping".into(),
             Handler::Peers => "Peers".into(),
+            Handler::AggregateDependencies(_) => "AggregateDependencies".into(),
 
             Handler::FindBlocks => "FindBlocks".into(),
             Handler::FindHeaders => "FindHeaders".into(),
@@ -152,6 +155,13 @@ impl Handler {
         debug!(handler = %tmp_state, %msg, "received peer response to Zakura request");
 
         *self = match (tmp_state, msg) {
+            (Handler::AggregateDependencies(id), Message::AggregateDependencies(manifest)) => {
+                if manifest.aggregate == id {
+                    Handler::Finished(Ok(Response::AggregateDependencies(manifest)))
+                } else {
+                    Handler::AggregateDependencies(id)
+                }
+            }
             (
                 Handler::Ping {
                     nonce,
@@ -1082,6 +1092,11 @@ where
                          })
             }
 
+            (AwaitingRequest, AggregateDependencies { aggregate, .. }) => {
+                self.peer_tx.send(Message::GetAggregateDependencies(aggregate)).await
+                    .map(|()| Handler::AggregateDependencies(aggregate))
+            }
+
             (AwaitingRequest, FindBlocks { known_blocks, stop }) => {
                 self
                     .peer_tx
@@ -1376,6 +1391,16 @@ where
             }
             .into(),
             Message::Mempool => Request::MempoolTransactionIds.into(),
+            Message::GetAggregateDependencies(aggregate) => Request::AggregateDependencies {
+                aggregate,
+                source: self
+                    .connection_info
+                    .connected_addr
+                    .get_transient_addr()
+                    .map(Into::into),
+            }
+            .into(),
+            Message::AggregateDependencies(_) => Unused,
         };
 
         // Handle the request, and return unused messages.
@@ -1479,6 +1504,15 @@ where
 
         // TODO: split response handler into its own method
         match rsp.clone() {
+            Response::AggregateDependencies(manifest) => {
+                if let Err(error) = self
+                    .peer_tx
+                    .send(Message::AggregateDependencies(manifest))
+                    .await
+                {
+                    self.fail_with(error).await;
+                }
+            }
             Response::Nil => { /* generic success, do nothing */ }
             Response::Peers(addrs) => {
                 if let Err(e) = self.peer_tx.send(Message::Addr(addrs)).await {

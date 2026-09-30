@@ -1,0 +1,16 @@
+{
+    "rust-analyzer.server.extraEnv": {
+      "RUSTUP_TOOLCHAIN": "1.97.1",
+      "ROCKSDB_LIB_DIR": "/opt/homebrew/lib"
+    },
+    "rust-analyzer.cargo.extraEnv": {
+      "RUSTUP_TOOLCHAIN": "1.97.1",
+      "ROCKSDB_LIB_DIR": "/opt/homebrew/lib"
+    },
+    "rust-analyzer.runnables.extraEnv": {
+      "RUSTUP_TOOLCHAIN": "1.97.1",
+      "ROCKSDB_LIB_DIR": "/opt/homebrew/lib"
+    },
+    "rust-analyzer.server.path": null,
+
+  }
