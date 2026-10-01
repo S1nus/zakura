@@ -258,7 +258,7 @@ mod tests {
         serialization::{ZcashDeserialize, ZcashDeserializeInto},
         transaction::Hash,
     };
-    use zakura_node_services::BoxError;
+    use zakura_node_services::{mempool, BoxError};
     use zakura_state::TachyonMiningData;
     use zakura_test::mock_service::MockService;
 
@@ -388,14 +388,21 @@ mod tests {
         )));
 
         let anchor_heights = HashMap::from([(tip_anchor, Height(candidate_height.0 - 1))]);
+        let mut mempool_service: MockService<_, _, _, BoxError> =
+            MockService::build().for_unit_tests();
         let aggregation = super::super::tachyon::aggregate_transactions(
             network,
             candidate_height,
             tip_hash,
             read_state.clone(),
+            mempool_service.clone(),
             generated,
         );
         let aggregation_response = async {
+            mempool_service
+                .expect_request(mempool::Request::TachyonAggregates(tip_hash))
+                .await
+                .respond(mempool::Response::TachyonAggregates(Vec::new()));
             read_state
                 .expect_request_that(|request| {
                     matches!(request, ReadRequest::TachyonMiningData { .. })

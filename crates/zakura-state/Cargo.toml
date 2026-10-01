@@ -89,6 +89,9 @@ derive-new.workspace = true
 [target.'cfg(zcash_unstable = "nutachyon")'.dependencies]
 zcash_tachyon = { workspace = true }
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dev-dependencies]
+ragu = { workspace = true }
+
 [dev-dependencies]
 zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.0", features = ["test-support"] }
 color-eyre = { workspace = true }

@@ -68,6 +68,8 @@ pub use crate::BoxError;
 
 pub use config::Config;
 pub use crawler::Crawler;
+#[cfg(zcash_unstable = "nutachyon")]
+mod aggregation;
 pub use error::MempoolError;
 pub(crate) use gossip::run_mempool_transaction_id_gossip;
 pub use queue_checker::QueueChecker;
@@ -306,6 +308,8 @@ impl ActiveState {
 /// of that have yet to be confirmed by the Zcash network. A transaction is
 /// confirmed when it has been included in a block ('mined').
 pub struct Mempool {
+    #[cfg(zcash_unstable = "nutachyon")]
+    aggregate_cache: aggregation::Cache,
     /// The configurable options for the mempool, persisted between states.
     config: Config,
 
@@ -393,6 +397,8 @@ impl Mempool {
         let transaction_subscriber = MempoolTxSubscriber::new(transaction_sender.clone());
 
         let mut service = Mempool {
+            #[cfg(zcash_unstable = "nutachyon")]
+            aggregate_cache: Default::default(),
             config: config.clone(),
             expose_peer_addresses,
             active_state: ActiveState::Disabled,
@@ -491,13 +497,19 @@ impl Mempool {
 
         info!(?tip_height, reason, "activating mempool");
 
-        let tx_downloads = Box::pin(TxDownloads::new(
+        let tx_downloads = TxDownloads::new(
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
             Timeout::new(self.tx_verifier.clone(), TRANSACTION_VERIFY_TIMEOUT),
             self.read_state.clone(),
             self.expose_peer_addresses,
             self.config.max_transaction_bytes,
-        ));
+        );
+        #[cfg(zcash_unstable = "nutachyon")]
+        let tx_downloads = tx_downloads.with_aggregation(
+            self.config.enable_tachyon_aggregation,
+            self.aggregate_cache.known.clone(),
+        );
+        let tx_downloads = Box::pin(tx_downloads);
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
             tx_downloads,
@@ -777,6 +789,8 @@ impl Service<Request> for Mempool {
             let mut mined_mempool_ids = HashSet::<_>::new();
 
             let best_tip_height = self.latest_chain_tip.best_tip_height();
+            #[cfg(zcash_unstable = "nutachyon")]
+            let best_tip_hash = self.latest_chain_tip.best_tip_hash();
 
             // Clean up completed download tasks and add to mempool if successful.
             while let Poll::Ready(Some(result)) = pin!(&mut *tx_downloads).poll_next(cx) {
@@ -789,7 +803,56 @@ impl Service<Request> for Mempool {
                         // the best chain changes (which is the only way to stay at the same height), and the
                         // mempool re-verifies all pending tx_downloads when there's a `TipAction::Reset`.
                         if best_tip_height == expected_tip_height {
+                            #[cfg(zcash_unstable = "nutachyon")]
+                            if !tx.tachyon_originals.is_empty() {
+                                // Alternatives never duplicate spend/output/fee accounting.
+                                for (original, outpoints) in tx.tachyon_originals {
+                                    self.aggregate_cache
+                                        .known
+                                        .lock()
+                                        .expect("known cache lock guards only bounded bookkeeping")
+                                        .remember(original.transaction.clone());
+                                    let (result, evicted) = storage.insert_with_evicted_ids(
+                                        original,
+                                        outpoints,
+                                        best_tip_height,
+                                    );
+                                    if let Ok(id) = result {
+                                        send_to_peers_ids.insert(id);
+                                    }
+                                    send_to_peers_ids.retain(|id| !evicted.contains(id));
+                                    invalidated_ids.extend(evicted);
+                                }
+                                let available: HashSet<_> = storage.tx_ids().collect();
+                                let stored = tx
+                                    .transaction
+                                    .tachyon_dependencies()
+                                    .iter()
+                                    .all(|original| available.contains(&original.id()))
+                                    && best_tip_hash.is_some_and(|tip| {
+                                        self.aggregate_cache.insert(tx.transaction.clone(), tip)
+                                    });
+                                if stored {
+                                    send_to_peers_ids.insert(tx.transaction.id());
+                                }
+                                if let Some(sender) = rsp_tx {
+                                    let _ = sender.send(if stored {
+                                        Ok(())
+                                    } else {
+                                        Err("aggregate package could not be retained".into())
+                                    });
+                                }
+                                continue;
+                            }
                             let tx_id = tx.transaction.id();
+                            #[cfg(zcash_unstable = "nutachyon")]
+                            if self.config.enable_tachyon_aggregation {
+                                self.aggregate_cache
+                                    .known
+                                    .lock()
+                                    .expect("known cache lock guards only bounded bookkeeping")
+                                    .remember(tx.transaction.clone());
+                            }
                             let (insert_result, evicted_ids) = storage.insert_with_evicted_ids(
                                 tx,
                                 spent_mempool_outpoints,
@@ -984,6 +1047,24 @@ impl Service<Request> for Mempool {
     /// and will cause callers to disconnect from the remote peer.
     #[instrument(name = "mempool", skip(self, req))]
     fn call(&mut self, req: Request) -> Self::Future {
+        if let Request::AggregateDependencies { aggregate, source } = req {
+            #[cfg(zcash_unstable = "nutachyon")]
+            let manifest = self.aggregate_cache.manifest(aggregate, source);
+            #[cfg(not(zcash_unstable = "nutachyon"))]
+            let manifest = {
+                let _ = source;
+                zakura_chain::transaction::aggregation::Manifest {
+                    aggregate,
+                    originals: Vec::new(),
+                }
+            };
+            return async move { Ok(Response::AggregateDependencies(manifest)) }.boxed();
+        }
+        #[cfg(zcash_unstable = "nutachyon")]
+        if let Request::TachyonAggregates(tip) = req {
+            let candidates = self.aggregate_cache.candidates(tip);
+            return async move { Ok(Response::TachyonAggregates(candidates)) }.boxed();
+        }
         match &mut self.active_state {
             ActiveState::Enabled {
                 storage,
@@ -991,11 +1072,23 @@ impl Service<Request> for Mempool {
                 pending_gossip_tx_ids,
                 last_seen_tip_hash,
             } => match req {
+                Request::AggregateDependencies { .. } => {
+                    unreachable!("handled before active state")
+                }
+                #[cfg(zcash_unstable = "nutachyon")]
+                Request::TachyonAggregates(_) => unreachable!("handled before active state"),
                 // Queries
                 Request::TransactionIds => {
                     trace!(?req, "got mempool request");
 
                     let res: HashSet<_> = storage.tx_ids().collect();
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    let res = {
+                        let alternatives =
+                            self.aggregate_cache.active_ids(*last_seen_tip_hash, &res);
+                        self.aggregate_cache.renew(&alternatives);
+                        res.into_iter().chain(alternatives).collect::<HashSet<_>>()
+                    };
 
                     trace!(?req, res_count = ?res.len(), "answered mempool request");
 
@@ -1005,6 +1098,15 @@ impl Service<Request> for Mempool {
                 Request::TakePendingGossipTransactionIds { limit } => {
                     trace!(?req, "got mempool request");
 
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    if self.config.enable_tachyon_aggregation {
+                        let available: HashSet<_> = storage.tx_ids().collect();
+                        let alternatives = self
+                            .aggregate_cache
+                            .active_ids(*last_seen_tip_hash, &available);
+                        pending_gossip_tx_ids
+                            .retain(|id| available.contains(id) || alternatives.contains(id));
+                    }
                     let res = if pending_gossip_tx_ids.len() <= limit {
                         std::mem::take(pending_gossip_tx_ids)
                     } else {
@@ -1018,6 +1120,9 @@ impl Service<Request> for Mempool {
                         res
                     };
 
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    self.aggregate_cache.renew(&res);
+
                     trace!(?req, res_count = ?res.len(), "answered mempool request");
 
                     async move { Ok(Response::TransactionIds(res)) }.boxed()
@@ -1027,6 +1132,17 @@ impl Service<Request> for Mempool {
                     trace!(?req, "got mempool request");
 
                     let res: Vec<_> = storage.transactions_exact(ids.clone()).cloned().collect();
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    let res = {
+                        let mut res = res;
+                        let found: HashSet<_> = res.iter().map(|tx| tx.id()).collect();
+                        res.extend(
+                            ids.iter()
+                                .filter(|id| !found.contains(id))
+                                .filter_map(|id| self.aggregate_cache.transaction(*id)),
+                        );
+                        res
+                    };
 
                     trace!(?req, res_count = ?res.len(), "answered mempool request");
 
@@ -1272,7 +1388,24 @@ impl Service<Request> for Mempool {
                         Response::TransactionIds(Default::default())
                     }
 
-                    Request::TransactionsById(_) => Response::Transactions(Default::default()),
+                    Request::AggregateDependencies { .. } => {
+                        unreachable!("handled before active state")
+                    }
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    Request::TachyonAggregates(_) => unreachable!("handled before active state"),
+                    Request::TransactionsById(ids) => {
+                        #[cfg(zcash_unstable = "nutachyon")]
+                        let transactions = ids
+                            .into_iter()
+                            .filter_map(|id| self.aggregate_cache.transaction(id))
+                            .collect();
+                        #[cfg(not(zcash_unstable = "nutachyon"))]
+                        let transactions = {
+                            let _ = ids;
+                            Vec::new()
+                        };
+                        Response::Transactions(transactions)
+                    }
                     Request::TransactionsByMinedId(_) => Response::Transactions(Default::default()),
                     Request::TransactionWithDepsByMinedId(_)
                     | Request::AwaitOutput(_)

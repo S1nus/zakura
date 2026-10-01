@@ -121,6 +121,11 @@ fn response_summary(response: &Response) -> (&'static str, u64, u64) {
         Response::TransactionIds(ids) => ("TransactionIds", bounded_u64(ids.len()), 0),
         Response::Pong(_) => ("Pong", 1, 0),
         Response::Nil => ("Nil", 0, 0),
+        Response::AggregateDependencies(manifest) => (
+            "AggregateDependencies",
+            bounded_u64(manifest.originals.len()),
+            0,
+        ),
         response => (response.command(), 0, 0),
     }
 }

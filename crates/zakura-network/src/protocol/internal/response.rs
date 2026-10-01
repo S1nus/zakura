@@ -18,6 +18,8 @@ use InventoryResponse::*;
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum Response {
+    /// Exact-ID aggregate dependency manifest, or an empty refusal.
+    AggregateDependencies(zakura_chain::transaction::aggregation::Manifest),
     /// The request does not have a response.
     ///
     /// Either:
@@ -87,6 +89,7 @@ impl fmt::Display for Response {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&match self {
             Response::Nil => "Nil".to_string(),
+            Response::AggregateDependencies(_) => "AggregateDependencies".to_string(),
 
             Response::Peers(peers) => format!("Peers {{ peers: {} }}", peers.len()),
 
@@ -133,6 +136,7 @@ impl Response {
     pub fn command(&self) -> &'static str {
         match self {
             Response::Nil => "Nil",
+            Response::AggregateDependencies(_) => "AggregateDependencies",
 
             Response::Peers(_) => "Peers",
 

@@ -7411,6 +7411,7 @@ name = "zakura"
 version = "1.5.1"
 dependencies = [
  "abscissa_core",
+ "blake2b_simd",
  "bytes",
  "chrono",
  "clap",
@@ -7446,6 +7447,7 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "prost",
+ "ragu",
  "rand 0.8.6",
  "rayon",
  "regex",
@@ -7488,6 +7490,7 @@ dependencies = [
  "zakura-test",
  "zakura-utils",
  "zcash_script",
+ "zcash_tachyon",
 ]
 
 [[package]]
@@ -8367,6 +8370,7 @@ dependencies = [
  "once_cell",
  "proptest",
  "proptest-derive",
+ "ragu",
  "rand 0.8.6",
  "rayon",
  "regex",

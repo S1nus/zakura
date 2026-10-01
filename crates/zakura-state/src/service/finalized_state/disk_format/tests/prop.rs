@@ -589,7 +589,7 @@ fn roundtrip_block_info_with_tachyon_value_pool() {
         123,
     );
 
-    assert_eq!(block_info.as_bytes().len(), 60);
+    assert_eq!(block_info.as_bytes().len(), 68);
     assert_value_properties(block_info);
 }
 

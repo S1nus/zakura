@@ -293,6 +293,11 @@ hex.workspace = true
 # test feature lightwalletd-grpc-tests
 tonic-prost-build = { workspace = true, optional = true }
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dev-dependencies]
+blake2b_simd = { workspace = true }
+ragu = { workspace = true }
+zcash_tachyon = { workspace = true }
+
 [dev-dependencies]
 abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
 hex-literal = { workspace = true }
