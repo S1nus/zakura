@@ -294,7 +294,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
@@ -475,7 +475,7 @@ jobs:
       # the canonical public repository; private rehearsal repos skip it.
       - name: Attest build provenance
         if: ${{ github.repository == 'zakura-core/zakura' }}
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d #v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 #v4.2.2
         env:
           # Preserve the response-header limit set by the former wrapper.
           NODE_OPTIONS: --max-http-header-size=32768
@@ -585,7 +585,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
@@ -678,7 +678,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.4.1
 
       - name: Create and verify Docker manifest
         env:
@@ -728,7 +728,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
@@ -832,7 +832,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.4.1
 
       - name: Create and verify zcashd compat Docker manifest
         env:
@@ -881,7 +881,7 @@ jobs:
     timeout-minutes: 1
     steps:
       - name: Decide whether the needed jobs succeeded or failed
-        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 #v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
           allowed-skips: build-zakurad-assets,publish-zakurad-assets,publish-docker-manifest,publish-zcashd-compat-docker-manifest

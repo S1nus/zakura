@@ -233,6 +233,7 @@ fn transaction(
         network_upgrade: NetworkUpgrade::NuTachyon,
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: candidate_height,
+        zip233_amount: Amount::zero(),
         inputs: vec![transparent::Input::PrevOut {
             outpoint,
             // Push the one-byte OP_TRUE redeem script onto the P2SH script stack.
@@ -335,6 +336,7 @@ mod tests {
             source_height,
             &miner_params,
             Amount::zero(),
+            Some(Amount::zero()),
         )
         .expect("workload coinbase can be built");
         let coinbase = coinbase

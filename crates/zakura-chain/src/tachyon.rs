@@ -134,8 +134,15 @@ impl From<&Tachygram> for [u8; 32] {
 
 impl From<zcash_tachyon::Tachygram> for Tachygram {
     fn from(tachygram: zcash_tachyon::Tachygram) -> Self {
-        let field: halo2::pasta::pallas::Base = tachygram.into();
-        Self(field.into())
+        let mut bytes = Vec::with_capacity(32);
+        tachygram
+            .write(&mut bytes)
+            .expect("serializing a Tachygram into a Vec is infallible");
+        Self(
+            bytes
+                .try_into()
+                .expect("Tachygrams always encode as 32 bytes"),
+        )
     }
 }
 

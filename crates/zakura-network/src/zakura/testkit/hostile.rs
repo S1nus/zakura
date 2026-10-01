@@ -52,11 +52,11 @@ impl HostilePeer {
             .endpoint(seed)
             .await?;
         let victim_addr = victim.node_addr().await;
-        endpoint.add_node_addr(victim_addr.clone())?;
+
         let connection = endpoint.connect(victim_addr, P2P_V2_ALPN).await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Config::default().network);
         config.supported_capabilities = capabilities;
-        let local_peer_id = ZakuraPeerId::new(endpoint.node_id().as_bytes().to_vec())?;
+        let local_peer_id = ZakuraPeerId::new(endpoint.id().as_bytes().to_vec())?;
         run_native_initiator_handshake(&connection, &limits, &config, &local_peer_id).await?;
 
         Ok(Self {
@@ -70,9 +70,7 @@ impl HostilePeer {
 
     /// Return this peer's authenticated Iroh id as Zakura sees it.
     pub fn id(&self) -> Result<ZakuraPeerId, BoxError> {
-        Ok(ZakuraPeerId::new(
-            self.endpoint.node_id().as_bytes().to_vec(),
-        )?)
+        Ok(ZakuraPeerId::new(self.endpoint.id().as_bytes().to_vec())?)
     }
 
     /// Encode and send one canonical protocol-v8 header-sync message.
@@ -500,7 +498,7 @@ impl HostilePeer {
         }
     }
 
-    async fn read_prelude(recv: &mut RecvStream) -> Result<StreamPrelude, BoxError> {
+    pub(crate) async fn read_prelude(recv: &mut RecvStream) -> Result<StreamPrelude, BoxError> {
         let mut bytes = vec![0; 4 + 2 + 2 + 1];
         recv.read_exact(&mut bytes).await?;
         match bytes[8] {
@@ -518,7 +516,10 @@ impl HostilePeer {
         Ok(StreamPrelude::decode(&bytes)?)
     }
 
-    async fn read_frame(recv: &mut RecvStream, max_frame_bytes: u32) -> Result<Frame, BoxError> {
+    pub(crate) async fn read_frame(
+        recv: &mut RecvStream,
+        max_frame_bytes: u32,
+    ) -> Result<Frame, BoxError> {
         let mut header = vec![0; FRAME_HEADER_BYTES];
         recv.read_exact(&mut header).await?;
         let mut reader = std::io::Cursor::new(&header);
@@ -596,7 +597,7 @@ mod tests {
         let server_addr = LocalEndpointFactory::node_addr(router.endpoint()).await;
 
         let client = LocalEndpointFactory::new().endpoint(4041).await?;
-        client.add_node_addr(server_addr.clone())?;
+
         let connection = client.connect(server_addr, TEST_ALPN).await?;
 
         let (_send, mut recv) = connection.accept_bi().await?;

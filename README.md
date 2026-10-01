@@ -43,13 +43,13 @@ initial_mainnet_peers = []
 initial_testnet_peers = []
 listen_addr = "[::]:18233"
 max_connections_per_ip = 1
-network = "Testnet"
 p2p_stack = "dual"
 peerset_initial_target_size = 100
 
-[network.testnet_parameters]
+[network.network]
 network_name = "TachyonTestnet"
 network_magic = [84, 65, 67, 72]
+extend_funding_stream_addresses_as_required = true
 slow_start_interval = 0
 disable_pow = true
 max_block_time_start_height = 1
@@ -58,7 +58,7 @@ lockbox_disbursements = [
     { address = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8", amount = 0 },
 ]
 
-[network.testnet_parameters.activation_heights]
+[network.network.activation_heights]
 Canopy = 1
 NU5 = 2
 NU6 = 3

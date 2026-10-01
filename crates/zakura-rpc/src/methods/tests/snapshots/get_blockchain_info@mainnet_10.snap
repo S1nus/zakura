@@ -63,6 +63,7 @@ expression: info
       "monitored": false
     }
   ],
+  "nsmValueBalanceZat": 0,
   "upgrades": {
     "5ba81b19": {
       "name": "Overwinter",
