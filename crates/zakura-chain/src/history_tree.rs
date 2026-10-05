@@ -34,7 +34,7 @@ use crate::{primitives::zcash_history::V4 as TachyonOnward, tachyon};
 pub enum HistoryTreeError {
     #[error("zcash_history error: {inner:?}")]
     #[non_exhaustive]
-    InnerError { inner: zcash_history::Error },
+    InnerError { inner: zakura_mmr_tree::Error },
 
     #[error("I/O error: {0}")]
     IOError(#[from] io::Error),
@@ -76,7 +76,7 @@ enum InnerHistoryTree {
 pub struct NonEmptyHistoryTree {
     network: Network,
     network_upgrade: NetworkUpgrade,
-    /// Merkle mountain range tree from `zcash_history`.
+    /// Merkle mountain range tree from [`zakura_mmr_tree`].
     /// This is a "runtime" structure used to add / remove nodes, and it's not
     /// persistent.
     inner: InnerHistoryTree,
