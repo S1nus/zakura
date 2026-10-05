@@ -418,3 +418,20 @@ fn cross_build_database_upgrade_history() {
         assert_eq!(restored.current_height(), tree.current_height());
     }
 }
+
+#[test]
+fn legacy_history_entry_keeps_its_unprefixed_bytes() {
+    let inner = std::array::from_fn(|index| {
+        u8::try_from(index).expect("the legacy entry width is less than 256 bytes")
+    });
+    let entry = LegacyEntry { inner };
+    let encoded = bincode::DefaultOptions::new().serialize(&entry).unwrap();
+    assert_eq!(encoded, inner);
+    let decoded: LegacyEntry = bincode::DefaultOptions::new()
+        .deserialize(&encoded)
+        .unwrap();
+    assert_eq!(decoded.inner, inner);
+    assert!(bincode::DefaultOptions::new()
+        .deserialize::<LegacyEntry>(&encoded[..LEGACY_MAX_ENTRY_SIZE - 1])
+        .is_err());
+}
