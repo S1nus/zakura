@@ -6610,7 +6610,7 @@ dependencies = [
 [[package]]
 name = "zakura-address"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "bech32",
  "blake2b_simd",
@@ -6629,7 +6629,7 @@ checksum = "15b9689ad2f9fac6380cccedea80f6df9a289c006057321b77d337565f42f955"
 [[package]]
 name = "zakura-bellman"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "bitvec",
  "blake2s_simd",
@@ -6655,7 +6655,7 @@ dependencies = [
 [[package]]
 name = "zakura-bls12-381"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "ff",
  "group",
@@ -6795,7 +6795,7 @@ dependencies = [
 [[package]]
 name = "zakura-equihash"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "blake2b_simd",
  "corez",
@@ -6804,7 +6804,7 @@ dependencies = [
 [[package]]
 name = "zakura-halo2-gadgets"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "arrayvec",
  "ff",
@@ -6818,12 +6818,12 @@ dependencies = [
 [[package]]
 name = "zakura-halo2-legacy-pdqsort"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 
 [[package]]
 name = "zakura-halo2-poseidon"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "bitvec",
  "ff",
@@ -6834,7 +6834,7 @@ dependencies = [
 [[package]]
 name = "zakura-halo2-proofs"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -7029,7 +7029,7 @@ dependencies = [
 [[package]]
 name = "zakura-jubjub"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "bitvec",
  "ff",
@@ -7042,7 +7042,7 @@ dependencies = [
 [[package]]
 name = "zakura-keys"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "bech32",
  "bs58",
@@ -7120,7 +7120,7 @@ dependencies = [
 [[package]]
 name = "zakura-orchard"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "aes",
  "bitvec",
@@ -7155,7 +7155,7 @@ dependencies = [
 [[package]]
 name = "zakura-pairing"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "group",
 ]
@@ -7178,7 +7178,7 @@ dependencies = [
 [[package]]
 name = "zakura-pasta-curves"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "blake2b_simd",
  "cc",
@@ -7194,7 +7194,7 @@ dependencies = [
 [[package]]
 name = "zakura-primitives"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "blake2b_simd",
  "block-buffer 0.11.0-rc.3",
@@ -7208,7 +7208,7 @@ dependencies = [
  "rand_core 0.10.1",
  "secp256k1",
  "sha2 0.10.9",
- "zakura-equihash 2.2.0 (git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb)",
+ "zakura-equihash 2.2.0 (git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71)",
  "zakura-jubjub 2.2.0",
  "zakura-orchard",
  "zakura-protocol",
@@ -7224,7 +7224,7 @@ dependencies = [
 [[package]]
 name = "zakura-proofs"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "blake2b_simd",
  "group",
@@ -7241,7 +7241,7 @@ dependencies = [
 [[package]]
 name = "zakura-protocol"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "corez",
  "memuse",
@@ -7269,7 +7269,7 @@ dependencies = [
 [[package]]
 name = "zakura-reddsa"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "blake2b_simd",
  "frost-rerandomized",
@@ -7284,7 +7284,7 @@ dependencies = [
 [[package]]
 name = "zakura-redjubjub"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "rand_core 0.10.1",
  "serde",
@@ -7364,7 +7364,7 @@ dependencies = [
 [[package]]
 name = "zakura-sapling-crypto"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "aes",
  "bitvec",
@@ -7414,7 +7414,7 @@ dependencies = [
 [[package]]
 name = "zakura-sinsemilla"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "group",
  "once_cell",
@@ -7528,7 +7528,7 @@ dependencies = [
 [[package]]
 name = "zakura-transparent"
 version = "2.2.0"
-source = "git+https://github.com/zakura-core/common.git?rev=282195c85bcdfc1a3fe9faeb530f5155636d81eb#282195c85bcdfc1a3fe9faeb530f5155636d81eb"
+source = "git+https://github.com/zakura-core/common.git?rev=98fb84a9093de12bbcd189d91d847d1da96b3a71#98fb84a9093de12bbcd189d91d847d1da96b3a71"
 dependencies = [
  "bip32",
  "bs58",
