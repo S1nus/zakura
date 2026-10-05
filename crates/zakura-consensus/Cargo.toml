@@ -21,12 +21,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
-# Production features that activate extra dependencies, or extra features in dependencies
-
-progress-bar = [
-    "howudoin",
-    "zakura-state/progress-bar",
-]
+# Legacy flags accepted for build compatibility; the progress display is removed.
+progress-bar = ["howudoin", "zakura-state/progress-bar"]
+howudoin = []
 
 # Test-only features
 internal-bench = []
@@ -74,8 +71,6 @@ zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1" }
 
 zcash_protocol.workspace = true
 
-# prod feature progress-bar
-howudoin = { workspace = true, optional = true }
 
 # Test-only dependencies
 proptest = { workspace = true, optional = true }
