@@ -95,7 +95,8 @@ download pins the [v1.2.0 release](https://github.com/valargroup/zcashd/releases
 standalone `zcashd` executable by SHA256. The
 split-container mode uses the
 [zakuracore/zcashd v1.2.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
-It differs from stock `zcash/zcash` in three ways:
+Sidecars before v1.2.0 do not support NU7, so they stop following the chain
+when NU7 activates. The build differs from stock `zcash/zcash` in three ways:
 
 1. **P2P sidecar mode is hard-locked.** The binary refuses to start unless
    exactly one `-connect=<zakura-address>` peer is configured. It never opens a
