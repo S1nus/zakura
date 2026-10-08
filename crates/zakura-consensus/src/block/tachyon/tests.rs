@@ -343,6 +343,13 @@ async fn trivial_proof_fails_verification() {
         adjuncts: Vec::new(),
     };
 
+    let transaction = v7_transaction(TachyonBundle::Proven(aggregate.bundle.clone()));
+    assert!(
+        crate::primitives::tachyon::verify_mempool_stamp(transaction.into())
+            .await
+            .is_err()
+    );
+
     let result = crate::primitives::tachyon::verify_proof_stamp(aggregate).await;
     assert!(
         matches!(result, Err(BlockError::TachyonProofInvalid(_))),
@@ -387,6 +394,11 @@ async fn real_mock_proof_passes_verification() {
         bundle,
         adjuncts: Vec::new(),
     };
+
+    let transaction = v7_transaction(TachyonBundle::Proven(aggregate.bundle.clone()));
+    crate::primitives::tachyon::verify_mempool_stamp(transaction.into())
+        .await
+        .expect("mempool proof verification accepts a genuinely proven stamp");
 
     crate::primitives::tachyon::verify_proof_stamp(aggregate)
         .await

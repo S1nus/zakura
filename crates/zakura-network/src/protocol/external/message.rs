@@ -38,6 +38,10 @@ use zakura_chain::serialization::arbitrary::datetime_full;
 #[derive(Clone, Eq, PartialEq, Debug)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum Message {
+    /// Experimental version-1 aggregate dependency request.
+    GetAggregateDependencies(zakura_chain::transaction::WtxId),
+    /// Experimental version-1 aggregate dependency response.
+    AggregateDependencies(zakura_chain::transaction::aggregation::Manifest),
     /// A `version` message.
     ///
     /// Note that although this is called `version` in Bitcoin, its role is really
@@ -474,6 +478,8 @@ impl fmt::Display for Message {
             Message::NotFound(invs) => format!("notfound {{ invs: {} }}", invs.len()),
 
             Message::Mempool => "mempool".to_string(),
+            Message::GetAggregateDependencies(_) => "getaggdeps".to_string(),
+            Message::AggregateDependencies(_) => "aggdeps".to_string(),
         })
     }
 }
@@ -499,6 +505,8 @@ impl Message {
             Message::Tx(_) => "tx",
             Message::NotFound(_) => "notfound",
             Message::Mempool => "mempool",
+            Message::GetAggregateDependencies(_) => "getaggdeps",
+            Message::AggregateDependencies(_) => "aggdeps",
         }
     }
 }

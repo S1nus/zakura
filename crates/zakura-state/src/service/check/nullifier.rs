@@ -202,6 +202,46 @@ pub(crate) fn tx_no_duplicates_in_chain(
         duplicate_ironwood_nullifier_error,
     )?;
 
+    #[cfg(zcash_unstable = "nutachyon")]
+    {
+        let network = finalized_chain.network();
+        let height = non_finalized_chain
+            .filter(|chain| !chain.is_empty())
+            .map(|chain| chain.non_finalized_tip_height())
+            .or_else(|| finalized_chain.finalized_tip_height())
+            .map_or(zakura_chain::block::Height(0), |tip| {
+                (tip + 1).expect("chain tip is below the maximum height")
+            });
+        for tachygram in transaction.tachyon_tachygrams() {
+            if non_finalized_chain.is_some_and(|chain| {
+                chain
+                    .tachyon_tachygrams
+                    .get(&tachygram)
+                    .is_some_and(|heights| {
+                        heights.iter().any(|&revealed| {
+                            zakura_chain::tachyon::within_scan_window(&network, revealed, height)
+                        })
+                    })
+            }) {
+                return Err(ValidateContextError::DuplicateTachyonTachygram {
+                    tachygram,
+                    in_finalized_state: false,
+                });
+            }
+            if finalized_chain
+                .tachyon_tachygram_revealed_height(&tachygram)
+                .is_some_and(|revealed| {
+                    zakura_chain::tachyon::within_scan_window(&network, revealed, height)
+                })
+            {
+                return Err(ValidateContextError::DuplicateTachyonTachygram {
+                    tachygram,
+                    in_finalized_state: true,
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 

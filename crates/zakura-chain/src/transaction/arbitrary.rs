@@ -869,6 +869,8 @@ impl Arbitrary for VerifiedUnminedTx {
                         miner_fee,
                         legacy_sigop_count: sigops,
                         p2sh_sigop_count: p2sh_sigops,
+                        #[cfg(zcash_unstable = "nutachyon")]
+                        tachyon_originals: Vec::new(),
                         conventional_actions,
                         unpaid_actions,
                         fee_weight_ratio,
