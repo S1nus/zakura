@@ -2895,6 +2895,12 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             #[cfg(zcash_unstable = "nutachyon")]
+            ReadRequest::TachyonBlock(hash_or_height) => {
+                read::tachyon::block(state.latest_best_chain(), &state.db, hash_or_height)
+                    .map(ReadResponse::TachyonBlock)
+            }
+
+            #[cfg(zcash_unstable = "nutachyon")]
             ReadRequest::TachyonMiningData {
                 anchors,
                 tachygrams,

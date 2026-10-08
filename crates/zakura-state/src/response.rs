@@ -39,6 +39,25 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// One block's public inputs for constructing Tachyon synchronization proofs.
+#[cfg(zcash_unstable = "nutachyon")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TachyonBlock {
+    /// The complete block, from the selected best chain.
+    pub block: Arc<Block>,
+    /// The block's chain height.
+    pub height: block::Height,
+    /// NuTachyon activation height; epoch numbering starts here.
+    pub activation_height: block::Height,
+    /// Whether this block was finalized when read.
+    pub finalized: bool,
+    /// Anchor before this block's epoch transition and stamps. At activation this is
+    /// Tachyon's epoch-zero entry anchor, not the inactive pool's zero sentinel.
+    pub anchor_before: tachyon::Anchor,
+    /// Consensus-computed anchor after the block.
+    pub anchor_after: tachyon::Anchor,
+}
+
 /// Best-chain data used to aggregate selected autonome Tachyon transactions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg(zcash_unstable = "nutachyon")]
@@ -507,6 +526,11 @@ pub enum ReadResponse {
     #[cfg(zcash_unstable = "nutachyon")]
     TachyonMiningData(Option<TachyonMiningData>),
 
+    /// Response to [`ReadRequest::TachyonBlock`]. `None` means the block is not in
+    /// the selected best chain; missing historical data is an error instead.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonBlock(Option<TachyonBlock>),
+
     /// Response to [`ReadRequest::BlockInfo`] with
     /// the block info after the specified block.
     BlockInfo(Option<BlockInfo>),
@@ -828,7 +852,7 @@ impl TryFrom<ReadResponse> for Response {
             }
 
             #[cfg(zcash_unstable = "nutachyon")]
-            ReadResponse::TachyonMiningData(_) => {
+            ReadResponse::TachyonMiningData(_) | ReadResponse::TachyonBlock(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 

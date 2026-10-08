@@ -1708,6 +1708,12 @@ pub enum ReadRequest {
     /// with the pool values of the current best chain tip.
     TipPoolValues,
 
+    /// Returns [`ReadResponse::TachyonBlock`] with one best-chain block and its
+    /// historical anchors, using one non-finalized chain snapshot. Inactive
+    /// Tachyon, pruned bodies, and unavailable anchor history return errors.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonBlock(HashOrHeight),
+
     /// Returns the chain data needed to aggregate transactions rooted at Tachyon anchors.
     ///
     /// Returns [`ReadResponse::TachyonMiningData`] if `tip_hash` is still the current best-chain
@@ -2230,6 +2236,8 @@ impl ReadRequest {
             ReadRequest::Tip => "tip",
             ReadRequest::FinalizedTip => "finalized_tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
+            #[cfg(zcash_unstable = "nutachyon")]
+            ReadRequest::TachyonBlock(_) => "tachyon_block",
             #[cfg(zcash_unstable = "nutachyon")]
             ReadRequest::TachyonMiningData { .. } => "tachyon_mining_data",
             ReadRequest::BlockInfo(_) => "block_info",
