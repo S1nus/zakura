@@ -48,7 +48,8 @@ futures = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server"] }
 jsonrpsee-types = { workspace = true }
 jsonrpsee-proc-macros = { workspace = true }
-hyper = { workspace = true }
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["service", "tokio"] }
 http-body-util = { workspace = true }
 semver = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -88,9 +89,6 @@ metrics = { workspace = true }
 hex = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["serde_derive"] }
 
-# For the `stop` RPC method.
-nix = { workspace = true, features = ["signal"] }
-
 # For openrpc
 schemars = { workspace = true }
 
@@ -107,7 +105,7 @@ zcash_transparent = { workspace = true }
 zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = [
     "json-conversion",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "10.0.1" }
+zakura-consensus = { path = "../zakura-consensus", version = "11.0.0" }
 zakura-network = { path = "../zakura-network", version = "10.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.0", features = [
     "rpc-client",
@@ -127,9 +125,12 @@ ragu = { workspace = true }
 
 [dev-dependencies]
 blake2b_simd = { workspace = true }
+
+# Preserve response field order when normalizing snapshot JSON.
+serde_json = { workspace = true, features = ["preserve_order"] }
 bytes = { workspace = true }
 http-body = { workspace = true }
-insta = { workspace = true, features = ["redactions", "json", "ron"] }
+insta = { workspace = true, features = ["json", "ron"] }
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-no-provider"] }
 tempfile = { workspace = true }
@@ -142,7 +143,7 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = [
     "proptest-impl",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "10.0.1", features = [
+zakura-consensus = { path = "../zakura-consensus", version = "11.0.0", features = [
     "proptest-impl",
 ] }
 zakura-network = { path = "../zakura-network", version = "10.0.0", features = [
@@ -156,3 +157,7 @@ zakura-test = { path = "../zakura-test", version = "3.0.0" }
 
 [lints]
 workspace = true
+
+# For the `stop` RPC method.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

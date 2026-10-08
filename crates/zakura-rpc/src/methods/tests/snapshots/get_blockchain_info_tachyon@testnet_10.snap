@@ -63,6 +63,7 @@ expression: info
       "monitored": false
     }
   ],
+  "nsmValueBalanceZat": 0,
   "upgrades": {
     "5ba81b19": {
       "name": "Overwinter",
@@ -112,6 +113,11 @@ expression: info
     "37a5165b": {
       "name": "NU6.3",
       "activationheight": 4134000,
+      "status": "pending"
+    },
+    "77190ad9": {
+      "name": "NU7",
+      "activationheight": 4465026,
       "status": "pending"
     }
   },
