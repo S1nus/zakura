@@ -1708,8 +1708,8 @@ mod tests {
     #[cfg(zcash_unstable = "nutachyon")]
     use zcash_tachyon::{
         bundle::Plan as BundlePlan, entropy::ActionEntropy, keys::private,
-        note::CommitmentTrapdoor, nullifier, value, Note, PointerStamp, ProofStamp, TachyonBundle,
-        Unproven,
+        note::CommitmentTrapdoor, nullifier, value, Note, PointerStamp, ProofStamp, Tachygram,
+        TachygramSetPoly, TachyonBundle, Unproven,
     };
 
     use super::*;
@@ -1904,11 +1904,17 @@ mod tests {
         let _init_guard = zakura_test::init();
 
         let coverage = [0x42; 32];
+        let tachygrams = [1u64, 2].map(|value| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&value.to_le_bytes());
+            Tachygram::read(&bytes[..]).expect("a small integer is a canonical field element")
+        });
+        let tachygram_set = tachygrams.iter().copied().collect::<TachygramSetPoly>();
         let bundle = signed_tachyon_bundle().stamp(ProofStamp {
             coverage,
             anchor: zcash_tachyon::Anchor::default(),
-            tachygram_set: zcash_tachyon::TachygramSetCommit::default(),
-            tachygrams: Default::default(),
+            tachygram_set: tachygram_set.commit(),
+            tachygrams: tachygrams.into_iter().collect(),
             proof: Box::new(ragu::Proof::trivial()),
         });
         let transaction_object = transaction_object_with_tachyon(TachyonBundle::Proven(bundle));
@@ -1921,8 +1927,11 @@ mod tests {
             hex::encode(coverage)
         );
         assert_eq!(
-            transaction_json["tachyon"]["stamp"]["tachygrams"],
-            serde_json::json!([])
+            transaction_json["tachyon"]["stamp"]["tachygrams"]
+                .as_array()
+                .expect("the Tachygrams are a JSON array")
+                .len(),
+            2
         );
         assert!(
             !transaction_json["tachyon"]["stamp"]["proof"]

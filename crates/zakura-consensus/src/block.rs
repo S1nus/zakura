@@ -201,6 +201,10 @@ impl VerifyBlockError {
                     consensus("block.tachyon_tachygram_arity_mismatch")
                 }
                 #[cfg(zcash_unstable = "nutachyon")]
+                BlockError::TachyonTachygramSetMismatch => {
+                    consensus("block.tachyon_tachygram_set_mismatch")
+                }
+                #[cfg(zcash_unstable = "nutachyon")]
                 BlockError::TachyonProofInvalid(_) => consensus("block.tachyon_proof_invalid"),
                 BlockError::InvalidHeaderEncoding(_)
                 | BlockError::MissingHeight(_)

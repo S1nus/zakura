@@ -87,15 +87,18 @@ pub fn check_package(transaction: &UnminedTx) -> Result<(), &'static str> {
             }
             carrier = true;
         } else {
-            covered.push(bundle.as_dyn());
+            covered.extend(bundle.descriptors());
         }
     }
     if !carrier {
         return Err("manifest is missing the carrier original");
     }
-    aggregate
+    let covered = aggregate
         .verify_coverage(&covered)
         .map_err(|_| "aggregate coverage mismatch")?;
+    aggregate
+        .verify_tachygrams(covered.len())
+        .map_err(|_| "aggregate Tachygrams mismatch")?;
     check_tachygrams(aggregate)
 }
 

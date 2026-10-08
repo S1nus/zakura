@@ -16,8 +16,14 @@ use zakura_chain::{
 
 fn fixture(height: u32, aggregate: bool) -> UnminedTx {
     use zcash_tachyon::{
-        bundle::Signature, Anchor, Bundle, ProofStamp, TachygramSetPoly, TachyonBundle,
+        bundle::Signature, Anchor, Bundle, ProofStamp, Tachygram, TachygramSetPoly, TachyonBundle,
     };
+    let tachygrams = [1u64, 2].map(|value| {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        Tachygram::read(&bytes[..]).expect("a small integer is a canonical field element")
+    });
+    let tachygram_set = tachygrams.iter().copied().collect::<TachygramSetPoly>();
     let coverage = if aggregate {
         [1; 32]
     } else {
@@ -37,8 +43,8 @@ fn fixture(height: u32, aggregate: bool) -> UnminedTx {
         stamp: ProofStamp {
             coverage,
             anchor: Anchor::read(&[0; 32][..]).unwrap(),
-            tachygram_set: std::iter::empty().collect::<TachygramSetPoly>().commit(),
-            tachygrams: Default::default(),
+            tachygram_set: tachygram_set.commit(),
+            tachygrams: tachygrams.into_iter().collect(),
             proof: Box::new(ragu::Proof::trivial()),
         },
     };

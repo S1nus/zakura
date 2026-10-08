@@ -804,6 +804,10 @@ pub enum BlockError {
     #[cfg(zcash_unstable = "nutachyon")]
     TachyonTachygramArityMismatch,
 
+    #[error("a Tachyon proof stamp's Tachygram commitment must match its published Tachygrams")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonTachygramSetMismatch,
+
     #[error("a Tachyon proof stamp must verify: {0}")]
     #[cfg(zcash_unstable = "nutachyon")]
     TachyonProofInvalid(String),
@@ -852,6 +856,7 @@ impl BlockError {
             | TachyonCoverageMismatch
             | TachyonDuplicateAction
             | TachyonTachygramArityMismatch
+            | TachyonTachygramSetMismatch
             | TachyonProofInvalid(_) => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             _other => 0,
