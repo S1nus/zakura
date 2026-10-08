@@ -437,6 +437,19 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
                 && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()))
 }
 
+/// Return whether a selected repair can add input to, or replace input in, one header's bucket.
+fn repair_bucket_admits(
+    engine: &HeaderChainEngine,
+    hash: block::Hash,
+    limits: zakura_header_chain::EngineLimits,
+) -> bool {
+    let deliveries = engine.aux_deliveries(hash);
+    deliveries.len() < limits.max_aux_deliveries_per_header.get()
+        || deliveries
+            .iter()
+            .any(|delivery| !delivery.is_authenticated())
+}
+
 fn auxiliary_rows_are_coherent(
     indexed_ids: &[EvidenceId],
     deliveries: &[AuxDelivery],
@@ -1797,7 +1810,9 @@ impl HeaderChainReader {
             admission_capacity_available,
             &durable_rows,
         )?;
-        if !durable_rows.is_empty() || !admission_capacity_available {
+        if zakura_header_chain::VctRepairContext::rows_constrain_repair(&durable_rows)
+            || !admission_capacity_available
+        {
             return Ok(Some(context));
         }
 
@@ -1858,7 +1873,9 @@ impl HeaderChainReader {
                 )
                 .into());
             }
-            if !candidate_rows.is_empty() {
+            if zakura_header_chain::VctRepairContext::rows_constrain_repair(&candidate_rows)
+                || !repair_bucket_admits(&engine, candidate.hash, self.config.limits)
+            {
                 break;
             }
             suffix.push(candidate);
@@ -3094,8 +3111,15 @@ impl HeaderChainRuntime {
                     &durable_rows_by_target[0],
                 )?;
                 if repair_range.len() > 1 {
-                    if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
-                        || before.alarms.resource_stalled
+                    if durable_rows_by_target.iter().any(|rows| {
+                        zakura_header_chain::VctRepairContext::rows_constrain_repair(rows)
+                    }) || repair_range.iter().any(|target| {
+                        !repair_bucket_admits(
+                            &transition_engine,
+                            target.hash,
+                            context.config.limits,
+                        )
+                    }) || before.alarms.resource_stalled
                     {
                         return Ok(ApplyResult::Stale(StaleReceipt {
                             current_version: before.state_version,
@@ -3104,8 +3128,9 @@ impl HeaderChainRuntime {
                     }
                     current = current
                         .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
-                } else if durable_rows_by_target[0].is_empty()
-                    && current.admission_capacity_available
+                } else if !zakura_header_chain::VctRepairContext::rows_constrain_repair(
+                    &durable_rows_by_target[0],
+                ) && current.admission_capacity_available
                     && current.episode != episode
                 {
                     current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
