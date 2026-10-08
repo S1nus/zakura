@@ -156,7 +156,7 @@ impl Anchor {
     ) -> Result<AnchorAdvance, zcash_tachyon::AnchorError> {
         use zcash_tachyon::TachyonBundle;
 
-        let epoch = zcash_tachyon::EpochIndex(epoch_of_pool_height(pool_height));
+        let epoch = zcash_tachyon::EpochIndex::new(epoch_of_pool_height(pool_height));
         let mut anchor = if pool_height == 0 {
             zcash_tachyon::Anchor::default()
         } else {

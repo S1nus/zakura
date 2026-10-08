@@ -196,7 +196,7 @@ fn coverage_mismatch_is_rejected() {
 
     let block = block_with(vec![v7_transaction(TachyonBundle::Proven(proven_bundle(
         vec![dummy_action()],
-        vec![],
+        vec![tachygram(1), tachygram(2)],
         // Deliberately not the digest of the bundle's actions.
         [0u8; 32],
     )))]);
@@ -204,6 +204,28 @@ fn coverage_mismatch_is_rejected() {
     assert_eq!(
         coherence(&block).err(),
         Some(BlockError::TachyonCoverageMismatch)
+    );
+}
+
+/// A proof stamp whose carried Tachygram commitment does not match its published Tachygrams is
+/// rejected before proof verification.
+#[test]
+fn tachygram_set_mismatch_is_rejected() {
+    let _init_guard = zakura_test::init();
+
+    let action = dummy_action();
+    let digest = action_descriptor_digest(&[action.descriptor()]);
+    let mut bundle = proven_bundle(vec![action], vec![tachygram(1), tachygram(2)], digest);
+    bundle.stamp.tachygram_set = [tachygram(3), tachygram(4)]
+        .into_iter()
+        .collect::<TachygramSetPoly>()
+        .commit();
+
+    let block = block_with(vec![v7_transaction(TachyonBundle::Proven(bundle))]);
+
+    assert_eq!(
+        coherence(&block).err(),
+        Some(BlockError::TachyonTachygramSetMismatch)
     );
 }
 
@@ -274,7 +296,7 @@ fn aggregate_with_adjunct_passes_coherence() {
             panic!("adjunct transaction bundle is pointer-stamped");
         };
         aggregate
-            .verify_coverage(&[adjunct.as_dyn()])
+            .verify_coverage(&adjunct.descriptors().collect::<Vec<_>>())
             .expect("hand-rolled action_descriptor_digest must not drift from the tachyon crate");
     }
 
