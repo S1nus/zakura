@@ -61,6 +61,13 @@ mod tests;
 ///     chain in the correct order.)
 const UTXO_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 60);
 
+/// Maximum pending state lookups per block transaction, not across the verifier.
+///
+/// Concurrent lookups start their timeout clocks together. During out-of-order sync,
+/// a later input can therefore time out sooner than with serial lookups. The existing
+/// sync restart recovers missing ancestors, as described on `UTXO_LOOKUP_TIMEOUT`.
+const MAX_CONCURRENT_UTXO_LOOKUPS: usize = 64;
+
 /// A timeout applied to output lookup requests sent to the mempool. This is shorter than the
 /// timeout for the state UTXO lookups because a block is likely to be mined every 75 seconds
 /// after Blossom is active, changing the best chain tip and requiring re-verification of transactions
@@ -210,7 +217,7 @@ pub enum Response {
         /// will be checked during contextual validation.
         tx_id: UnminedTxId,
 
-        /// The miner fee for this transaction.
+        /// The full transaction fee before the block's aggregate NSM fee split.
         ///
         /// `None` for coinbase transactions.
         ///
@@ -372,7 +379,7 @@ impl Response {
         }
     }
 
-    /// The miner fee for the transaction in this response.
+    /// The full transaction fee before the block's aggregate NSM fee split.
     ///
     /// Coinbase transactions do not have a miner fee,
     /// and they don't need UTXOs to calculate their value balance,
@@ -463,6 +470,16 @@ where
                 Ok(()) => {}
             }
             check::sapling_point_encodings_are_valid(&tx)?;
+
+            // A transaction whose own shielded counts exceed a per-block ZIP 218
+            // limit can never be mined, so reject it on submission. ZIP 218 does
+            // not specify this rejection. The error's mempool misbehavior score
+            // is 100.
+            crate::block::check::shielded_action_limits_are_valid(
+                std::iter::once(&tx),
+                req.height(),
+                &network,
+            )?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.
             //
@@ -765,9 +782,15 @@ where
         spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
     ) -> Result<Amount<NonNegative>, TransactionError> {
         match tx.value_balance(spent_utxos) {
-            Ok(value_balance) => value_balance
-                .remaining_transaction_value()
-                .map_err(|_| TransactionError::IncorrectFee),
+            Ok(value_balance) => {
+                let fee = value_balance
+                    .remaining_transaction_value()
+                    .map_err(|_| TransactionError::IncorrectFee)?;
+                #[cfg(zcash_unstable = "nutachyon")]
+                let fee = (fee - tx.zip233_amount()).map_err(|_| TransactionError::IncorrectFee)?;
+
+                Ok(fee)
+            }
             Err(_) => Err(TransactionError::IncorrectFee),
         }
     }
@@ -806,6 +829,7 @@ where
         let mut spent_outputs: Vec<Option<transparent::Output>> = vec![None; inputs.len()];
         // Stores (input_idx, outpoint) for UTXOs not found in the best chain (fetched from mempool later).
         let mut spent_mempool_outpoints: Vec<(usize, transparent::OutPoint)> = Vec::new();
+        let mut block_outpoints_to_lookup = Vec::new();
 
         for (input_idx, input) in inputs.iter().enumerate() {
             if let transparent::Input::PrevOut { outpoint, .. } = input {
@@ -832,26 +856,64 @@ where
 
                     utxo
                 } else {
-                    let response = state
-                        .clone()
-                        .oneshot(zakura_state::Request::AwaitUtxo(*outpoint))
-                        .await
-                        .map_err(|boxed_error| match boxed_error.downcast::<Elapsed>() {
-                            Ok(_) => TransactionError::TransparentInputNotFound,
-                            Err(boxed_error) => TransactionError::from(boxed_error),
-                        })?;
-
-                    if let zakura_state::Response::Utxo(utxo) = response {
-                        utxo
-                    } else {
-                        unreachable!("AwaitUtxo always responds with Utxo")
-                    }
+                    block_outpoints_to_lookup.push((input_idx, *outpoint));
+                    continue;
                 };
                 tracing::trace!(?utxo, "got UTXO");
                 spent_outputs[input_idx] = Some(utxo.output.clone());
                 spent_utxos.insert(*outpoint, utxo);
             } else {
                 continue;
+            }
+        }
+
+        if !block_outpoints_to_lookup.is_empty() {
+            let single_lookup = block_outpoints_to_lookup.len() == 1;
+            // The verifier keeps one pending admission wait per transaction and overlaps responses.
+            // Queuing 64 readiness waits per transaction delays unrelated state requests.
+            #[allow(clippy::async_yields_async)] // Admission and response need separate awaits.
+            let lookups =
+                futures::stream::iter(block_outpoints_to_lookup)
+                    .then(move |(input_idx, outpoint)| {
+                        let mut state = state.clone();
+                        async move {
+                            let response = state
+                                .ready()
+                                .await
+                                .map(|state| state.call(zs::Request::AwaitUtxo(outpoint)));
+                            async move {
+                                let response = match response {
+                                    Ok(response) => response.await,
+                                    Err(error) => Err(error),
+                                }
+                                .map_err(|boxed_error| match boxed_error.downcast::<Elapsed>() {
+                                    Ok(_) => TransactionError::TransparentInputNotFound,
+                                    Err(boxed_error) => TransactionError::from(boxed_error),
+                                })?;
+
+                                let zs::Response::Utxo(utxo) = response else {
+                                    unreachable!("AwaitUtxo always responds with Utxo")
+                                };
+                                Ok::<_, TransactionError>((input_idx, outpoint, utxo))
+                            }
+                        }
+                    })
+                    .boxed();
+            // A single lookup cannot overlap another lookup, so skip the concurrency queue.
+            let lookups = if single_lookup {
+                lookups.then(std::convert::identity).left_stream()
+            } else {
+                lookups
+                    .buffer_unordered(MAX_CONCURRENT_UTXO_LOOKUPS)
+                    .right_stream()
+            };
+            futures::pin_mut!(lookups);
+
+            while let Some(result) = lookups.next().await {
+                let (input_idx, outpoint, utxo) = result?;
+                tracing::trace!(?utxo, "got UTXO");
+                spent_outputs[input_idx] = Some(utxo.output.clone());
+                spent_utxos.insert(outpoint, utxo);
             }
         }
 
@@ -953,7 +1015,7 @@ where
         let tx = request.transaction();
         let nu = request.upgrade(network);
 
-        Self::verify_v4_transaction_network_upgrade(&tx, nu)?;
+        Self::verify_v4_transaction_network_upgrade(&tx, network, request.height(), nu)?;
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
 
@@ -970,11 +1032,33 @@ where
         .and(Self::verify_sapling_bundle(sapling_bundle, &sighash, tx_id)))
     }
 
-    /// Verifies if a V4 `transaction` is supported by `network_upgrade`.
+    /// Verifies if a V4 `transaction` is supported by `network_upgrade` at
+    /// `height` on `network`.
     fn verify_v4_transaction_network_upgrade(
         transaction: &Transaction,
+        network: &Network,
+        height: block::Height,
         network_upgrade: NetworkUpgrade,
     ) -> Result<(), TransactionError> {
+        // # Consensus
+        //
+        // > [NU7 onward] The transaction version number MUST be 5 or 6.
+        //
+        // https://zips.z.cash/zip-2003
+        //
+        // `activation_height` falls back to the next upgrade's height when this
+        // network omits NU7. The only later upgrade is `ZFuture`, which exists
+        // only under `cfg(zcash_unstable = "zfuture")`.
+        if NetworkUpgrade::Nu7
+            .activation_height(network)
+            .is_some_and(|nu7_height| height >= nu7_height)
+        {
+            return Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            ));
+        }
+
         match network_upgrade {
             // Supports V4 transactions
             //
@@ -999,7 +1083,8 @@ where
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
-            | NetworkUpgrade::Nu6_3 => Ok(()),
+            | NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::Nu7 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -1007,8 +1092,7 @@ where
             // Does not support V4 transactions
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
-            | NetworkUpgrade::Overwinter
-            | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            | NetworkUpgrade::Overwinter => Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
             )),
@@ -1490,8 +1574,11 @@ impl AsyncChecks {
 
     /// Wait until all checks in the set finish.
     ///
-    /// If any of the checks fail, this method immediately returns the error and cancels all other
-    /// checks by dropping them.
+    /// Returns the first error, once every check has finished. Dropping a check does not stop the
+    /// batch work its request already dispatched, so returning early would report completion
+    /// while that work is still running. A caller that bounds its compute on this response reads
+    /// completion literally, and the wait costs nothing extra: the batches are already queued, and
+    /// the batch verifiers flush them on their own latency bound at the latest.
     async fn check(
         mut self,
         block_batch_flush_key: Option<primitives::BlockVerifierBatchFlushKey>,
@@ -1508,6 +1595,7 @@ impl AsyncChecks {
 
         // Wait for all asynchronous checks to complete
         // successfully, or fail verification if they error.
+        let mut first_error = None;
         loop {
             tokio::select! {
                 biased;
@@ -1518,11 +1606,16 @@ impl AsyncChecks {
                             block_batch_flush.await;
                         }
 
-                        return Ok(());
+                        return match first_error {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        };
                     };
 
                     tracing::trace!(?check, remaining = self.0.len());
-                    check?;
+                    if let Err(error) = check {
+                        first_error.get_or_insert(error);
+                    }
                 }
 
                 () = &mut block_batch_flush, if needs_block_batch_flush => {

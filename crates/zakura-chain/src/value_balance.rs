@@ -7,8 +7,10 @@ use core::fmt;
 #[cfg(any(test, feature = "proptest-impl"))]
 use std::{borrow::Borrow, collections::HashMap};
 
+use crate::amount::MAX_MONEY;
+
 #[cfg(any(test, feature = "proptest-impl"))]
-use crate::{amount::MAX_MONEY, transaction::Transaction, transparent};
+use crate::{transaction::Transaction, transparent};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -19,9 +21,9 @@ mod tests;
 use ValueBalanceError::*;
 
 #[cfg(not(zcash_unstable = "nutachyon"))]
-const VALUE_BALANCE_BYTES: usize = 48;
-#[cfg(zcash_unstable = "nutachyon")]
 const VALUE_BALANCE_BYTES: usize = 56;
+#[cfg(zcash_unstable = "nutachyon")]
+const VALUE_BALANCE_BYTES: usize = 64;
 
 /// A balance in each chain value pool or transaction value pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -32,6 +34,10 @@ pub struct ValueBalance<C> {
     orchard: Amount<C>,
     deferred: Amount<C>,
     ironwood: Amount<C>,
+    /// Historical unclaimed issuance plus scheduled issuance minus issued value since NU7.
+    /// This accounting counter funds reissuance but holds no spendable value.
+    /// Monetary totals exclude it. Contextual validation rejects negative balances from NU7.
+    nsm_value_balance: Amount<NegativeAllowed>,
     #[cfg(zcash_unstable = "nutachyon")]
     tachyon: Amount<C>,
 }
@@ -163,6 +169,20 @@ where
         self
     }
 
+    /// Returns the [`ValueBalance::nsm_value_balance`] amount.
+    pub fn nsm_value_balance_amount(&self) -> Amount<NegativeAllowed> {
+        self.nsm_value_balance
+    }
+
+    /// Sets the [`ValueBalance::nsm_value_balance`] amount without affecting other amounts.
+    pub fn set_nsm_value_balance_amount(
+        &mut self,
+        nsm_value_balance: Amount<NegativeAllowed>,
+    ) -> &Self {
+        self.nsm_value_balance = nsm_value_balance;
+        self
+    }
+
     /// Get the Tachyon amount from the [`ValueBalance`].
     #[cfg(zcash_unstable = "nutachyon")]
     pub fn tachyon_amount(&self) -> Amount<C> {
@@ -186,9 +206,36 @@ where
             orchard: zero,
             deferred: zero,
             ironwood: zero,
+            nsm_value_balance: Amount::zero(),
             #[cfg(zcash_unstable = "nutachyon")]
             tachyon: zero,
         }
+    }
+
+    /// Returns the sum of all value pool balances.
+    ///
+    /// Returns an error if the final sum does not satisfy the amount constraint `C`.
+    /// Signed balances are summed before applying that constraint.
+    ///
+    /// [`ValueBalance::nsm_value_balance`] is excluded: it holds value that is in no pool,
+    /// so adding it would overstate the monetary base this sum is used to bound.
+    pub fn total(self) -> Result<Amount<C>, amount::Error> {
+        let total: i128 = [
+            self.transparent,
+            self.sprout,
+            self.sapling,
+            self.orchard,
+            self.deferred,
+            self.ironwood,
+        ]
+        .into_iter()
+        .map(|amount| i128::from(amount.zatoshis()))
+        .sum();
+
+        #[cfg(zcash_unstable = "nutachyon")]
+        let total = total + i128::from(self.tachyon.zatoshis());
+
+        Amount::try_from(total)
     }
 
     /// Convert this value balance to a different ValueBalance type,
@@ -204,6 +251,9 @@ where
             orchard: self.orchard.constrain().map_err(Orchard)?,
             deferred: self.deferred.constrain().map_err(Deferred)?,
             ironwood: self.ironwood.constrain().map_err(Ironwood)?,
+            // The balance is signed in every `ValueBalance`, so it survives the conversion
+            // unchanged.
+            nsm_value_balance: self.nsm_value_balance,
             #[cfg(zcash_unstable = "nutachyon")]
             tachyon: self.tachyon.constrain().map_err(Tachyon)?,
         })
@@ -344,7 +394,8 @@ impl ValueBalance<NonNegative> {
     /// <https://developer.bitcoin.org/devguide/transactions.html#transaction-fees-and-change>
     ///
     /// We implement the consensus rules above by constraining the returned value balance to
-    /// [`ValueBalance<NonNegative>`].
+    /// [`ValueBalance<NonNegative>`]. The sum of all returned pool balances must also fit
+    /// within `MAX_MONEY` as an additional accounting safeguard.
     #[allow(clippy::unwrap_in_result)]
     pub fn add_chain_value_pool_change(
         self,
@@ -355,26 +406,124 @@ impl ValueBalance<NonNegative> {
             .expect("conversion from NonNegative to NegativeAllowed is always valid");
         chain_value_pool = (chain_value_pool + chain_value_pool_change)?;
 
-        chain_value_pool.constrain()
+        let chain_value_pool = chain_value_pool.constrain::<NonNegative>()?;
+
+        // Bound the total monetary base as defence in depth.
+        chain_value_pool.total().map_err(ValueBalanceError::Total)?;
+
+        Ok(chain_value_pool)
+    }
+
+    /// Derives the seed from the monetary pools at the supplied pre-NU7 height.
+    /// Public networks check the result against their measured consensus seed.
+    /// Configured networks can override the seed for synthetic histories.
+    pub fn initial_nsm_value_balance(
+        &self,
+        height: crate::block::Height,
+        network: &crate::parameters::Network,
+    ) -> Result<Amount<NonNegative>, ValueBalanceError> {
+        use crate::parameters::{
+            subsidy::{scheduled_issuance_zatoshis, ParameterSubsidy, SubsidyError},
+            Network,
+        };
+
+        let public = match network {
+            Network::Mainnet => true,
+            Network::Testnet(params) => {
+                if params.is_default_testnet() {
+                    true
+                } else if let Some(seed) = params.configured_initial_nsm_value_balance() {
+                    return Ok(seed);
+                } else {
+                    false
+                }
+            }
+        };
+        let scheduled = scheduled_issuance_zatoshis(height, network).map_err(ScheduledIssuance)?;
+        let scheduled =
+            i128::try_from(scheduled).map_err(|_| ScheduledIssuance(SubsidyError::Overflow))?;
+        // total() excludes the NSM balance, including during migration retries.
+        let issued = i128::from(i64::from(self.total().map_err(Total)?));
+        let seed = i64::try_from(scheduled - issued)
+            .map_err(|_| ScheduledIssuance(SubsidyError::Overflow))?;
+        let seed = Amount::<NonNegative>::try_from(seed).map_err(NsmValueBalance)?;
+        if public && seed != network.initial_nsm_value_balance() {
+            return Err(NsmSeedMismatch {
+                derived: seed,
+                expected: network.initial_nsm_value_balance(),
+            });
+        }
+        Ok(seed)
+    }
+
+    /// Initializes the NSM balance after applying the last pre-NU7 block's monetary changes.
+    /// No other height changes the NSM balance here, including NU7 at genesis.
+    pub fn seed_nsm_value_balance(
+        mut self,
+        height: crate::block::Height,
+        network: &crate::parameters::Network,
+    ) -> Result<Self, ValueBalanceError> {
+        if crate::parameters::NetworkUpgrade::Nu7
+            .activation_height(network)
+            .and_then(|activation| activation.0.checked_sub(1))
+            == Some(height.0)
+        {
+            self.nsm_value_balance = self
+                .initial_nsm_value_balance(height, network)?
+                .constrain()
+                .map_err(NsmValueBalance)?;
+        }
+        Ok(self)
+    }
+
+    /// Returns `IssuedSupply` from [protocol specification §4.17][4.17]: the total value
+    /// across every chain value pool.
+    ///
+    /// [4.17]: https://zips.z.cash/protocol/protocol.pdf#chainvaluepoolbalances
+    pub fn issued_supply(&self) -> Amount<NonNegative> {
+        (self.transparent
+            + self.sprout
+            + self.sapling
+            + self.orchard
+            + self.ironwood
+            + self.deferred)
+            .expect("consensus rules bound the issued supply by MAX_MONEY")
+    }
+
+    /// Returns the [ZIP 234] money reserve: `MAX_MONEY - IssuedSupply`.
+    ///
+    /// The money reserve is the value that has never been issued or is otherwise outside
+    /// the chain value pools.
+    ///
+    /// [ZIP 234]: https://zips.z.cash/zip-0234
+    pub fn money_reserve(&self) -> Amount<NonNegative> {
+        let max_money =
+            Amount::<NonNegative>::try_from(MAX_MONEY).expect("MAX_MONEY is a valid amount");
+
+        (max_money - self.issued_supply())
+            .expect("consensus rules bound the issued supply by MAX_MONEY")
     }
 
     /// Create a fake value pool for testing purposes.
     ///
-    /// The resulting [`ValueBalance`] will have half of the MAX_MONEY amount on each pool.
+    /// The resulting [`ValueBalance`] has `MAX_MONEY / 8` on the transparent, Sprout, Sapling,
+    /// Orchard, and Ironwood pools; the deferred pool is zero. This keeps the total within the
+    /// valid `Amount` range (see [`ValueBalance::total`]), while leaving headroom for value pool
+    /// changes that tests commit on top of it.
     #[cfg(any(test, feature = "proptest-impl"))]
     pub fn fake_populated_pool() -> ValueBalance<NonNegative> {
         let mut fake_value_pool = ValueBalance::zero();
 
         let fake_transparent_value_balance =
-            ValueBalance::from_transparent_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_transparent_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
         let fake_sprout_value_balance =
-            ValueBalance::from_sprout_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_sprout_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
         let fake_sapling_value_balance =
-            ValueBalance::from_sapling_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_sapling_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
         let fake_orchard_value_balance =
-            ValueBalance::from_orchard_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_orchard_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
         let fake_ironwood_value_balance =
-            ValueBalance::from_ironwood_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+            ValueBalance::from_ironwood_amount(Amount::try_from(MAX_MONEY / 8).unwrap());
 
         fake_value_pool.set_transparent_value_balance(fake_transparent_value_balance);
         fake_value_pool.set_sprout_value_balance(fake_sprout_value_balance);
@@ -387,8 +536,9 @@ impl ValueBalance<NonNegative> {
 
     /// To byte array
     ///
-    /// New pools are appended in activation order, so older records remain parsable by
-    /// [`Self::from_bytes`].
+    /// Each leg is appended after the last, so records written by earlier versions remain
+    /// parsable by [`Self::from_bytes`]. `nsm_value_balance` is at 48..56, and Tachyon is at
+    /// 56..64 when enabled.
     pub fn to_bytes(self) -> [u8; VALUE_BALANCE_BYTES] {
         match [
             self.transparent.to_bytes(),
@@ -397,6 +547,7 @@ impl ValueBalance<NonNegative> {
             self.orchard.to_bytes(),
             self.deferred.to_bytes(),
             self.ironwood.to_bytes(),
+            self.nsm_value_balance.to_bytes(),
             #[cfg(zcash_unstable = "nutachyon")]
             self.tachyon.to_bytes(),
         ]
@@ -412,15 +563,20 @@ impl ValueBalance<NonNegative> {
 
     /// From byte array
     ///
-    /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-`ironwood`), 48-byte (pre-`tachyon`),
-    /// and 56-byte records; missing trailing pools default to zero.
+    /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-`ironwood`), 48-byte
+    /// (pre-`nsm_value_balance`), 56-byte (pre-Tachyon), and 64-byte records when Tachyon is
+    /// enabled; missing trailing pools default to zero.
+    ///
+    /// A zero `nsm_value_balance` on a shorter record is a placeholder, not the real balance.
+    /// The `nsm_value_balance_pool` database upgrade recomputes it from the halving schedule
+    /// and the stored pools before any block reads it.
     #[allow(clippy::unwrap_in_result)]
     pub fn from_bytes(bytes: &[u8]) -> Result<ValueBalance<NonNegative>, ValueBalanceError> {
         let bytes_length = bytes.len();
 
         // Return an error early if bytes don't have the right length instead of panicking later.
-        let valid_length = matches!(bytes_length, 32 | 40 | 48)
-            || cfg!(zcash_unstable = "nutachyon") && bytes_length == 56;
+        let valid_length = matches!(bytes_length, 32 | 40 | 48 | 56)
+            || cfg!(zcash_unstable = "nutachyon") && bytes_length == 64;
         if !valid_length {
             return Err(Unparsable);
         }
@@ -455,7 +611,7 @@ impl ValueBalance<NonNegative> {
 
         let deferred = match bytes_length {
             32 => Amount::zero(),
-            40 | 48 | 56 => Amount::from_bytes(
+            40 | 48 | 56 | 64 => Amount::from_bytes(
                 bytes[32..40]
                     .try_into()
                     .expect("deferred amount should be parsable"),
@@ -466,7 +622,7 @@ impl ValueBalance<NonNegative> {
 
         let ironwood = match bytes_length {
             32 | 40 => Amount::zero(),
-            48 | 56 => Amount::from_bytes(
+            48 | 56 | 64 => Amount::from_bytes(
                 bytes[40..48]
                     .try_into()
                     .expect("ironwood amount should be parsable"),
@@ -475,11 +631,22 @@ impl ValueBalance<NonNegative> {
             _ => return Err(Unparsable),
         };
 
+        let nsm_value_balance = match bytes_length {
+            32 | 40 | 48 => Amount::zero(),
+            56 | 64 => Amount::from_bytes(
+                bytes[48..56]
+                    .try_into()
+                    .expect("NSM value balance amount should be parsable"),
+            )
+            .map_err(NsmValueBalance)?,
+            _ => return Err(Unparsable),
+        };
+
         #[cfg(zcash_unstable = "nutachyon")]
         let tachyon = match bytes_length {
-            32 | 40 | 48 => Amount::zero(),
-            56 => Amount::from_bytes(
-                bytes[48..56]
+            32 | 40 | 48 | 56 => Amount::zero(),
+            64 => Amount::from_bytes(
+                bytes[56..64]
                     .try_into()
                     .expect("tachyon amount should be parsable"),
             )
@@ -494,6 +661,7 @@ impl ValueBalance<NonNegative> {
             orchard,
             deferred,
             ironwood,
+            nsm_value_balance,
             #[cfg(zcash_unstable = "nutachyon")]
             tachyon,
         })
@@ -521,9 +689,29 @@ pub enum ValueBalanceError {
     /// ironwood amount error {0}
     Ironwood(amount::Error),
 
+    /// NSM value balance amount error {0}
+    NsmValueBalance(amount::Error),
+
+    /// the derived NSM seed differs from the expected public-network seed
+    NsmSeedMismatch {
+        /// Seed derived from cumulative issuance and monetary pools.
+        derived: Amount<NonNegative>,
+        /// Expected seed measured from the public network.
+        expected: Amount<NonNegative>,
+    },
+
+    /// scheduled issuance calculation failed: {0}
+    ScheduledIssuance(crate::parameters::subsidy::SubsidyError),
+
+    /// the block has no coinbase height, so its NSM value balance change is undefined
+    MissingCoinbaseHeight,
+
     /// Tachyon amount error {0}
     #[cfg(zcash_unstable = "nutachyon")]
     Tachyon(amount::Error),
+
+    /// total amount error {0}
+    Total(amount::Error),
 
     /// ValueBalance is unparsable
     Unparsable,
@@ -538,8 +726,18 @@ impl fmt::Display for ValueBalanceError {
             Orchard(e) => format!("orchard amount err: {e}"),
             Deferred(e) => format!("deferred amount err: {e}"),
             Ironwood(e) => format!("ironwood amount err: {e}"),
+            NsmValueBalance(e) => format!("NSM value balance amount err: {e}"),
+            NsmSeedMismatch { derived, expected } => {
+                format!("derived NSM seed {derived:?} does not match expected {expected:?}")
+            }
+            ScheduledIssuance(e) => format!("scheduled issuance calculation failed: {e}"),
+            MissingCoinbaseHeight => {
+                "block has no coinbase height, so its NSM value balance change is undefined"
+                    .to_string()
+            }
             #[cfg(zcash_unstable = "nutachyon")]
             Tachyon(e) => format!("tachyon amount err: {e}"),
+            Total(e) => format!("total amount err: {e}"),
             Unparsable => "value balance is unparsable".to_string(),
         })
     }
@@ -558,6 +756,8 @@ where
             orchard: (self.orchard + rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred + rhs.deferred).map_err(Deferred)?,
             ironwood: (self.ironwood + rhs.ironwood).map_err(Ironwood)?,
+            nsm_value_balance: (self.nsm_value_balance + rhs.nsm_value_balance)
+                .map_err(NsmValueBalance)?,
             #[cfg(zcash_unstable = "nutachyon")]
             tachyon: (self.tachyon + rhs.tachyon).map_err(Tachyon)?,
         })
@@ -610,6 +810,8 @@ where
             orchard: (self.orchard - rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred - rhs.deferred).map_err(Deferred)?,
             ironwood: (self.ironwood - rhs.ironwood).map_err(Ironwood)?,
+            nsm_value_balance: (self.nsm_value_balance - rhs.nsm_value_balance)
+                .map_err(NsmValueBalance)?,
             #[cfg(zcash_unstable = "nutachyon")]
             tachyon: (self.tachyon - rhs.tachyon).map_err(Tachyon)?,
         })
@@ -682,6 +884,7 @@ where
             orchard: self.orchard.neg(),
             deferred: self.deferred.neg(),
             ironwood: self.ironwood.neg(),
+            nsm_value_balance: self.nsm_value_balance.neg(),
             #[cfg(zcash_unstable = "nutachyon")]
             tachyon: self.tachyon.neg(),
         }

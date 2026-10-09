@@ -18,7 +18,11 @@ pub use zakura_header_chain::{
 /// Maximum simultaneous retained target-path leases.
 pub const MAX_RETAINED_PATH_LEASES: usize = zakura_header_chain::MAX_STAGED_TARGETS_V1;
 
-/// Opaque state-owned lease for one exact canonical target path.
+/// Opaque state-owned cursor for one exact canonical target path.
+///
+/// This lease reserves serving capacity, but does not prevent retention from evicting the path.
+/// A successful page read consumes the lease before returning its coherent snapshot.
+/// State may cache the hash index for a later continuation without retaining the path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetainedPathLease {
     /// Monotonic process-local lease identity.
@@ -48,8 +52,10 @@ pub enum RetainedPathLeaseOutcome {
     NoLocatorIntersection,
     /// The target path cannot reach retained history.
     HistoryPruned,
-    /// A per-peer or global lease resource bound refused the request.
+    /// State refused the request without a capacity notification.
     Busy,
+    /// A per-peer or global lease resource bound refused the request.
+    CapacityBusy(zakura_node_services::header_chain::ServingCapacitySignal),
 }
 
 /// One hash-keyed lease page, independent of the current selected projection.
@@ -71,12 +77,12 @@ pub struct RetainedPathPage {
     pub complete: bool,
 }
 
-/// Result of reading or renewing an existing retained path.
+/// Result of consuming a retained path lease for one page.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetainedPathReadOutcome {
-    /// State read a bounded page and renewed the lease deadline.
+    /// State read a bounded page and released the serving capacity.
     Page(Box<RetainedPathPage>),
-    /// The lease is absent or expired.
+    /// The lease is absent or expired, or its path was pruned.
     /// A replacement session might own the lease.
     Unavailable,
 }

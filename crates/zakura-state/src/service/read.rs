@@ -22,6 +22,9 @@ pub mod find;
 pub mod historical_tree;
 pub mod tree;
 
+#[cfg(zcash_unstable = "nutachyon")]
+pub(crate) mod tachyon;
+
 #[cfg(test)]
 mod tests;
 
@@ -32,8 +35,8 @@ pub use address::{
 };
 pub use block::{
     any_block, any_transaction, any_utxo, block, block_and_size, block_header, block_info,
-    block_size_hints, mined_transaction, transaction_hashes_for_any_block,
-    transaction_hashes_for_block, unspent_utxo,
+    block_info_by_hash_or_best_chain_height, mined_transaction, parent_inputs,
+    transaction_hashes_for_any_block, transaction_hashes_for_block, unspent_utxo,
 };
 
 #[cfg(feature = "indexer")]

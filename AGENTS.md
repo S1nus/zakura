@@ -11,7 +11,7 @@
 
 ## Project Structure & Module Organization
 
-Zakura is a Rust workspace; the member crates live under `crates/` (except `deploy/zakura-watchdog`). Main crates include:
+Zakura is a Rust workspace; the member crates live under `crates/`. Main crates include:
 
 `crates/zakura-assets/` is a publish-only packaging crate and is deliberately excluded from the workspace because its payload is generated and not committed.
 
@@ -62,7 +62,7 @@ cargo nextest run --profile zakura-integration
 Zakura is a Zcash full node implementation in Rust. It is a validator node — it excludes features not strictly needed for block validation and chain sync.
 
 - **Rust edition**: 2021
-- **MSRV**: 1.91 (unified across the library crates and the zakurad binary)
+- **MSRV**: 1.97 (unified across the internal crates and the zakurad binary)
 - **Database format version**: defined in `crates/zakura-state/src/constants.rs`
 
 ## Crate Architecture

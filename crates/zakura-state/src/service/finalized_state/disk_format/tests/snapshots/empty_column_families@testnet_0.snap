@@ -4,6 +4,7 @@ expression: empty_column_families
 ---
 [
   "balance_by_transparent_addr: no entries",
+  "header_aux_body_size_v1: no entries",
   "header_aux_delivery_v1: no entries",
   "header_body_evidence_authority_v1: no entries",
   "header_child_v1: no entries",
@@ -26,10 +27,6 @@ expression: empty_column_families
   "sapling_note_commitment_subtree: no entries",
   "sapling_nullifiers: no entries",
   "sprout_nullifiers: no entries",
-  "tachyon_anchor_by_height: no entries",
-  "tachyon_anchors: no entries",
-  "tachyon_epoch_anchor_by_epoch: no entries",
-  "tachyon_tachygrams: no entries",
   "tx_loc_by_spent_out_loc: no entries",
   "tx_loc_by_transparent_addr_loc: no entries",
   "utxo_by_out_loc: no entries",

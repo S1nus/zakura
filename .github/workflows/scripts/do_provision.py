@@ -16,7 +16,16 @@ import time
 from pathlib import Path
 
 REGIONS = ("nyc1", "sfo3", "nyc3")
-TAGS = {"zakura-pr-node", "zakura-image-bake", "zakura-mempool-load"}
+# The reaper sweeps zakura-pr-node, zakura-image-bake and zakura-mempool-load by
+# age. zakura-nu7-fork is deliberately absent from that sweep: a fork testnet
+# outlives any single CI run, so its operator deletes the droplet and volume
+# (deploy/nu7-fork/README.md, "Tearing down").
+TAGS = {
+    "zakura-pr-node",
+    "zakura-image-bake",
+    "zakura-mempool-load",
+    "zakura-nu7-fork",
+}
 
 
 def doctl(*args):
@@ -80,6 +89,15 @@ def height(snapshot):
     return int(match[1]) if match else None
 
 
+def handoff_height(snapshot):
+    """Return a database-measured height, excluding old publisher-tip labels."""
+    if re.search(r"-finalized-h\d+$", snapshot["name"]) or snapshot["name"].startswith(
+        "zakura-vct-approach-mainnet-"
+    ):
+        return height(snapshot)
+    return None
+
+
 def newest(items):
     return sorted(
         items, key=lambda item: (item.get("created_at", ""), item["name"]), reverse=True
@@ -89,13 +107,33 @@ def newest(items):
 def select_state(snapshots, region, network, mode, checkpoint=None, snapshot_id=""):
     """Pick a regional fixture, preserving exact IDs and the handoff boundary."""
     regional = [s for s in snapshots if region in s["regions"]]
+    if mode == "vct-handoff":
+        if network != "mainnet" or not checkpoint or checkpoint <= 0:
+            raise ValueError("vct-handoff requires mainnet and a positive checkpoint")
+        # Ordinary finalized snapshots may cross C by recomputing every tree.
+        # Only dedicated approach fixtures are candidates for this canary. A
+        # validation bake is eligible only when explicitly selected by ID.
+        prefixes = ("zakura-vct-approach-mainnet-",)
+        if snapshot_id:
+            prefixes += ("zakura-pr-validation-approach-mainnet-",)
+        regional = [
+            s for s in regional
+            if s["name"].startswith(prefixes)
+            and height(s) is not None
+            and height(s) < checkpoint
+        ]
+        if snapshot_id:
+            return next((s for s in regional if str(s["id"]) == snapshot_id), None)
+        return max(
+            regional, key=lambda s: (height(s), s.get("created_at", "")), default=None
+        )
     if snapshot_id:
         selected = next((s for s in regional if str(s["id"]) == snapshot_id), None)
         if selected and mode == "pre-checkpoint":
             if (
                 not checkpoint
-                or height(selected) is None
-                or height(selected) >= checkpoint
+                or handoff_height(selected) is None
+                or handoff_height(selected) >= checkpoint
             ):
                 return None
         return selected
@@ -112,8 +150,13 @@ def select_state(snapshots, region, network, mode, checkpoint=None, snapshot_id=
         states += [
             s for s in regional if s["name"].startswith("zakura-vct-approach-mainnet-")
         ]
-    candidates = [s for s in states if height(s) is not None and height(s) < checkpoint]
-    # Unknown-height legacy fixtures remain usable for tip/sandblast runs only.
+    candidates = [
+        s
+        for s in states
+        if handoff_height(s) is not None and handoff_height(s) < checkpoint
+    ]
+    # Old ordinary snapshots have unverified publisher-tip labels. Keep them
+    # usable for tip/sandblast runs, but never prefer them for a handoff.
     return max(
         candidates, key=lambda s: (height(s), s.get("created_at", "")), default=None
     )
@@ -397,7 +440,7 @@ def parser():
     cli.add_argument("--network", choices=("", "mainnet", "testnet"), default="")
     cli.add_argument(
         "--mode",
-        choices=("tip", "sandblast", "pre-checkpoint", "genesis"),
+        choices=("tip", "sandblast", "pre-checkpoint", "vct-handoff", "genesis"),
         default="tip",
     )
     cli.add_argument("--checkpoint", type=int)

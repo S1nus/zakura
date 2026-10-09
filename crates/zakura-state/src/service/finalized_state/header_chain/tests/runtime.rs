@@ -1,6 +1,444 @@
 use super::*;
 
 #[test]
+fn cached_finalized_continuation_still_chooses_the_nearest_locator() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(7);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd5; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(first) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the initial path is available");
+    };
+    assert!(matches!(
+        reader
+            .read_retained_path(source, 7, first.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+    finalize_serving_test_path(&runtime, &db, &path[3..]);
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(next) = reader
+        .acquire_retained_path(source, 7, target, &[path[3].hash, path[4].hash], scope)
+        .unwrap()
+    else {
+        panic!("a cache miss can use the nearest finalized locator");
+    };
+    assert_eq!(next.common_ancestor.hash, path[4].hash);
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, next.lease_id, scope, path[4].hash, 1)
+        .unwrap()
+    else {
+        panic!("the nearest finalized suffix is available");
+    };
+    assert_eq!(page.headers[0].hash(), target);
+    assert!(page.complete);
+}
+
+#[test]
+fn idle_continuation_indexes_are_bounded_and_cannot_block_new_readers() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    for marker in 0..=MAX_RETAINED_PATH_LEASES {
+        let source = SourceId::from_digest([u8::try_from(marker).unwrap(); 32]);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+            .unwrap()
+        else {
+            panic!("idle continuations cannot consume active capacity");
+        };
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+            .unwrap()
+        else {
+            panic!("the first page is available");
+        };
+        assert!(!page.complete);
+        let leases = runtime.leases.lock().unwrap();
+        assert!(leases.by_peer.is_empty());
+        assert!(leases.continuations.len() <= MAX_RETAINED_PATH_LEASES);
+    }
+    {
+        let leases = runtime.leases.lock().unwrap();
+        assert_eq!(leases.continuations.len(), MAX_RETAINED_PATH_LEASES);
+        assert!(!leases
+            .continuations
+            .contains_key(&SourceId::from_digest([0; 32])));
+    }
+    // An evicted index is only a cache miss, even when the request is a continuation.
+    for marker in 0..MAX_RETAINED_PATH_LEASES - 1 {
+        let source = SourceId::from_digest([u8::try_from(marker).unwrap(); 32]);
+        assert!(matches!(
+            reader
+                .acquire_retained_path(source, 7, target, &[path[3].hash], scope)
+                .unwrap(),
+            RetainedPathLeaseOutcome::Acquired(_)
+        ));
+    }
+    assert!(matches!(
+        reader
+            .acquire_retained_path(
+                SourceId::from_digest([0xff; 32]),
+                7,
+                target,
+                &[path[3].hash],
+                scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
+}
+
+#[test]
+fn continuation_cache_matches_session_target_and_first_locator() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd3; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    for (session, next_target, locators, ancestor) in [
+        (8, target, vec![path[3].hash], path[3].hash),
+        (7, path[4].hash, vec![path[3].hash], path[3].hash),
+        (7, target, vec![path[2].hash, path[3].hash], path[2].hash),
+    ] {
+        let RetainedPathLeaseOutcome::Acquired(first) = reader
+            .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+            .unwrap()
+        else {
+            panic!("the initial page has capacity");
+        };
+        let original = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(source, 7, first.lease_id, Instant::now())
+            .unwrap()
+            .retained_path;
+        assert!(matches!(
+            reader
+                .read_retained_path(source, 7, first.lease_id, scope, path[2].hash, 1)
+                .unwrap(),
+            RetainedPathReadOutcome::Page(_)
+        ));
+        let next_scope =
+            HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), next_target);
+        let RetainedPathLeaseOutcome::Acquired(next) = reader
+            .acquire_retained_path(source, session, next_target, &locators, next_scope)
+            .unwrap()
+        else {
+            panic!("a mismatched cache entry must fall back to normal acquisition");
+        };
+        assert_eq!(next.common_ancestor.hash, ancestor);
+        let fresh = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(source, session, next.lease_id, Instant::now())
+            .unwrap();
+        assert!(!Arc::ptr_eq(&original, &fresh.retained_path));
+        assert!(!reader
+            .release_retained_path(source, 7, first.lease_id, scope)
+            .unwrap());
+        assert!(reader
+            .release_retained_path(source, session, next.lease_id, next_scope)
+            .unwrap());
+    }
+}
+
+#[test]
+fn continuation_index_survives_its_target_moving_to_finalized_storage() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(7);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd4; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(first) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the retained target is available");
+    };
+    let original = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .get(source, 7, first.lease_id, Instant::now())
+        .unwrap()
+        .retained_path;
+    assert!(matches!(
+        reader
+            .read_retained_path(source, 7, first.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+    finalize_serving_test_path(&runtime, &db, &path[3..]);
+    assert!(runtime.store.header_node(target).unwrap().is_none());
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(next) = reader
+        .acquire_retained_path(source, 7, target, &[path[3].hash], scope)
+        .unwrap()
+    else {
+        panic!("the finalized target can reuse its bounded index");
+    };
+    let resumed = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .get(source, 7, next.lease_id, Instant::now())
+        .unwrap();
+    assert!(Arc::ptr_eq(&original, &resumed.retained_path));
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, next.lease_id, scope, path[3].hash, 2)
+        .unwrap()
+    else {
+        panic!("the remaining canonical headers are still available");
+    };
+    assert_eq!(
+        page.headers,
+        vec![path[4].header.clone(), path[5].header.clone()]
+    );
+    assert!(page.complete);
+    assert!(runtime.leases.lock().unwrap().continuations.is_empty());
+}
+
+#[test]
+fn continuations_reuse_the_path_index_through_finality_and_late_cleanup() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(64);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd2; 32]);
+    let target = path.last().unwrap().hash;
+    let mut after = path[2].hash;
+    let mut original_path = None;
+    let mut previous_lease = None;
+    for expected in &path[3..] {
+        if expected.height == block::Height(10) {
+            finalize_serving_test_path(&runtime, &db, &path[3..20]);
+        }
+        let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(source, 7, target, &[after], scope)
+            .unwrap()
+        else {
+            panic!("every continuation has capacity");
+        };
+        let cursor = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(source, 7, lease.lease_id, Instant::now())
+            .unwrap();
+        if let Some(original) = &original_path {
+            assert!(
+                Arc::ptr_eq(original, &cursor.retained_path),
+                "continuations must reuse the immutable path index, not rebuild it"
+            );
+        } else {
+            original_path = Some(cursor.retained_path.clone());
+        }
+        if let Some((old_id, old_scope)) = previous_lease {
+            assert!(!reader
+                .release_retained_path(source, 7, old_id, old_scope)
+                .unwrap());
+        }
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(source, 7, lease.lease_id, scope, after, 1)
+            .unwrap()
+        else {
+            panic!("the exact next page remains available");
+        };
+        assert_eq!(
+            page.headers.as_slice(),
+            std::slice::from_ref(&expected.header)
+        );
+        assert_eq!(page.complete, expected.hash == target);
+        assert!(runtime.leases.lock().unwrap().by_peer.is_empty());
+        previous_lease = Some((lease.lease_id, scope));
+        after = expected.hash;
+    }
+}
+
+#[test]
+fn completed_page_releases_capacity_before_continuation_and_late_cleanup() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(5);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd1; 32]);
+    let target = path[4].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(first) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first page has capacity");
+    };
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, first.lease_id, scope, path[2].hash, 1)
+        .unwrap()
+    else {
+        panic!("the first page remains available");
+    };
+    assert!(!page.complete);
+    let RetainedPathLeaseOutcome::Acquired(second) = reader
+        .acquire_retained_path(source, 7, target, &[path[3].hash], scope)
+        .unwrap()
+    else {
+        panic!("the continuation must acquire before cleanup of the first page runs");
+    };
+    assert_ne!(second.lease_id, first.lease_id);
+    assert!(!reader
+        .release_retained_path(source, 7, first.lease_id, scope)
+        .unwrap());
+    assert_eq!(
+        reader
+            .read_retained_path(source, 7, first.lease_id, scope, path[3].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Unavailable,
+        "the consumed lease cannot race the new reader",
+    );
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, second.lease_id, scope, path[3].hash, 1)
+        .unwrap()
+    else {
+        panic!("late cleanup must not revoke the continuation");
+    };
+    assert_eq!(page.headers[0].hash(), target);
+    assert!(page.complete);
+    assert!(runtime.leases.lock().unwrap().by_peer.is_empty());
+}
+
+#[test]
+fn serving_leases_do_not_block_a_better_work_branch() {
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&Config::ephemeral(), engine_config.network()));
+    store.initialize(metadata, anchor.clone()).unwrap();
+    let (runtime, _) = store.startup(&engine_config).unwrap();
+    let reader = runtime.reader();
+    let parent = Frontier::new(anchor.height, anchor.hash);
+    let validation = reader.validation_context(anchor.hash).unwrap().unwrap();
+    let rules = HeaderRules::for_validation_lease(&validation).unwrap();
+    let context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    let insert = |headers: &[Arc<block::Header>]| {
+        let snapshot = runtime.publisher().snapshot();
+        let target = headers.last().unwrap().hash();
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: header_owner(&snapshot, target, 1, 1),
+                        source: SourceId::from_digest([0xee; 32]),
+                        parent_hash: parent.hash,
+                        target_tip_hash: target,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: parent,
+                        },
+                        batch: zakura_header_chain::prepare_headers(
+                            HeaderBatchInput::new(headers),
+                            parent,
+                            &rules,
+                            &SystemClock,
+                        )
+                        .unwrap(),
+                        aux: Vec::new(),
+                    })),
+                },
+                &context,
+            )
+            .unwrap()
+    };
+    let mut captured_paths = Vec::new();
+    for index in 0..zakura_header_chain::MAX_CANDIDATE_TIPS_V1 {
+        let marker = u8::try_from(index).unwrap();
+        let mut header = *anchor.header;
+        header.previous_block_hash = parent.hash;
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] = marker;
+        let header = Arc::new(header);
+        assert_eq!(
+            insert(std::slice::from_ref(&header)),
+            ApplyResult::Committed
+        );
+        let source = SourceId::from_digest([marker; 32]);
+        let scope = zakura_header_chain::HeaderWorkAuthority::for_target(
+            &runtime.publisher().snapshot(),
+            header.hash(),
+        );
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(source, 7, header.hash(), &[parent.hash], scope)
+            .unwrap()
+        else {
+            panic!("every candidate tip fits in the general serving capacity");
+        };
+        let cursor = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(source, 7, lease.lease_id, Instant::now())
+            .unwrap();
+        let captured = reader.capture_path_read(&cursor, 1).unwrap();
+        captured_paths.push((cursor, captured));
+    }
+
+    let mut first = *anchor.header;
+    first.previous_block_hash = parent.hash;
+    first.time += chrono::Duration::seconds(1);
+    first.nonce.0[0] = 0xff;
+    let first = Arc::new(first);
+    let mut second = *first;
+    second.previous_block_hash = first.hash();
+    second.time += chrono::Duration::seconds(1);
+    let second = Arc::new(second);
+    let target = Frontier::new(block::Height(2), second.hash());
+    assert_eq!(
+        insert(&[first, second]),
+        ApplyResult::Committed,
+        "peer serving leases must not veto admission of the better-work branch",
+    );
+    let snapshot = runtime.publisher().snapshot();
+    assert_eq!(snapshot.frontiers.header_best, target);
+    assert!(!snapshot.alarms.resource_stalled);
+
+    let (cursor, captured) = captured_paths
+        .iter()
+        .find(|(cursor, _)| {
+            runtime
+                .store
+                .header_node(cursor.target.hash)
+                .unwrap()
+                .is_none()
+        })
+        .expect("retention evicts an old fork to admit the better branch");
+    assert_eq!(
+        reader
+            .read_retained_path(
+                cursor.peer,
+                7,
+                cursor.lease_id,
+                cursor.scope,
+                parent.hash,
+                1
+            )
+            .unwrap(),
+        RetainedPathReadOutcome::Unavailable,
+    );
+    let (page, _, _) = captured.read_page(cursor, 1).unwrap().unwrap();
+    assert_eq!(page.headers[0].hash(), cursor.target.hash);
+    assert!(
+        page.complete,
+        "an already captured page survives pruning coherently"
+    );
+}
+
+#[test]
 fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
@@ -9,9 +447,15 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
 
+    // Stage one node past the retained predecessor span, so the context cap
+    // binds whatever difficulty averaging window this build uses.
+    let predecessor_span = zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN;
+    let staged_len =
+        u32::try_from(predecessor_span + 1).expect("the retained predecessor span fits in u32");
+
     let mut nodes = Vec::new();
     let mut parent = anchor;
-    for height in 1..=28 {
+    for height in 1..=staged_len {
         let mut header = *parent.header;
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
@@ -40,14 +484,14 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let staged: HashMap<_, _> = nodes.iter().map(|node| (node.hash, node)).collect();
     let contexts = authenticated_context_headers(&store, parent.hash, Some(&staged))
         .expect("the atomic batch can authenticate context from its staged node overlay");
-    assert_eq!(contexts.len(), 27);
+    assert_eq!(contexts.len(), predecessor_span);
     assert_eq!(
         contexts.first().map(|context| context.height),
         Some(block::Height(1))
     );
     assert_eq!(
         contexts.last().map(|context| context.height),
-        Some(block::Height(27))
+        Some(block::Height(staged_len - 1))
     );
     assert_eq!(
         parent.header.previous_block_hash,
@@ -132,6 +576,80 @@ fn body_refill_snapshot_holds_the_complete_transition_barrier() {
 }
 
 #[test]
+fn body_refill_does_not_attach_committed_sizes_to_another_fork() {
+    use crate::arbitrary::Prepare;
+    use crate::tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase};
+    use zakura_chain::serialization::ZcashSerialize;
+
+    let _init_guard = zakura_test::init();
+    let (engine_config, anchor, metadata) = mainnet_fixture();
+    let (finalized, mut full_state, _) = new_state_with_mainnet_genesis();
+    let store = HeaderChainStore::new(finalized.db.header_chain_disk_db());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("header schema initializes");
+
+    let mut old: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("height one parses");
+    let selected_header = old.header.clone();
+    let mut old_header = *old.header;
+    old_header.nonce.0[0] ^= 1;
+    old.header = Arc::new(old_header);
+    // The state fixture requires a modern coinbase transaction version.
+    old.transactions[0] = transaction_v4_from_coinbase(&old.transactions[0]).into();
+    let old = Arc::new(old);
+    full_state
+        .commit_new_chain(old.clone().prepare(), &finalized)
+        .expect("old branch commits");
+
+    let selected_hash = selected_header.hash();
+    let (runtime, _) = store
+        .startup_reconciled(
+            &engine_config,
+            Frontier::new(anchor.height, anchor.hash),
+            Vec::new(),
+            vec![VerifiedHeaderRef {
+                height: block::Height(1),
+                hash: selected_hash,
+                header: selected_header,
+            }],
+        )
+        .expect("selected fork restores");
+
+    let old_size = u32::try_from(
+        old.zcash_serialize_to_vec()
+            .expect("old block serializes")
+            .len(),
+    )
+    .expect("test block size fits u32");
+    assert_eq!(
+        crate::service::read::block_info(
+            full_state.best_chain(),
+            &finalized.db,
+            old.hash().into(),
+        )
+        .map(|info| info.size()),
+        Some(old_size),
+        "the old branch has a confirmed size at the same height",
+    );
+    let metadata = crate::service::missing_block_body_metadata(
+        || full_state.best_chain(),
+        &finalized.db,
+        Some(&runtime.reader()),
+        block::Height(2),
+        10,
+    )
+    .expect("fork refill metadata reads");
+    assert_eq!(metadata.anchor, Frontier::new(anchor.height, anchor.hash));
+    assert_eq!(
+        metadata.blocks,
+        vec![(block::Height(1), selected_hash, None)],
+        "a selected fork must not inherit the other block's confirmed size"
+    );
+}
+
+#[test]
 fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
@@ -185,6 +703,19 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
         restored
             .last()
             .map(|header| Frontier::new(header.height, header.hash))
+    );
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(5, NonZeroU64::new(6).expect("six is nonzero"));
+    let repair = runtime
+        .reader()
+        .vct_repair_context(owner, block::Height(1))
+        .expect("the long selected repair context is coherent")
+        .expect("the empty selected range needs repair");
+    assert_eq!(repair.selected_header_count(), 4_000);
+    assert_eq!(
+        repair.request_target(),
+        Frontier::new(restored[3_999].height, restored[3_999].hash)
     );
 }
 
@@ -271,8 +802,32 @@ fn reconciled_store_with_finalized_prefix(
 }
 
 #[test]
+fn repair_context_range_is_bounded_by_reclaimable_capacity() {
+    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(6);
+    // Even an empty store cannot retain a range larger than its aggregate limit.
+    runtime.set_auxiliary_limits_for_test(1, 1);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(7, NonZeroU64::new(8).unwrap());
+    for index in [3, 4, 5] {
+        let context = runtime
+            .reader()
+            .vct_repair_context(owner, path[index].height)
+            .unwrap()
+            .unwrap();
+        assert!(context.admission_capacity_available);
+        assert_eq!(context.selected_header_count(), 1);
+        assert_eq!(
+            context.target,
+            Frontier::new(path[index].height, path[index].hash)
+        );
+    }
+}
+
+#[test]
 fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
-    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let (mut runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    runtime.set_auxiliary_limits_for_test(1, 3);
     let target = Frontier::new(path[3].height, path[3].hash);
     let snapshot = runtime.publisher().snapshot();
     let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
@@ -349,6 +904,10 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
         .expect("the recovered selected target still needs repair");
 
     assert_ne!(recovered.episode, before.episode);
+    assert!(
+        recovered.admission_capacity_available,
+        "a full recovered input bucket permits a selected replacement"
+    );
     assert!(recovered.excludes(input));
     assert!(recovered.retains_payload(input));
     assert!(recovered.retains_source(rejected.source));
@@ -519,6 +1078,466 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
     ));
 }
 
+#[test]
+fn selected_range_repair_rejects_atomically_then_commits_every_delivery() {
+    let (runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let targets = [
+        Frontier::new(path[3].height, path[3].hash),
+        Frontier::new(path[4].height, path[4].hash),
+    ];
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(17, NonZeroU64::new(18).expect("eighteen is nonzero"));
+    let repair = runtime
+        .reader()
+        .vct_repair_context(owner, targets[0].height)
+        .expect("the range repair context is coherent")
+        .expect("the selected empty range needs repair");
+    assert_eq!(repair.selected_header_count(), targets.len());
+    assert_eq!(repair.request_target(), targets[1]);
+
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let headers = [path[3].header.clone(), path[4].header.clone()];
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected range passes deterministic preparation");
+    let source = SourceId::from_digest([0xa1; 32]);
+    let delivery = |index: usize, height| {
+        let marker = u8::try_from(index).expect("the delivery index fits u8");
+        AuxDelivery::new(
+            EvidenceId::from_digest([0xa2_u8.saturating_add(marker); 32]),
+            targets[index].hash,
+            source,
+            owner.into(),
+            zakura_header_chain::BodySizeHint::Unknown,
+            Some(zakura_header_chain::TreeAuxRecordV1 {
+                height,
+                sapling_root: Default::default(),
+                orchard_root: Default::default(),
+                ironwood_root: Default::default(),
+                sapling_tx_count: u64::try_from(index).expect("the delivery index fits u64"),
+                orchard_tx_count: 0,
+                ironwood_tx_count: 0,
+                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from(
+                    [0xa4_u8.saturating_add(marker); 32],
+                ),
+            }),
+        )
+    };
+    let request = |aux| TransitionRequest {
+        expected_version: StateVersion::default(),
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: parent.hash,
+            target_tip_hash: targets[1].hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: parent,
+                selected_target: targets[1],
+                episode: repair.episode,
+            },
+            batch: batch.clone(),
+            aux,
+        })),
+    };
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+
+    let malformed = request(vec![
+        delivery(0, targets[0].height),
+        delivery(1, targets[0].height),
+    ]);
+    assert!(runtime.apply(malformed, &context).is_err());
+    for target in targets {
+        assert!(runtime
+            .store
+            .aux_deliveries(target.hash)
+            .expect("the target auxiliary rows remain readable")
+            .is_empty());
+    }
+
+    assert!(matches!(
+        runtime
+            .apply(
+                request(vec![
+                    delivery(0, targets[0].height),
+                    delivery(1, targets[1].height),
+                ]),
+                &context,
+            )
+            .expect("the complete repair range applies"),
+        ApplyResult::Committed
+    ));
+    for target in targets {
+        assert_eq!(
+            runtime
+                .store
+                .aux_deliveries(target.hash)
+                .expect("the committed target auxiliary rows are readable")
+                .len(),
+            1
+        );
+    }
+}
+
+/// Store each delivery as durable input on its retained header and refresh the runtime mirror.
+///
+/// Each delivery must name a distinct header.
+fn retain_aux_deliveries_for_test(runtime: &HeaderChainRuntime, deliveries: &[AuxDelivery]) {
+    let mut batch = DiskWriteBatch::new();
+    for delivery in deliveries {
+        let mut node = runtime
+            .store
+            .header_node(delivery.header_hash)
+            .expect("the retained header row decodes")
+            .expect("the delivery header is retained");
+        node.aux_delivery_ids.push(delivery.delivery_id);
+        runtime
+            .store
+            .put_value(
+                &mut batch,
+                HEADER_NODE_BY_HASH,
+                delivery.header_hash.0,
+                &HeaderNodeDisk::from_domain(&node),
+            )
+            .expect("the header with auxiliary input encodes");
+        runtime
+            .store
+            .put_value(
+                &mut batch,
+                HEADER_AUX_DELIVERY,
+                HeaderAuxDeliveryKey {
+                    header: delivery.header_hash,
+                    delivery: delivery.delivery_id,
+                }
+                .as_bytes(),
+                delivery,
+            )
+            .expect("the auxiliary delivery encodes");
+    }
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the auxiliary input fixture commits");
+    *runtime
+        .transition_engine
+        .lock()
+        .expect("the transition engine mutex is not poisoned") =
+        load_transition_engine(&runtime.store)
+            .expect("the direct durable test fixture refreshes the runtime mirror");
+}
+
+/// Repair three headers that hold rootless near-tip rows in one range, below one rooted header.
+///
+/// `aggregate_limit` replaces the aggregate input limit. Returns the durable rows of each
+/// repaired target and the number of durable rows in the store.
+fn repair_rootless_near_tip_range(
+    aggregate_limit: Option<usize>,
+) -> (Vec<Vec<AuxDelivery>>, usize) {
+    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(8);
+    if let Some(total) = aggregate_limit {
+        let per_header = runtime.config.limits.max_aux_deliveries_per_header.get();
+        runtime.set_auxiliary_limits_for_test(per_header, total);
+    }
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let targets: Vec<_> = path[3..6]
+        .iter()
+        .map(|header| Frontier::new(header.height, header.hash))
+        .collect();
+    let rooted_header = Frontier::new(path[6].height, path[6].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(37, NonZeroU64::new(38).expect("thirty-eight is nonzero"));
+    let near_tip_owner =
+        zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, path[7].hash)
+            .bind(39, NonZeroU64::new(40).expect("forty is nonzero"));
+    let near_tip_source = SourceId::from_digest([0xc1; 32]);
+    let record = |height: block::Height, marker: u8| zakura_header_chain::TreeAuxRecordV1 {
+        height,
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: u64::from(marker),
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([marker; 32]),
+    };
+    let mut near_tip_input: Vec<_> = targets
+        .iter()
+        .zip(0xc2_u8..)
+        .map(|(target, marker)| {
+            AuxDelivery::new(
+                EvidenceId::from_digest([marker; 32]),
+                target.hash,
+                near_tip_source,
+                near_tip_owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                None,
+            )
+        })
+        .collect();
+    near_tip_input.push(AuxDelivery::new(
+        EvidenceId::from_digest([0xc8; 32]),
+        rooted_header.hash,
+        near_tip_source,
+        near_tip_owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(record(rooted_header.height, 0xc9)),
+    ));
+    retain_aux_deliveries_for_test(&runtime, &near_tip_input);
+
+    let repair = runtime
+        .reader()
+        .vct_repair_context(owner, targets[0].height)
+        .expect("the rootless range repair context is coherent")
+        .expect("the rootless selected range needs repair");
+    assert_eq!(
+        repair.selected_header_count(),
+        targets.len(),
+        "the range stops before the first rooted row"
+    );
+    assert_eq!(repair.request_target(), targets[2]);
+    assert_eq!(
+        runtime
+            .reader()
+            .vct_repair_context(owner, rooted_header.height)
+            .expect("the rooted repair context is coherent")
+            .expect("the rooted target remains repairable")
+            .selected_header_count(),
+        1,
+        "rooted input still constrains its replacement to one target"
+    );
+
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let headers: Vec<_> = path[3..6]
+        .iter()
+        .map(|header| header.header.clone())
+        .collect();
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected range passes deterministic preparation");
+    let source = SourceId::from_digest([0xca; 32]);
+    let replacements = targets
+        .iter()
+        .zip(0xcb_u8..)
+        .map(|(target, marker)| {
+            AuxDelivery::new(
+                EvidenceId::from_digest([marker; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(record(target.height, marker)),
+            )
+        })
+        .collect();
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: StateVersion::default(),
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: owner.into(),
+                        source,
+                        parent_hash: parent.hash,
+                        target_tip_hash: targets[2].hash,
+                        completion: TargetCompletion::SelectedAuxiliaryRepair {
+                            common_ancestor: parent,
+                            selected_target: targets[2],
+                            episode: repair.episode,
+                        },
+                        batch,
+                        aux: replacements,
+                    })),
+                },
+                &context,
+            )
+            .expect("the rootless range repair applies"),
+        ApplyResult::Committed
+    ));
+    let rows = targets
+        .iter()
+        .map(|target| {
+            runtime
+                .store
+                .aux_deliveries(target.hash)
+                .expect("the repaired target rows are readable")
+        })
+        .collect();
+    let total = runtime
+        .store
+        .load_aux_deliveries()
+        .expect("the durable input rows are readable")
+        .len();
+    (rows, total)
+}
+
+#[test]
+fn repair_range_spans_rootless_near_tip_input() {
+    // Suppliers attach roots only to their finalized prefix, so headers received near the
+    // network tip keep rootless rows. When a later handoff moves above those headers, one repair
+    // must still cover them all instead of one header per round trip.
+    let (rows, _) = repair_rootless_near_tip_range(None);
+    for rows in rows {
+        assert_eq!(rows.len(), 2, "the repair adds a rooted row");
+        assert!(rows.iter().any(|row| row.tree_aux.is_some()));
+    }
+}
+
+#[test]
+fn saturated_rootless_range_repair_retains_every_root() {
+    // The four near-tip rows leave one free aggregate slot. The two lowest targets sit in the
+    // commit window, so their rows are protected, and the range admits three new roots by
+    // reclaiming the two rows above it. Aggregate pressure must evict those older rows, never a
+    // root that the range repair just supplied.
+    let (rows, total) = repair_rootless_near_tip_range(Some(5));
+    assert_eq!(total, 5, "the repair stays within the aggregate limit");
+    let repair_source = SourceId::from_digest([0xca; 32]);
+    for rows in &rows {
+        assert!(
+            rows.iter()
+                .any(|row| row.source == repair_source && row.tree_aux.is_some()),
+            "every target retains its new root"
+        );
+    }
+    assert_eq!(rows[2].len(), 1, "eviction removes the suffix rootless row");
+}
+
+#[test]
+fn one_header_range_prefix_keeps_its_state_bound_episode() {
+    let (runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let successor = Frontier::new(path[4].height, path[4].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(27, NonZeroU64::new(28).expect("twenty-eight is nonzero"));
+    let range = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the range repair context is coherent")
+        .expect("the selected empty range needs repair");
+    let prefix = range
+        .bounded_prefix(1)
+        .expect("the one-header range prefix exists");
+    let stale_episode = zakura_header_chain::VctRepairContext::from_durable_rows(
+        target,
+        HeaderLocator::for_continuation(parent),
+        StateVersion::new(snapshot.state_version.get().saturating_add(1)),
+        Some(successor.hash),
+        true,
+        &[],
+    )
+    .expect("the stale exact context is coherent")
+    .extend_empty_selected_range(&[], Some(successor.hash))
+    .expect("the stale one-header range is coherent")
+    .episode;
+
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&path[3].header)),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected prefix passes deterministic preparation");
+    let source = SourceId::from_digest([0xb1; 32]);
+    let request = |episode| TransitionRequest {
+        expected_version: StateVersion::default(),
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: parent.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: parent,
+                selected_target: target,
+                episode,
+            },
+            batch: batch.clone(),
+            aux: vec![AuxDelivery::new(
+                EvidenceId::from_digest([0xb2; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(zakura_header_chain::TreeAuxRecordV1 {
+                    height: target.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 1,
+                    orchard_tx_count: 0,
+                    ironwood_tx_count: 0,
+                    auth_data_root: [0xb3; 32].into(),
+                }),
+            )],
+        })),
+    };
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+
+    assert!(matches!(
+        runtime
+            .apply(request(stale_episode), &context)
+            .expect("a stale range episode is a normal apply outcome"),
+        ApplyResult::Stale(_)
+    ));
+    assert!(runtime
+        .store
+        .aux_deliveries(target.hash)
+        .expect("the stale target auxiliary rows remain readable")
+        .is_empty());
+    assert!(matches!(
+        runtime
+            .apply(request(prefix.episode), &context)
+            .expect("the current one-header range prefix applies"),
+        ApplyResult::Committed
+    ));
+}
+
 #[tokio::test(start_paused = true)]
 async fn retained_path_serves_a_locator_before_the_header_retention_window() {
     let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix(4);
@@ -531,7 +1550,7 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
         &runtime.publisher().snapshot(),
         target.hash,
     );
-    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+    let RetainedPathLeaseOutcome::Acquired(mut lease) = reader
         .acquire_retained_path(
             SourceId::from_digest([0x71; 32]),
             9,
@@ -564,14 +1583,23 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
         assert_eq!(page.aux_deliveries, vec![Vec::new()]);
         assert_eq!(page.complete, complete);
         after = expected.hash;
+        if !complete {
+            let RetainedPathLeaseOutcome::Acquired(next) = reader
+                .acquire_retained_path(owner, 9, target.hash, &[after], scope)
+                .unwrap()
+            else {
+                panic!("the next page can acquire fresh capacity");
+            };
+            lease = next;
+        }
     }
-    assert!(reader
+    assert!(!reader
         .release_retained_path(owner, 9, lease.lease_id, scope)
         .expect("the one-header-page cursor releases"));
 
     for (marker, page_count) in [(0x72, 2), (0x73, 3)] {
         let page_owner = SourceId::from_digest([marker; 32]);
-        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        let RetainedPathLeaseOutcome::Acquired(mut lease) = reader
             .acquire_retained_path(page_owner, 9, target.hash, &[genesis.hash], scope)
             .expect("the tier-boundary page cursor acquires")
         else {
@@ -595,6 +1623,13 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
                 .last()
                 .expect("an incomplete page contains at least one header")
                 .hash();
+            let RetainedPathLeaseOutcome::Acquired(next) = reader
+                .acquire_retained_path(page_owner, 9, target.hash, &[after], scope)
+                .unwrap()
+            else {
+                panic!("the next page can acquire across the storage boundary");
+            };
+            lease = next;
         }
         assert_eq!(
             served,
@@ -784,6 +1819,23 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         .expect("the current owner resolves its selected header");
     assert_eq!(repair.target, Frontier::new(child.height, child.hash));
     assert_eq!(repair.locator.entries(), &[anchor_frontier]);
+    assert_eq!(repair.selected_header_count(), 2);
+    assert_eq!(
+        repair.request_target(),
+        Frontier::new(grandchild.height, grandchild.hash)
+    );
+    let checkpoint_bounded = reader
+        .vct_repair_context_bounded(owner, child.height, child.height)
+        .expect("the checkpoint-bounded repair context is coherent")
+        .expect("the checkpoint permits the blocking target");
+    assert_eq!(checkpoint_bounded.selected_header_count(), 1);
+    assert_eq!(checkpoint_bounded.request_target(), repair.target);
+    assert_eq!(
+        reader
+            .vct_repair_context_bounded(owner, child.height, anchor.height)
+            .expect("a repair above the checkpoint is a normal stale outcome"),
+        None
+    );
 
     let mut stale_owner = owner;
     stale_owner.authority.verified_generation = VerifiedGeneration::new(
@@ -864,6 +1916,12 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         .expect("the transition engine mutex is not poisoned") =
         load_transition_engine(&runtime.store)
             .expect("the direct durable test fixture refreshes the runtime mirror");
+    let evidence_constrained = reader
+        .vct_repair_context(owner, child.height)
+        .expect("the evidence-constrained repair context is coherent")
+        .expect("the selected target remains repairable");
+    assert_eq!(evidence_constrained.selected_header_count(), 1);
+    assert_eq!(evidence_constrained.request_target(), repair.target);
     let roots = reader
         .selected_block_roots(child.height, 2)
         .expect("selected auxiliary roots are coherent");
@@ -917,19 +1975,18 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             .expect("a stale acquisition scope is a normal refusal"),
         RetainedPathLeaseOutcome::Busy
     );
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash], lease_scope,)
             .expect("the lease bound is a normal outcome"),
-        RetainedPathLeaseOutcome::Busy
-    );
-    assert_eq!(
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
+    assert!(matches!(
         reader
             .acquire_retained_path(owner, 8, grandchild.hash, &[anchor.hash], lease_scope)
             .expect("a new session cannot replace a live lease"),
-        RetainedPathLeaseOutcome::Busy,
-        "same-peer replacement requires exact release or expiry"
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
     assert_eq!(
         reader
             .read_retained_path(owner, 8, lease.lease_id, lease_scope, anchor.hash, 1)
@@ -963,6 +2020,30 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             .expect("a replayed cursor position is a normal refusal"),
         RetainedPathReadOutcome::Unavailable,
         "the opaque cursor advances exactly once and cannot be rewound",
+    );
+
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(owner, 7, grandchild.hash, &[child.hash], lease_scope)
+        .unwrap()
+    else {
+        panic!("the next page acquires its own lease");
+    };
+    let cursor = runtime
+        .leases
+        .lock()
+        .expect("the lease registry is available")
+        .get(owner, 7, lease.lease_id, Instant::now())
+        .expect("the lease remains active");
+    let captured_read = reader
+        .capture_path_read(&cursor, 1)
+        .expect("the page captures a coherent read view");
+    assert!(
+        reader.store.writer.try_lock().is_ok(),
+        "page I/O does not hold the writer"
+    );
+    assert!(
+        reader.transition_engine.try_lock().is_ok(),
+        "page I/O does not hold the engine"
     );
 
     let before = runtime.publisher().snapshot();
@@ -999,6 +2080,31 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         runtime.publisher().snapshot().frontiers.header_best,
         anchor_frontier
     );
+
+    let (captured_page, _, _) = captured_read
+        .read_page(&cursor, 1)
+        .expect("the old snapshot remains coherent after the branch changes")
+        .expect("the captured path remains readable");
+    assert_eq!(captured_page.headers[0].hash(), grandchild.hash);
+    assert!(captured_page.complete);
+
+    let stale_source = SourceId::from_digest([0xed; 32]);
+    let RetainedPathLeaseOutcome::Acquired(stale_lease) = reader
+        .acquire_retained_path(
+            stale_source,
+            7,
+            grandchild.hash,
+            &[anchor.hash],
+            lease_scope,
+        )
+        .expect("a request queued before the head changed can still acquire its exact path")
+    else {
+        panic!("head changes do not invalidate an exact retained target");
+    };
+    assert_eq!(stale_lease.scope, lease_scope);
+    assert!(reader
+        .release_retained_path(stale_source, 7, stale_lease.lease_id, lease_scope)
+        .unwrap());
 
     let RetainedPathReadOutcome::Page(continuation) = reader
         .read_retained_path(owner, 7, lease.lease_id, lease_scope, child.hash, 1)
@@ -1074,7 +2180,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     };
     assert!(completed.headers.is_empty());
     assert!(completed.complete);
-    assert!(reader
+    assert!(!reader
         .release_retained_path(
             SourceId::from_digest([2; 32]),
             7,
@@ -1083,7 +2189,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         )
         .expect("the requester-order test lease releases"));
 
-    assert!(reader
+    assert!(!reader
         .release_retained_path(owner, 7, lease.lease_id, lease_scope)
         .expect("the exact owner can release its lease"));
     for marker in 1..MAX_RETAINED_PATH_LEASES {
@@ -1104,7 +2210,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             RetainedPathLeaseOutcome::Acquired(_)
         ));
     }
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(
                 SourceId::from_digest([0xff; 32]),
@@ -1117,31 +2223,9 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 ),
             )
             .expect("capacity refusal is a normal outcome"),
-        RetainedPathLeaseOutcome::Busy
-    );
-    let active_references = {
-        let mut leases = runtime
-            .leases
-            .lock()
-            .expect("the lease registry mutex is not poisoned");
-        let active_references = leases.active_references(Instant::now());
-        let cached_references = leases.active_references(Instant::now());
-        assert!(Arc::ptr_eq(&active_references, &cached_references));
-        active_references
-    };
-    assert_eq!(
-        active_references.as_ref(),
-        [child.hash],
-        "each lease contributes only its target; retaining that target protects its whole ancestry"
-    );
-
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
     tokio::time::advance(RETAINED_PATH_LEASE_IDLE + Duration::from_secs(1)).await;
-    assert!(runtime
-        .leases
-        .lock()
-        .expect("the lease registry mutex is not poisoned")
-        .active_references(Instant::now())
-        .is_empty());
     assert!(matches!(
         reader
             .acquire_retained_path(
@@ -1195,14 +2279,13 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn retained_path_serves_an_exact_finalized_target_below_the_header_frontier() {
+async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontier() {
     let (runtime, _db, genesis, path) = reconciled_store_with_finalized_prefix(4);
     let finalized = Frontier::new(path[2].height, path[2].hash);
     let reader = runtime.reader();
 
-    // A VCT repair asks for the exact header at one stalled height. The header graph holds only
-    // the retained suffix, so a supplier that has finalized past that height serves it from the
-    // finalized indexes.
+    // A VCT repair can ask for a selected range below the retained suffix. A supplier that has
+    // finalized that range serves it from the finalized indexes.
     let target = Frontier::new(path[1].height, path[1].hash);
     assert!(target.height < finalized.height);
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(
@@ -1210,7 +2293,7 @@ async fn retained_path_serves_an_exact_finalized_target_below_the_header_frontie
         target.hash,
     );
     // Long retained paths may occupy every general slot. The registry preserves one slot for the
-    // bounded finalized fallback that supplies an exact VCT repair header.
+    // bounded finalized fallback that supplies a VCT repair range.
     let retained_target = Frontier::new(path[3].height, path[3].hash);
     let retained_scope = zakura_header_chain::HeaderWorkAuthority::for_target(
         &runtime.publisher().snapshot(),
@@ -1257,19 +2340,64 @@ async fn retained_path_serves_an_exact_finalized_target_below_the_header_frontie
     );
     assert_eq!(page.target, target);
     assert!(page.complete);
-    assert!(reader
+    assert!(!reader
         .release_retained_path(owner, 11, lease.lease_id, scope)
         .expect("the finalized target cursor releases"));
 
-    // The finalized fallback serves only the one-header VCT repair path. A lower locator cannot
-    // create a renewable multi-page lease.
+    // The finalized fallback also serves a bounded range from an earlier canonical locator.
     let long_path_owner = SourceId::from_digest([0x84; 32]);
-    assert!(matches!(
-        reader
-            .acquire_retained_path(long_path_owner, 11, target.hash, &[genesis.hash], scope)
-            .expect("the long finalized path lookup is coherent"),
-        RetainedPathLeaseOutcome::NoLocatorIntersection
-    ));
+    let RetainedPathLeaseOutcome::Acquired(long_path_lease) = reader
+        .acquire_retained_path(long_path_owner, 11, target.hash, &[genesis.hash], scope)
+        .expect("the bounded finalized path lookup is coherent")
+    else {
+        panic!("the bounded finalized path should acquire a lease");
+    };
+    let RetainedPathReadOutcome::Page(long_path_page) = reader
+        .read_retained_path(
+            long_path_owner,
+            11,
+            long_path_lease.lease_id,
+            scope,
+            genesis.hash,
+            4,
+        )
+        .expect("the bounded finalized path page is coherent")
+    else {
+        panic!("the bounded finalized path lease should remain available");
+    };
+    assert_eq!(
+        long_path_page.headers,
+        vec![path[0].header.clone(), path[1].header.clone()]
+    );
+    assert_eq!(long_path_page.target, target);
+    assert!(long_path_page.complete);
+    assert!(!reader
+        .release_retained_path(long_path_owner, 11, long_path_lease.lease_id, scope,)
+        .expect("the bounded finalized path cursor releases"));
+
+    // The nearest canonical locator bounds the lease. Honouring list order instead would let a
+    // requester place a distant ancestor first and lease a complete range it never needed.
+    let nearest_owner = SourceId::from_digest([0x85; 32]);
+    let RetainedPathLeaseOutcome::Acquired(nearest_lease) = reader
+        .acquire_retained_path(
+            nearest_owner,
+            11,
+            target.hash,
+            &[genesis.hash, path[0].hash],
+            scope,
+        )
+        .expect("the nearest canonical locator resolves")
+    else {
+        panic!("the nearest canonical locator should acquire a lease");
+    };
+    assert_eq!(
+        nearest_lease.common_ancestor,
+        Frontier::new(path[0].height, path[0].hash),
+        "an ordered-first distant locator must not widen the leased range"
+    );
+    assert!(reader
+        .release_retained_path(nearest_owner, 11, nearest_lease.lease_id, scope)
+        .expect("the nearest canonical locator cursor releases"));
 
     // A locator at or above the target leaves no ancestor to continue from.
     let above_owner = SourceId::from_digest([0x82; 32]);
@@ -1293,4 +2421,963 @@ async fn retained_path_serves_an_exact_finalized_target_below_the_header_frontie
             .expect("the unknown target lookup is coherent"),
         RetainedPathLeaseOutcome::TargetNotRetained
     ));
+}
+
+#[test]
+fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
+    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let successor = Frontier::new(path[4].height, path[4].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(27, NonZeroU64::new(28).expect("twenty-eight is nonzero"));
+    let range = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the range repair context is coherent")
+        .expect("the selected empty range needs repair");
+    let prefix = range
+        .bounded_prefix(1)
+        .expect("the one-header range prefix exists");
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&path[3].header)),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected prefix passes deterministic preparation");
+    let source = SourceId::from_digest([0xc1; 32]);
+    let known_size = std::num::NonZeroU32::new(123_456).expect("the fixture size is nonzero");
+    let request = TransitionRequest {
+        expected_version: StateVersion::default(),
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: parent.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: parent,
+                selected_target: target,
+                episode: prefix.episode,
+            },
+            batch,
+            aux: vec![AuxDelivery::new(
+                EvidenceId::from_digest([0xc2; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(zakura_header_chain::TreeAuxRecordV1 {
+                    height: target.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 1,
+                    orchard_tx_count: 0,
+                    ironwood_tx_count: 0,
+                    auth_data_root: [0xc3; 32].into(),
+                }),
+            )],
+        })),
+    };
+    let original_request = request.clone();
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        runtime
+            .apply(request, &context)
+            .expect("the one-header range prefix applies"),
+        ApplyResult::Committed
+    ));
+
+    let hints_by_hash = || {
+        runtime
+            .reader()
+            .body_size_hints_by_hash(&[parent.hash, target.hash, successor.hash])
+            .expect("the delivery hints read")
+    };
+    assert_eq!(hints_by_hash(), vec![None, None, None]);
+    assert!(runtime
+        .store
+        .scan_raw(HEADER_AUX_BODY_SIZE)
+        .unwrap()
+        .is_empty());
+    let replay = |request_id, marker, size| {
+        let view = runtime.publisher().view();
+        let mut replay = original_request.clone();
+        replay.expected_version = view.state_version;
+        let TransitionEvent::InsertHeaders(insert) = &mut replay.event else {
+            unreachable!()
+        };
+        let new_owner = HeaderWorkAuthority::for_target(&view.snapshot, target.hash)
+            .bind(27, NonZeroU64::new(request_id).unwrap());
+        insert.owner = new_owner.into();
+        insert.completion = TargetCompletion::TargetPrefix {
+            common_ancestor: parent,
+        };
+        insert.aux[0].owner = new_owner.into();
+        insert.aux[0].delivery_id = EvidenceId::from_digest([marker; 32]);
+        insert.aux[0].body_size = zakura_header_chain::BodySizeHint::new(size).unwrap();
+        replay
+    };
+    let before = runtime.publisher().view();
+    let filled = runtime
+        .apply(replay(29, 0xc4, known_size.get()), &context)
+        .unwrap();
+    assert!(matches!(filled, ApplyResult::Committed), "{filled:?}");
+    let after = runtime.publisher().view();
+    assert_eq!(after.header_generation, before.header_generation);
+    assert_eq!(after.body_work_epoch, before.body_work_epoch);
+    assert_eq!(
+        after.body_size_hint_revision,
+        before.body_size_hint_revision + 1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_DELIVERY).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_BODY_SIZE).unwrap().len(),
+        1
+    );
+    let persisted = runtime.store.untrusted_aux_deliveries(target.hash).unwrap();
+    assert_eq!(
+        persisted[0].delivery().body_size,
+        zakura_header_chain::BodySizeHint::Unknown
+    );
+    assert_eq!(hints_by_hash(), vec![None, Some(known_size), None]);
+
+    // A differing known hint is false, so it cannot replace the filled size.
+    let conflicting = runtime.apply(replay(30, 0xc5, 3_146), &context).unwrap();
+    assert!(
+        matches!(conflicting, ApplyResult::NoChange(_)),
+        "{conflicting:?}"
+    );
+    assert_eq!(
+        runtime.publisher().view().body_size_hint_revision,
+        after.body_size_hint_revision
+    );
+    let config = runtime.config.clone();
+    drop(runtime);
+    let (reopened, _) = HeaderChainStore::new(db).startup(&config).unwrap();
+    assert_eq!(
+        reopened
+            .reader()
+            .body_size_hints_by_hash(&[target.hash])
+            .unwrap(),
+        vec![Some(known_size)]
+    );
+}
+
+#[test]
+fn retained_path_lookup_stops_at_the_locator_outside_commit_locks() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(64);
+    let reader = runtime.reader();
+    let target = path.last().unwrap();
+    let parent = &path[path.len() - 2];
+    let snapshot = runtime.publisher().snapshot();
+    let scope = HeaderWorkAuthority::for_target(&snapshot, target.hash);
+
+    // Make an older, unrequested row unreadable so a walk past the locator fails
+    // deterministically. The target's requested suffix is still intact.
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .delete_raw(&mut batch, HEADER_NODE_BY_HASH, path[3].hash.0)
+        .unwrap();
+    db.write(batch).unwrap();
+    let read = reader.store.audit_snapshot().unwrap();
+    let node = read.retained_path_node(target.hash).unwrap().unwrap();
+    {
+        let _writer = reader.store.writer.lock().unwrap();
+        let _engine = reader.transition_engine.lock().unwrap();
+        let ancestors = read
+            .retained_ancestry_to_locator(node, snapshot.frontiers.finalized, &[parent.hash])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ancestors,
+            vec![
+                Frontier::new(target.height, target.hash),
+                Frontier::new(parent.height, parent.hash),
+            ]
+        );
+    }
+
+    let source = SourceId::from_digest([0xc1; 32]);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target.hash, &[parent.hash, path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("a one-header request only needs the intact suffix");
+    };
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, lease.lease_id, scope, parent.hash, 1)
+        .unwrap()
+    else {
+        panic!("the requested suffix can be served");
+    };
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    assert!(matches!(
+        reader
+            .acquire_retained_path(
+                SourceId::from_digest([0xc2; 32]),
+                7,
+                target.hash,
+                &[path[2].hash, parent.hash],
+                scope,
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::HistoryPruned
+    ));
+}
+
+#[test]
+fn retained_path_lookup_preserves_locator_priority_and_skips_other_branches() {
+    let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let target = &path[4];
+    let snapshot = runtime.publisher().snapshot();
+    let scope = HeaderWorkAuthority::for_target(&snapshot, target.hash);
+    let mut fork = runtime.store.header_node(path[3].hash).unwrap().unwrap();
+    let mut header = *fork.header;
+    header.nonce.0[0] = 0xff;
+    fork.header = Arc::new(header);
+    fork.hash = fork.header.hash();
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut batch,
+            HEADER_NODE_BY_HASH,
+            fork.hash.0,
+            &HeaderNodeDisk::from_domain(&fork),
+        )
+        .unwrap();
+    db.write(batch).unwrap();
+    for (index, (locators, ancestor)) in [
+        (vec![path[2].hash, path[3].hash], &path[2]),
+        (vec![path[3].hash, path[2].hash], &path[3]),
+        (vec![genesis.hash, path[3].hash], &genesis),
+        (vec![path[3].hash, genesis.hash], &path[3]),
+        (vec![path[5].hash, path[3].hash], &path[3]),
+        (vec![fork.hash, target.hash], target),
+        (vec![fork.hash, path[3].hash], &path[3]),
+        (vec![fork.hash, genesis.hash], &genesis),
+        (vec![target.hash, path[3].hash], target),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = SourceId::from_digest([u8::try_from(index).unwrap(); 32]);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(source, 7, target.hash, &locators, scope)
+            .unwrap()
+        else {
+            panic!("each locator list intersects the retained target's ancestry");
+        };
+        assert_eq!(lease.common_ancestor.hash, ancestor.hash);
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(source, 7, lease.lease_id, scope, ancestor.hash, 10)
+            .unwrap()
+        else {
+            panic!("the path from the chosen locator remains contiguous");
+        };
+        assert_eq!(
+            page.headers.len(),
+            usize::try_from(target.height.0 - ancestor.height.0).unwrap()
+        );
+        assert_eq!(page.target.hash, target.hash);
+        assert!(page.complete);
+    }
+}
+
+#[test]
+fn retained_path_survives_finalization_during_and_between_page_reads() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let source = SourceId::from_digest([0xa1; 32]);
+    let before = runtime.publisher().snapshot();
+    let scope = HeaderWorkAuthority::for_target(&before, target.hash);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target.hash, &[path[2].hash], scope)
+        .expect("the retained target can be leased")
+    else {
+        panic!("the retained target has capacity");
+    };
+    let cursor = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .get(source, 7, lease.lease_id, Instant::now())
+        .unwrap();
+    let captured = reader.capture_path_read(&cursor, 1).unwrap();
+    let ancestry_read = reader.store.audit_snapshot().unwrap();
+    finalize_serving_test_path(&runtime, &db, &path[3..5]);
+    assert!(runtime.publisher().snapshot().header_generation > before.header_generation);
+    assert!(
+        runtime.store.header_node(target.hash).unwrap().is_none(),
+        "finality removes the old retained row"
+    );
+    let ancestors = ancestry_read
+        .retained_ancestry_to_locator(
+            ancestry_read
+                .retained_path_node(target.hash)
+                .unwrap()
+                .unwrap(),
+            before.frontiers.finalized,
+            &[path[2].hash],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(ancestors, vec![target, before.frontiers.finalized]);
+    let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+        .unwrap()
+    else {
+        panic!("a fresh page reads the same hash from finalized storage");
+    };
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    let RetainedPathLeaseOutcome::Acquired(fresh) = reader
+        .acquire_retained_path(
+            SourceId::from_digest([0xa2; 32]),
+            7,
+            target.hash,
+            &[path[2].hash],
+            scope,
+        )
+        .unwrap()
+    else {
+        panic!("an acquisition queued before finality can still serve the exact hash");
+    };
+    assert_eq!(fresh.target, target);
+    assert_eq!(fresh.scope, scope);
+}
+
+#[test]
+fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xb1; 32]);
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let before = runtime.publisher().snapshot();
+    let scope = HeaderWorkAuthority::for_target(&before, target.hash);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target.hash, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the original target is retained");
+    };
+    let cursor = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .get(source, 7, lease.lease_id, Instant::now())
+        .unwrap();
+    let captured = reader.capture_path_read(&cursor, 1).unwrap();
+    let ancestry_read = reader.store.audit_snapshot().unwrap();
+
+    let cached_source = SourceId::from_digest([0xb4; 32]);
+    let cached_target = path[4].hash;
+    let cached_scope = HeaderWorkAuthority::for_target(&before, cached_target);
+    let RetainedPathLeaseOutcome::Acquired(cached_lease) = reader
+        .acquire_retained_path(
+            cached_source,
+            8,
+            cached_target,
+            &[path[2].hash],
+            cached_scope,
+        )
+        .unwrap()
+    else {
+        panic!("the longer losing path can prepare a continuation");
+    };
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(
+            cached_source,
+            8,
+            cached_lease.lease_id,
+            cached_scope,
+            path[2].hash,
+            1,
+        )
+        .unwrap()
+    else {
+        panic!("the first losing-path page is available before finality");
+    };
+    assert!(!page.complete);
+
+    let pending_source = SourceId::from_digest([0xb2; 32]);
+    let reservation_id = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .reserve(
+            pending_source,
+            Instant::now(),
+            RetainedPathCapacity::General,
+        )
+        .unwrap();
+    let reservation = RetainedPathReservation {
+        leases: runtime.leases.clone(),
+        peer: pending_source,
+        reservation_id,
+        active: true,
+    };
+    let pending = RetainedPathLeaseSpec {
+        peer: pending_source,
+        session_id: 8,
+        target,
+        common_ancestor: cursor.common_ancestor,
+        scope,
+        position: cursor.position,
+        retained_ancestor: cursor.retained_ancestor,
+        retained_path: cursor.retained_path.clone(),
+    };
+
+    let mut parent = path[2].clone();
+    let mut fork = Vec::new();
+    for _ in 0..3 {
+        let mut header = *parent.header;
+        header.previous_block_hash = parent.hash;
+        header.time += chrono::Duration::seconds(10);
+        let header = Arc::new(header);
+        parent = VerifiedHeaderRef {
+            height: parent.height.next().unwrap(),
+            hash: header.hash(),
+            header,
+        };
+        fork.push(parent.clone());
+    }
+    let evidence = EvidenceId::from_digest([0xb3; 32]);
+    let authority = Authority(evidence);
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                    full_state_transition_id: evidence,
+                    old_tip: before.frontiers.verified_best,
+                    new_path: fork.clone(),
+                    cause: VerifiedChangeCause::Reset,
+                }),
+            },
+            &TransitionContext {
+                config: &runtime.config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+        )
+        .expect("full state can select the competing verified path");
+    finalize_serving_test_path(&runtime, &db, &fork[..2]);
+    assert_eq!(
+        reader
+            .acquire_retained_path(
+                cached_source,
+                8,
+                cached_target,
+                &[path[3].hash],
+                cached_scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::TargetNotRetained,
+        "a cached path must not resurrect a branch removed by finality"
+    );
+    assert!(runtime.store.header_node(target.hash).unwrap().is_none());
+    assert!(reader
+        .store
+        .audit_snapshot()
+        .unwrap()
+        .finalized_frontier(target.hash)
+        .unwrap()
+        .is_none());
+
+    let ancestors = ancestry_read
+        .retained_ancestry_to_locator(
+            ancestry_read
+                .retained_path_node(target.hash)
+                .unwrap()
+                .unwrap(),
+            before.frontiers.finalized,
+            &[path[2].hash],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(ancestors, vec![target, before.frontiers.finalized]);
+
+    let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    assert_eq!(
+        reader
+            .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Unavailable
+    );
+    assert!(matches!(
+        reader.commit_path_lease(reservation, pending).unwrap(),
+        RetainedPathLeaseOutcome::TargetNotRetained
+    ));
+    let leases = runtime.leases.lock().unwrap();
+    assert!(!leases.reservations.contains_key(&pending_source));
+    assert!(!leases.by_peer.contains_key(&pending_source));
+}
+
+fn finalize_serving_test_path(
+    runtime: &HeaderChainRuntime,
+    db: &DiskDb,
+    rows: &[VerifiedHeaderRef],
+) {
+    let before = runtime.publisher().snapshot();
+    let last = rows.last().expect("the test finalizes a nonempty range");
+    let finalized = Frontier::new(last.height, last.hash);
+    let proof: Vec<_> = runtime
+        .verified_projection()
+        .unwrap()
+        .into_iter()
+        .take_while(|frontier| frontier.height <= finalized.height)
+        .map(|frontier| frontier.hash)
+        .collect();
+    let evidence =
+        zakura_header_chain::full_state_finality_evidence(before.state_version, finalized, &proof);
+    let authority = Authority(evidence);
+    let mut batch = DiskWriteBatch::new();
+    for header in rows {
+        batch.zs_insert(
+            &db.cf_handle("hash_by_height").unwrap(),
+            header.height,
+            header.hash,
+        );
+        batch.zs_insert(
+            &db.cf_handle("height_by_hash").unwrap(),
+            header.hash,
+            header.height,
+        );
+        batch.zs_insert(
+            &db.cf_handle("block_header_by_height").unwrap(),
+            header.height,
+            header.header.as_ref(),
+        );
+    }
+    runtime
+        .apply_combined(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::FullStateFinalized(FullStateFinalized {
+                    full_state_transition_id: evidence,
+                    new_finalized: finalized,
+                    verified_path_proof: proof,
+                }),
+            },
+            &TransitionContext {
+                config: &runtime.config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+            batch,
+            || {},
+        )
+        .expect("the authoritative test path finalizes");
+}
+
+#[test]
+fn capacity_signals_follow_reservations_and_capacity_classes() {
+    let mut leases = RetainedPathLeaseRegistry::default();
+    let now = Instant::now();
+    let first = SourceId::from_digest([0; 32]);
+    let first_id = leases
+        .reserve(first, now, RetainedPathCapacity::General)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(peer_wait)) =
+        leases.reserve(first, now, RetainedPathCapacity::General)
+    else {
+        panic!("the reservation occupies this peer's slot")
+    };
+    for marker in 1..MAX_RETAINED_PATH_LEASES - 1 {
+        leases
+            .reserve(
+                SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                now,
+                RetainedPathCapacity::General,
+            )
+            .unwrap();
+    }
+    let waiting = SourceId::from_digest([0xfe; 32]);
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(general_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::General)
+    else {
+        panic!("general capacity is full")
+    };
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(other_wait)) = leases.reserve(
+        SourceId::from_digest([0xfd; 32]),
+        now,
+        RetainedPathCapacity::General,
+    ) else {
+        panic!("another peer shares the same full capacity class")
+    };
+    assert_eq!(general_wait, other_wait);
+    let fallback = SourceId::from_digest([0xff; 32]);
+    let fallback_id = leases
+        .reserve(fallback, now, RetainedPathCapacity::FinalizedFallback)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(fallback_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::FinalizedFallback)
+    else {
+        panic!("fallback capacity is full")
+    };
+    leases.release_reservation(fallback, fallback_id + 1);
+    assert!(!fallback_wait.is_released());
+    leases.release_reservation(fallback, fallback_id);
+    assert!(fallback_wait.is_released());
+    assert!(!general_wait.is_released());
+    assert!(!peer_wait.is_released());
+    leases.release_reservation(first, first_id);
+    assert!(general_wait.is_released());
+    assert!(other_wait.is_released());
+    assert!(peer_wait.is_released());
+    let replacement = leases
+        .reserve(first, now, RetainedPathCapacity::General)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(next_general_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::General)
+    else {
+        panic!("another peer acquired the available general slot")
+    };
+    assert_ne!(general_wait, next_general_wait);
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(next_wait)) =
+        leases.reserve(first, now, RetainedPathCapacity::General)
+    else {
+        panic!("the replacement occupies this peer's slot")
+    };
+    leases.release_reservation(first, first_id);
+    assert!(!next_wait.is_released());
+    assert!(!next_general_wait.is_released());
+    leases.release_reservation(first, replacement);
+    assert!(next_wait.is_released());
+    assert!(next_general_wait.is_released());
+}
+
+#[test]
+fn capacity_signal_survives_reservation_commit_and_page_release() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd8; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the target is retained")
+    };
+    let RetainedPathLeaseOutcome::CapacityBusy(signal) = reader
+        .acquire_retained_path(source, 8, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first session holds this peer's slot")
+    };
+    assert!(!reader
+        .release_retained_path(source, 8, lease.lease_id, scope)
+        .unwrap());
+    assert!(!signal.is_released());
+    assert!(matches!(
+        reader
+            .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+    assert!(signal.is_released());
+    assert!(!reader
+        .release_retained_path(source, 7, lease.lease_id, scope)
+        .unwrap());
+}
+
+#[test]
+fn dropped_reservation_notifies_waiters() {
+    let leases = Arc::new(Mutex::new(RetainedPathLeaseRegistry::default()));
+    let peer = SourceId::from_digest([0xd9; 32]);
+    let id = leases
+        .lock()
+        .unwrap()
+        .reserve(peer, Instant::now(), RetainedPathCapacity::General)
+        .unwrap();
+    let reservation = RetainedPathReservation {
+        leases: leases.clone(),
+        peer,
+        reservation_id: id,
+        active: true,
+    };
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(signal)) =
+        leases
+            .lock()
+            .unwrap()
+            .reserve(peer, Instant::now(), RetainedPathCapacity::General)
+    else {
+        panic!("the reservation occupies this peer's slot")
+    };
+    assert!(!signal.is_released());
+    drop(reservation);
+    assert!(signal.is_released());
+}
+
+#[test]
+fn reservation_commit_keeps_the_waiter_until_exact_release_or_expiry() {
+    for expire in [false, true] {
+        let mut leases = RetainedPathLeaseRegistry::default();
+        let peer = SourceId::from_digest([0xda; 32]);
+        let now = Instant::now();
+        let reservation = leases
+            .reserve(peer, now, RetainedPathCapacity::General)
+            .unwrap();
+        let Err(RetainedPathLeaseOutcome::CapacityBusy(signal)) =
+            leases.reserve(peer, now, RetainedPathCapacity::General)
+        else {
+            panic!("the reservation occupies this peer's slot")
+        };
+        let frontier = Frontier::new(block::Height(0), block::Hash([0; 32]));
+        let scope = HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            branch: zakura_header_chain::BranchId::new(frontier.hash, frontier.hash),
+        };
+        let RetainedPathLeaseOutcome::Acquired(lease) = leases.commit_reservation(
+            peer,
+            reservation,
+            RetainedPathLeaseSpec {
+                peer,
+                session_id: 7,
+                target: frontier,
+                common_ancestor: frontier,
+                scope,
+                position: CanonicalHeaderPathPosition::Complete,
+                retained_ancestor: None,
+                retained_path: Arc::from([]),
+            },
+            now,
+        ) else {
+            panic!("the reservation commits its lease")
+        };
+        assert!(!signal.is_released());
+        assert!(!leases.release(peer, 8, lease.lease_id, scope));
+        assert!(!signal.is_released());
+        if expire {
+            leases.expire(now + RETAINED_PATH_LEASE_IDLE);
+        } else {
+            assert!(leases.release(peer, 7, lease.lease_id, scope));
+        }
+        assert!(signal.is_released());
+    }
+}
+
+#[tokio::test]
+async fn abandoned_blocking_acquisition_releases_its_lease_and_notifies_waiters() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(7);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xe5; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let outcome = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap();
+    assert!(matches!(outcome, RetainedPathLeaseOutcome::Acquired(_)));
+    let RetainedPathLeaseOutcome::CapacityBusy(signal) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first acquisition owns the peer slot");
+    };
+    let (resume, blocked) = std::sync::mpsc::channel();
+    let task_reader = reader.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        blocked.recv().unwrap();
+        PendingRetainedPathAcquisition::new(task_reader, outcome)
+    });
+    drop(task);
+    assert!(!signal.is_released());
+    resume.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), signal.released())
+        .await
+        .unwrap();
+    let outcome = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap();
+    let pending = PendingRetainedPathAcquisition::new(reader.clone(), outcome);
+    let RetainedPathLeaseOutcome::Acquired(lease) = pending.into_outcome() else {
+        panic!("abandonment must return the peer slot");
+    };
+    // Receiving the result transfers ownership to the caller.
+    assert!(reader
+        .release_retained_path(source, 7, lease.lease_id, scope)
+        .unwrap());
+}
+
+fn retained_checkpoint_fixture() -> (HeaderChainRuntime, DiskDb, Vec<VerifiedHeaderRef>) {
+    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let before = runtime.publisher().snapshot();
+    let evidence = EvidenceId::from_digest([0xc4; 32]);
+    let authority = Authority(evidence);
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                    full_state_transition_id: evidence,
+                    old_tip: before.frontiers.verified_best,
+                    new_path: Vec::new(),
+                    cause: VerifiedChangeCause::Reset,
+                }),
+            },
+            &TransitionContext {
+                config: &runtime.config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+        )
+        .expect("the fixture resets the verified tip while retaining its headers");
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.verified_best,
+        before.frontiers.finalized
+    );
+    (runtime, db, path)
+}
+
+#[test]
+fn retained_checkpoint_omits_context_but_missing_headers_and_other_causes_keep_it() {
+    let (runtime, _db, path) = retained_checkpoint_fixture();
+    let before = runtime.publisher().snapshot();
+    let make_request = |header: VerifiedHeaderRef, cause| TransitionRequest {
+        expected_version: before.state_version,
+        event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+            full_state_transition_id: zakura_header_chain::checkpoint_finality_evidence(
+                before.state_version,
+                Frontier::new(header.height, header.hash),
+            ),
+            old_tip: before.frontiers.verified_best,
+            new_path: vec![header],
+            cause,
+        }),
+    };
+    let engine = runtime
+        .transition_engine
+        .lock()
+        .expect("the fixture writer is unlocked");
+    let retained = make_request(
+        path[3].clone(),
+        VerifiedChangeCause::CheckpointFinalizedGrow,
+    );
+    let input = runtime
+        .build_transition_input(retained.clone(), &before, runtime.config.network(), &engine)
+        .expect("retained checkpoint input needs no durable context");
+    assert!(input
+        .header_validation_facts()
+        .expect("checkpoint facts exist")
+        .validation_leases
+        .is_empty());
+    let grow = runtime
+        .build_transition_input(
+            make_request(path[3].clone(), VerifiedChangeCause::Grow),
+            &before,
+            runtime.config.network(),
+            &engine,
+        )
+        .expect("ordinary growth keeps its context");
+    assert_eq!(
+        grow.header_validation_facts()
+            .expect("growth facts exist")
+            .validation_leases
+            .len(),
+        1
+    );
+    let mut missing = path[3].clone();
+    Arc::make_mut(&mut missing.header).nonce.0[0] ^= 0x80;
+    missing.hash = missing.header.hash();
+    let input = runtime
+        .build_transition_input(
+            make_request(missing, VerifiedChangeCause::CheckpointFinalizedGrow),
+            &before,
+            runtime.config.network(),
+            &engine,
+        )
+        .expect("a missing header receives durable context");
+    assert_eq!(
+        input
+            .header_validation_facts()
+            .expect("checkpoint facts exist")
+            .validation_leases
+            .len(),
+        1
+    );
+    drop(engine);
+
+    let TransitionEvent::VerifiedChainChanged(event) = &retained.event else {
+        unreachable!()
+    };
+    let authority = Authority(event.full_state_transition_id);
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: Some(&authority),
+        retention_references: &[],
+    };
+    let mut batch = DiskWriteBatch::new();
+    let accepted = Frontier::new(path[3].height, path[3].hash);
+    stage_full_state_canonical_hash(&runtime.store, &mut batch, accepted);
+    assert!(matches!(
+        runtime
+            .apply_combined(retained, &context, batch, || {})
+            .expect("retained checkpoint commits through the full adapter"),
+        ApplyResult::Committed
+    ));
+    assert_eq!(runtime.publisher().snapshot().frontiers.finalized, accepted);
+}
+
+#[test]
+fn retained_checkpoint_still_rejects_mismatched_header_identity() {
+    let (runtime, _db, path) = retained_checkpoint_fixture();
+    let before = runtime.publisher().snapshot();
+    let accepted = Frontier::new(path[3].height, path[3].hash);
+    let evidence =
+        zakura_header_chain::checkpoint_finality_evidence(before.state_version, accepted);
+    let authority = Authority(evidence);
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: Some(&authority),
+        retention_references: &[],
+    };
+    let mut tampered = path[3].clone();
+    Arc::make_mut(&mut tampered.header).nonce.0[0] ^= 0x80;
+    let request = TransitionRequest {
+        expected_version: before.state_version,
+        event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+            full_state_transition_id: evidence,
+            old_tip: before.frontiers.verified_best,
+            new_path: vec![tampered],
+            cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+    assert!(runtime
+        .apply_combined(request, &context, DiskWriteBatch::new(), || {})
+        .is_err());
+    assert_eq!(runtime.publisher().snapshot(), before);
 }

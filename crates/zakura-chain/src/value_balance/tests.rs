@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use crate::{
-    amount::{Amount, NegativeAllowed, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -112,4 +112,225 @@ fn value_balance_bytes_report_invalid_tail_pool() {
         ValueBalance::<NonNegative>::from_bytes(&bytes[..47]),
         Err(ValueBalanceError::Unparsable)
     );
+}
+
+#[test]
+fn chain_pool_total_limit_includes_every_pool() {
+    let _init_guard = zakura_test::init();
+
+    // Every pool contributes to a total exactly at the cap.
+    #[cfg(not(zcash_unstable = "nutachyon"))]
+    let share = Amount::<NonNegative>::try_from(MAX_MONEY / 6).unwrap();
+    #[cfg(zcash_unstable = "nutachyon")]
+    let share = Amount::<NonNegative>::try_from(MAX_MONEY / 7).unwrap();
+    let at_cap = ValueBalance {
+        transparent: share,
+        sprout: share,
+        sapling: share,
+        orchard: share,
+        deferred: share,
+        ironwood: share,
+        // The NSM value balance holds value that is in no pool, so `total` excludes it.
+        nsm_value_balance: Amount::zero(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon: share,
+    };
+    assert_eq!(at_cap.total(), Ok(Amount::try_from(MAX_MONEY).unwrap()));
+    assert_eq!(
+        at_cap.add_chain_value_pool_change(ValueBalance::zero()),
+        Ok(at_cap)
+    );
+
+    let one = Amount::<NegativeAllowed>::try_from(1).unwrap();
+    let mut deferred_change = ValueBalance::zero();
+    deferred_change.set_deferred_amount(one);
+    for change in [
+        ValueBalance::from_transparent_amount(one),
+        ValueBalance::from_sprout_amount(one),
+        ValueBalance::from_sapling_amount(one),
+        ValueBalance::from_orchard_amount(one),
+        deferred_change,
+        ValueBalance::from_ironwood_amount(one),
+    ] {
+        // Every individual pool remains valid, but the combined total is one zatoshi over.
+        assert!(matches!(
+            at_cap.add_chain_value_pool_change(change),
+            Err(ValueBalanceError::Total(_))
+        ));
+        let below_cap = at_cap.add_chain_value_pool_change(-change).unwrap();
+        assert_eq!(
+            below_cap.total(),
+            Ok(Amount::try_from(MAX_MONEY - 1).unwrap())
+        );
+        assert_eq!(below_cap.add_chain_value_pool_change(change), Ok(at_cap));
+    }
+}
+
+#[test]
+fn chain_pool_transfer_at_total_limit_is_valid() {
+    let _init_guard = zakura_test::init();
+
+    let initial =
+        ValueBalance::from_transparent_amount(Amount::<NonNegative>::try_from(MAX_MONEY).unwrap());
+    let one = Amount::<NegativeAllowed>::try_from(1).unwrap();
+    let mut transfer = ValueBalance::from_transparent_amount(-one);
+    transfer.set_ironwood_value_balance(ValueBalance::from_ironwood_amount(one));
+    let updated = initial.add_chain_value_pool_change(transfer).unwrap();
+    assert_eq!(updated.total(), initial.total());
+    assert_eq!(updated.add_chain_value_pool_change(-transfer), Ok(initial));
+}
+
+#[test]
+fn total_sums_signed_balances_before_applying_the_constraint() {
+    let _init_guard = zakura_test::init();
+
+    let max = Amount::<NegativeAllowed>::try_from(MAX_MONEY).unwrap();
+    let mut balance = ValueBalance::from_transparent_amount(max);
+    balance.set_sprout_value_balance(ValueBalance::from_sprout_amount(max));
+    balance.set_ironwood_value_balance(ValueBalance::from_ironwood_amount(-max));
+    assert_eq!(balance.total(), Ok(max));
+}
+
+#[test]
+fn signed_deficit_roundtrips_without_changing_monetary_totals() {
+    for deficit in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
+        let mut pools =
+            ValueBalance::from_transparent_amount(Amount::<NonNegative>::try_from(7).unwrap());
+        pools.set_nsm_value_balance_amount(Amount::try_from(deficit).unwrap());
+        assert_eq!(i64::from(pools.total().unwrap()), 7);
+        assert_eq!(i64::from(pools.issued_supply()), 7);
+        assert_eq!(i64::from(pools.money_reserve()), MAX_MONEY - 7);
+        assert_eq!(ValueBalance::from_bytes(&pools.to_bytes()).unwrap(), pools);
+        let signed = pools.constrain::<NegativeAllowed>().unwrap();
+        assert_eq!(signed.constrain::<NonNegative>().unwrap(), pools);
+        assert_eq!((signed + -signed).unwrap(), ValueBalance::zero());
+    }
+}
+
+#[test]
+fn nsm_seed_matches_measured_public_network_supply() {
+    use crate::{block::Height, parameters::Network};
+    for (network, height, issued, expected) in [
+        (
+            Network::Mainnet,
+            2_726_399,
+            1_574_963_141_554_480i64,
+            36_858_445_520i64,
+        ),
+        (
+            Network::new_default_testnet(),
+            2_975_999,
+            1_603_069_231_585_043,
+            55_768_414_957,
+        ),
+    ] {
+        let mut pools =
+            ValueBalance::from_transparent_amount(Amount::<NonNegative>::try_from(issued).unwrap());
+        // NSM is not part of issued supply, even if a migration already wrote it.
+        pools.set_nsm_value_balance_amount(Amount::try_from(123).unwrap());
+        assert_eq!(
+            i64::from(
+                pools
+                    .initial_nsm_value_balance(Height(height), &network)
+                    .unwrap()
+            ),
+            expected
+        );
+        let wrong = pools
+            .add_chain_value_pool_change(ValueBalance::from_transparent_amount(
+                Amount::try_from(1).unwrap(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            wrong.initial_nsm_value_balance(Height(height), &network),
+            Err(ValueBalanceError::NsmSeedMismatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn nsm_seed_uses_all_monetary_pools_and_rejects_overissuance() {
+    use crate::{
+        block::Height,
+        parameters::{
+            subsidy::scheduled_issuance_zatoshis,
+            testnet::{ConfiguredActivationHeights, RegtestParameters},
+            Network,
+        },
+    };
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(3),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let height = Height(2);
+    let scheduled = i64::try_from(scheduled_issuance_zatoshis(height, &network).unwrap()).unwrap();
+    let mut pools = ValueBalance::from_transparent_amount(
+        Amount::<NonNegative>::try_from(scheduled - 100).unwrap(),
+    );
+    for leg in [
+        ValueBalance::from_sprout_amount,
+        ValueBalance::from_sapling_amount,
+        ValueBalance::from_orchard_amount,
+        ValueBalance::from_ironwood_amount,
+    ] {
+        pools = (pools + leg(Amount::try_from(10).unwrap())).unwrap();
+    }
+    pools.set_deferred_amount(Amount::try_from(10).unwrap());
+    let seeded = pools.seed_nsm_value_balance(height, &network).unwrap();
+    assert_eq!(i64::from(seeded.nsm_value_balance_amount()), 50);
+    assert_eq!(seeded.total().unwrap(), pools.total().unwrap());
+    assert_eq!(
+        seeded.seed_nsm_value_balance(height, &network).unwrap(),
+        seeded
+    );
+    assert_eq!(
+        pools.seed_nsm_value_balance(Height(1), &network).unwrap(),
+        pools
+    );
+    assert_eq!(
+        pools.seed_nsm_value_balance(Height(3), &network).unwrap(),
+        pools
+    );
+    let over = ValueBalance::from_transparent_amount(
+        Amount::<NonNegative>::try_from(scheduled + 1).unwrap(),
+    );
+    assert!(matches!(
+        over.seed_nsm_value_balance(height, &network),
+        Err(ValueBalanceError::NsmValueBalance(_))
+    ));
+    for seed in [0, 123] {
+        let configured = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(3),
+                ..Default::default()
+            },
+            initial_nsm_value_balance: Some(Amount::try_from(seed).unwrap()),
+            ..Default::default()
+        });
+        assert_eq!(
+            i64::from(
+                over.seed_nsm_value_balance(height, &configured)
+                    .unwrap()
+                    .nsm_value_balance_amount()
+            ),
+            seed
+        );
+    }
+    for nu7 in [None, Some(1)] {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let zero = ValueBalance::<NonNegative>::zero();
+        assert_eq!(
+            zero.seed_nsm_value_balance(Height(0), &network).unwrap(),
+            zero
+        );
+    }
 }

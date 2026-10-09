@@ -34,6 +34,7 @@ pub const REDEEM_SCRIPT_HASH: [u8; 20] = [
 const OP_TRUE: u8 = 0x51;
 const WORKLOAD_FEE: u64 = 50_000;
 const STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Generate transactions that shield the first newly mature internal-miner reward into Tachyon.
 ///
@@ -98,6 +99,36 @@ where
         }
     };
 
+    let workload_script = workload_address(network).script();
+    let generation = tokio::task::spawn_blocking(move || {
+        build_transactions(
+            candidate_height,
+            source_height,
+            source_block,
+            workload_script,
+            tip_anchor,
+        )
+    });
+    match timeout(GENERATION_TIMEOUT, generation).await {
+        Ok(Ok(transactions)) => transactions,
+        Ok(Err(error)) => {
+            tracing::warn!(?error, "Tachyon workload generation task failed");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("timed out generating Tachyon workload transactions");
+            Vec::new()
+        }
+    }
+}
+
+fn build_transactions(
+    candidate_height: Height,
+    source_height: Height,
+    source_block: Arc<block::Block>,
+    workload_script: transparent::Script,
+    tip_anchor: zakura_chain::tachyon::Anchor,
+) -> Vec<VerifiedUnminedTx> {
     let Some(coinbase) = source_block.transactions.first() else {
         tracing::warn!(
             ?source_height,
@@ -107,7 +138,6 @@ where
     };
 
     let source_hash = coinbase.hash();
-    let workload_script = workload_address(network).script();
     let mut transactions = Vec::with_capacity(TRANSACTIONS_PER_BLOCK);
 
     for (index, output) in coinbase.outputs().iter().enumerate() {
@@ -233,6 +263,7 @@ fn transaction(
         network_upgrade: NetworkUpgrade::NuTachyon,
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: candidate_height,
+        zip233_amount: Amount::zero(),
         inputs: vec![transparent::Input::PrevOut {
             outpoint,
             // Push the one-byte OP_TRUE redeem script onto the P2SH script stack.
@@ -255,7 +286,7 @@ mod tests {
         amount::NonNegative,
         parameters::testnet::ConfiguredActivationHeights,
         serialization::{ZcashDeserialize, ZcashDeserializeInto},
-        transaction::Hash,
+        transaction::{Hash, WtxId},
     };
     use zakura_node_services::BoxError;
     use zakura_state::TachyonMiningData;
@@ -279,7 +310,7 @@ mod tests {
             Height(200),
             outpoint,
             source_output,
-            zakura_chain::tachyon::Anchor::default(),
+            zcash_tachyon::Anchor::default().into(),
         )
         .expect("output-only mock proof can be generated");
         let transaction = generated.transaction.transaction();
@@ -298,9 +329,23 @@ mod tests {
             generated.miner_fee,
             Amount::<NonNegative>::try_from(WORKLOAD_FEE).unwrap()
         );
+        let sighash = transaction
+            .sighash(
+                NetworkUpgrade::NuTachyon,
+                HashType::ALL,
+                generated.spent_outputs.clone(),
+                None,
+            )
+            .expect("generated V7 transaction has a sighash");
+        let wtxid: [u8; 64] = WtxId::from(transaction.as_ref()).into();
         bundle
-            .verify_coverage(&[])
-            .expect("proof stamp covers the generated action");
+            .verify(
+                &mut StdRng::from_seed([8; 32]),
+                sighash.as_ref(),
+                &wtxid,
+                &[],
+            )
+            .expect("generated signatures, tachygrams, coverage, and mock proof are valid");
     }
 
     #[tokio::test]
@@ -335,6 +380,7 @@ mod tests {
             source_height,
             &miner_params,
             Amount::zero(),
+            Some(Amount::zero()),
         )
         .expect("workload coinbase can be built");
         let coinbase = coinbase
@@ -347,7 +393,7 @@ mod tests {
                 .expect("hardcoded genesis block deserializes");
         source_block.transactions = vec![Arc::new(coinbase)];
         let tip_hash = source_block.hash();
-        let tip_anchor = zakura_chain::tachyon::Anchor::default();
+        let tip_anchor = zcash_tachyon::Anchor::default().into();
 
         let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
         let generation =
@@ -372,7 +418,11 @@ mod tests {
                     revealed_tachygrams: HashSet::new(),
                 })));
         };
-        let (generated, ()) = tokio::join!(generation, responses);
+        let (generated, ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(generation, responses)
+        })
+        .await
+        .expect("workload generation and state queries complete promptly");
 
         assert_eq!(generated.len(), TRANSACTIONS_PER_BLOCK);
         assert!(generated.iter().all(|transaction| matches!(
@@ -406,7 +456,11 @@ mod tests {
                     revealed_tachygrams: HashSet::new(),
                 })));
         };
-        let (aggregated, ()) = tokio::join!(aggregation, aggregation_response);
+        let (aggregated, ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(aggregation, aggregation_response)
+        })
+        .await
+        .expect("workload aggregation and state queries complete promptly");
 
         assert_eq!(aggregated.len(), TRANSACTIONS_PER_BLOCK);
         assert!(matches!(

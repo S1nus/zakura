@@ -1,7 +1,5 @@
 //! Constants that impact state behaviour.
 
-use lazy_static::lazy_static;
-use regex::Regex;
 use semver::Version;
 
 use zakura_chain::parameters::{Network, NetworkKind};
@@ -20,6 +18,13 @@ pub use zakura_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
 /// non-finalized chain. The value lives in `zakura-chain` so tooling (e.g.
 /// `zakura-checkpoints`) can use it without depending on `zakura-state`.
 pub const MAX_BLOCK_REORG_HEIGHT: u32 = zakura_chain::parameters::constants::MAX_BLOCK_REORG_HEIGHT;
+
+/// The longest time a [`crate::Request::AwaitBlockInfo`] request waits for its block to commit.
+///
+/// A block's parent can still be verifying when the block needs the parent's metadata. The
+/// parent can also fail semantic verification and never reach the state. This limit bounds
+/// the wait in that case. Callers treat the timeout as retryable.
+pub const AWAIT_BLOCK_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 
 /// The directory name used to distinguish the state database from Zebra's other databases or flat files.
 pub const STATE_DATABASE_KIND: &str = "state";
@@ -96,9 +101,21 @@ pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
 #[cfg(not(zcash_unstable = "nutachyon"))]
-const DATABASE_FORMAT_VERSION: u64 = 28;
-#[cfg(zcash_unstable = "nutachyon")]
 const DATABASE_FORMAT_VERSION: u64 = 29;
+#[cfg(zcash_unstable = "nutachyon")]
+const DATABASE_FORMAT_VERSION: u64 = RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION;
+
+/// Reserved for NuTachyon databases derived from production database format 29.
+///
+/// This reservation prevents a future production format from giving version 30 a
+/// different meaning while NuTachyon development remains out of tree.
+const RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION: u64 = 30;
+
+#[cfg(not(zcash_unstable = "nutachyon"))]
+const _: () = assert!(
+    DATABASE_FORMAT_VERSION != RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION,
+    "production database format conflicts with reserved NuTachyon major version 30",
+);
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -109,20 +126,17 @@ const DATABASE_FORMAT_VERSION: u64 = 29;
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
 /// Version history:
-/// - 29.0.0: adds the Tachyon anchor and Tachygram column families, widens the chain value
-///   balance from 48 to 56 bytes, and widens history entries for the V4 history-node fields.
-///   Existing value-balance and history rows remain readable, so version 29 can reuse a version
-///   28 database without a row migration.
-#[cfg(not(zcash_unstable = "nutachyon"))]
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+/// - 30.0.0: adds the Tachyon anchor and Tachygram column families, widens the chain value
+///   balance from 56 to 64 bytes, and widens history entries for the V4 history-node fields.
+///   Existing value-balance and history rows remain readable, so version 30 can reuse a version
+///   29 database without a row migration.
 #[cfg(zcash_unstable = "nutachyon")]
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
+#[cfg(not(zcash_unstable = "nutachyon"))]
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
-#[cfg(not(zcash_unstable = "nutachyon"))]
-const DATABASE_FORMAT_PATCH_VERSION: u64 = 5;
-#[cfg(zcash_unstable = "nutachyon")]
 const DATABASE_FORMAT_PATCH_VERSION: u64 = 0;
 
 /// Returns the full semantic version of the currently running state database format code.
@@ -175,11 +189,3 @@ pub const MAX_HEADER_SYNC_HEIGHT_RANGE: u32 = 4000;
 /// the worst case, to around:
 /// `100 entries * up to 1000 blocks * 2 MB per block = 200 GB`
 pub const MAX_INVALIDATED_BLOCKS: usize = 100;
-
-lazy_static! {
-    /// Regex that matches a direct RocksDB lock error or the state initialization hint that wraps it.
-    pub static ref LOCK_FILE_ERROR: Regex = Regex::new(
-        "(lock file).*(temporarily unavailable)|(in use)|(being used by another process)|(Database likely already open)|(database lock)"
-    )
-    .expect("regex is valid");
-}

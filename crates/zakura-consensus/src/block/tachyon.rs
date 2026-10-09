@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use zakura_chain::{block::Block, transaction::WtxId};
 use zcash_tachyon::{
     stamp::StampState as _, Bundle, PointerStamp, ProofStamp, Tachygram, TachyonBundle,
-    VerifyCoverageError,
+    VerifyCoverageError, VerifyTachygramsError,
 };
 
 use crate::error::BlockError;
@@ -62,21 +62,28 @@ pub(crate) fn coherence(block: &Block) -> Result<Vec<AggregateCoverage>, BlockEr
     }
 
     for aggregate in &aggregates {
-        let adjunct_refs: Vec<_> = aggregate
+        let adjunct_descriptors: Vec<_> = aggregate
             .adjuncts
             .iter()
-            .map(|adjunct| adjunct.as_dyn())
+            .flat_map(|adjunct| adjunct.descriptors())
             .collect();
 
-        aggregate
+        let covered_descriptors = aggregate
             .bundle
-            .verify_coverage(&adjunct_refs)
+            .verify_coverage(&adjunct_descriptors)
             .map_err(|error| match error {
                 VerifyCoverageError::DuplicateActions => BlockError::TachyonDuplicateAction,
                 VerifyCoverageError::StampActionsMismatch => BlockError::TachyonCoverageMismatch,
-                VerifyCoverageError::TachygramArityMismatch => {
-                    BlockError::TachyonTachygramArityMismatch
-                }
+                error => BlockError::TachyonProofInvalid(error.to_string()),
+            })?;
+
+        aggregate
+            .bundle
+            .verify_tachygrams(covered_descriptors.len())
+            .map_err(|error| match error {
+                VerifyTachygramsError::WrongArity => BlockError::TachyonTachygramArityMismatch,
+                VerifyTachygramsError::WrongSet => BlockError::TachyonTachygramSetMismatch,
+                error => BlockError::TachyonProofInvalid(error.to_string()),
             })?;
     }
 

@@ -9,6 +9,7 @@ use chrono::Utc;
 use tower::{service_fn, ServiceExt};
 
 use zakura_chain::{
+    amount::Amount,
     block::Height,
     parameters::{testnet::ConfiguredActivationHeights, Network, NetworkUpgrade},
     transaction::{HashType, LockTime, Transaction},
@@ -57,6 +58,7 @@ fn v7_transaction(
         network_upgrade,
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: Height(0),
+        zip233_amount: Amount::zero(),
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
@@ -68,7 +70,12 @@ fn v7_transaction(
 
 /// A proof stamp with an unasserted covered-actions digest and no proof: tx-level verification
 /// never checks the stamp's proof or coverage (those are block-level rules).
-fn mock_proof_stamp(tachygrams: Vec<Tachygram>) -> ProofStamp {
+fn mock_proof_stamp() -> ProofStamp {
+    let tachygrams = [1u64, 2].map(|value| {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        Tachygram::read(&bytes[..]).expect("a small integer is a canonical field element")
+    });
     let tachygram_set = tachygrams.iter().copied().collect::<TachygramSetPoly>();
     ProofStamp {
         coverage: [0u8; 32],
@@ -146,7 +153,7 @@ fn signed_spend_bundle(value: u64) -> zcash_tachyon::Bundle<zcash_tachyon::Unpro
         .expect("bundle plan has matching signatures and an in-range value balance");
     let draft_tx = v7_transaction(
         NetworkUpgrade::NuTachyon,
-        Some(TachyonBundle::Proven(draft.stamp(mock_proof_stamp(vec![])))),
+        Some(TachyonBundle::Proven(draft.stamp(mock_proof_stamp()))),
     );
     let sighash = v7_sighash(&draft_tx);
 
@@ -196,7 +203,7 @@ async fn verify_block_transaction(
 #[test]
 fn mempool_accepts_only_autonome_tachyon_transactions() {
     let bundle = signed_spend_bundle(100);
-    let mut stamp = mock_proof_stamp(vec![]);
+    let mut stamp = mock_proof_stamp();
     stamp.coverage = action_descriptor_digest(&bundle.actions);
     let autonome = bundle.stamp(stamp);
 
@@ -244,21 +251,21 @@ async fn v7_sighash_commits_to_tachyon_bundle() {
     let proven_sighash = v7_sighash(&v7_transaction(
         NetworkUpgrade::NuTachyon,
         Some(TachyonBundle::Proven(
-            bundle.clone().stamp(mock_proof_stamp(vec![])),
+            bundle.clone().stamp(mock_proof_stamp()),
         )),
     ));
     let adjunct_sighash = v7_sighash(&v7_transaction(
         NetworkUpgrade::NuTachyon,
         Some(TachyonBundle::Adjunct(
             bundle
-                .stamp(mock_proof_stamp(vec![]))
+                .stamp(mock_proof_stamp())
                 .strip(PointerStamp::try_from([0xEEu8; 64]).expect("nonzero wtxid")),
         )),
     ));
     let other_bundle_sighash = v7_sighash(&v7_transaction(
         NetworkUpgrade::NuTachyon,
         Some(TachyonBundle::Proven(
-            signed_spend_bundle(100).stamp(mock_proof_stamp(vec![])),
+            signed_spend_bundle(100).stamp(mock_proof_stamp()),
         )),
     ));
 
@@ -278,7 +285,7 @@ async fn v7_with_signed_tachyon_bundle_is_accepted() {
     let (network, height) = nutachyon_network();
 
     // Proof-stamped: the tx-level rules don't verify the proof itself.
-    let proven = signed_spend_bundle(100).stamp(mock_proof_stamp(vec![]));
+    let proven = signed_spend_bundle(100).stamp(mock_proof_stamp());
     let tx = v7_transaction(
         NetworkUpgrade::NuTachyon,
         Some(TachyonBundle::Proven(proven)),
@@ -290,7 +297,7 @@ async fn v7_with_signed_tachyon_bundle_is_accepted() {
     // Pointer-stamped: signature checks still run, proof coverage is deferred to the block.
     // The sighash excludes the stamp, so stripping a signed bundle keeps its signatures valid.
     let adjunct = signed_spend_bundle(100)
-        .stamp(mock_proof_stamp(vec![]))
+        .stamp(mock_proof_stamp())
         .strip(PointerStamp::try_from([0xEEu8; 64]).expect("nonzero wtxid"));
     let tx = v7_transaction(
         NetworkUpgrade::NuTachyon,
@@ -313,7 +320,7 @@ async fn v7_with_wrong_sighash_signatures_is_rejected() {
     let bundle = plan
         .sign(&mut rng, &[0x42u8; 32], &ask)
         .expect("bundle plan has matching signatures and an in-range value balance")
-        .stamp(mock_proof_stamp(vec![]));
+        .stamp(mock_proof_stamp());
     let tx = v7_transaction(
         NetworkUpgrade::NuTachyon,
         Some(TachyonBundle::Proven(bundle)),
@@ -329,8 +336,6 @@ async fn v7_with_wrong_sighash_signatures_is_rejected() {
 /// A tachyon action whose value commitment is the identity point is rejected.
 #[tokio::test(flavor = "multi_thread")]
 async fn v7_with_identity_cv_is_rejected() {
-    use halo2::pasta::group::CurveAffine;
-
     let _init_guard = zakura_test::init();
     let (network, height) = nutachyon_network();
 
@@ -344,7 +349,7 @@ async fn v7_with_identity_cv_is_rejected() {
     let rk = private::ActionSigningKey::new(&alpha).derive_action_public();
 
     let action = zcash_tachyon::Action {
-        cv: value::Commitment::from(halo2::pasta::pallas::Affine::identity()),
+        cv: value::Commitment::default(),
         rk,
         sig: action::Signature::read(&[0x01u8; 64][..]).expect("64 bytes"),
     };
@@ -354,7 +359,7 @@ async fn v7_with_identity_cv_is_rejected() {
         value_balance: value::Balance::ZERO,
         binding_sig: bundle::Signature::read(&[0x02u8; 64][..]).expect("64 bytes"),
         memo: Vec::new(),
-        stamp: mock_proof_stamp(vec![]),
+        stamp: mock_proof_stamp(),
     };
     let tx = v7_transaction(
         NetworkUpgrade::NuTachyon,
@@ -392,7 +397,7 @@ async fn v7_is_rejected_before_nu_tachyon() {
     let bundle = plan
         .sign(&mut rng, &[0u8; 32], &ask)
         .expect("bundle plan has matching signatures and an in-range value balance")
-        .stamp(mock_proof_stamp(vec![]));
+        .stamp(mock_proof_stamp());
     let tx = v7_transaction(
         NetworkUpgrade::NuTachyon,
         Some(TachyonBundle::Proven(bundle)),

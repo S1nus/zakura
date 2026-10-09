@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 #![allow(dead_code)]
 
-use std::{ops::Deref, sync::atomic::Ordering};
+use std::{cell::Cell, io, ops::Deref, sync::atomic::Ordering};
 
 use semver::Version;
 use zakura_chain::parameters::Network;
@@ -12,6 +12,171 @@ use crate::{
     service::finalized_state::disk_db::{format_bytes, DiskDb, DB},
     Config,
 };
+
+#[test]
+fn automatic_major_database_reuse_validates_source_and_preserves_data() {
+    let _init_guard = zakura_test::init();
+    for version_file in [Some("1.0.0"), Some("0.0"), None] {
+        let cache = tempfile::tempdir().expect("temporary directory exists");
+        let config = Config {
+            cache_dir: cache.path().to_owned(),
+            ..Config::default()
+        };
+        let network = Network::Mainnet;
+        let old_version = Version::new(1, 0, 0);
+        let new_version = Version::new(2, 0, 0);
+        let old_path = config.db_path("state", 1, &network);
+        let new_path = config.db_path("state", 2, &network);
+        {
+            let db = DiskDb::new(
+                &config,
+                "state",
+                &old_version,
+                &network,
+                ["test".to_owned()],
+                false,
+            )
+            .expect("fixture database opens");
+            let cf = db.cf_handle("test").expect("fixture column family exists");
+            db.put_cf(cf, b"key", b"value")
+                .expect("fixture value is written");
+            crate::write_database_format_version_to_disk(
+                &config,
+                "state",
+                1,
+                &old_version,
+                &network,
+            )
+            .expect("fixture version is written");
+        }
+        crate::write_database_format_version_to_disk(
+            &config,
+            "state",
+            1,
+            &Version::new(3, 0, 0),
+            &network,
+        )
+        .expect("fixture models a newer database in the old directory");
+        assert_eq!(
+            DiskDb::try_reusing_previous_db_after_major_upgrade(
+                &[2],
+                &new_version,
+                &config,
+                "state",
+                &network
+            ),
+            None
+        );
+        assert!(old_path.exists());
+        assert!(!new_path.exists());
+        let version_path = config.version_file_path("state", 1, &network);
+        if let Some(version_file) = version_file {
+            std::fs::write(&version_path, version_file)
+                .expect("fixture restores the compatible format");
+        } else {
+            std::fs::remove_file(&version_path)
+                .expect("fixture models a database without a version file");
+        }
+        assert_eq!(
+            DiskDb::try_reusing_previous_db_after_major_upgrade(
+                &[2],
+                &new_version,
+                &config,
+                "state",
+                &network
+            ),
+            Some(old_version)
+        );
+        assert!(!old_path.exists());
+        let db = DiskDb::new(
+            &config,
+            "state",
+            &new_version,
+            &network,
+            ["test".to_owned()],
+            false,
+        )
+        .expect("reused database opens");
+        let cf = db.cf_handle("test").expect("reused column family exists");
+        assert_eq!(
+            db.get_cf(cf, b"key").expect("reused value is readable"),
+            Some(b"value".to_vec())
+        );
+    }
+}
+
+#[test]
+fn automatic_major_database_reuse_resumes_interrupted_upgrade() {
+    let _init_guard = zakura_test::init();
+    let cache = tempfile::tempdir().expect("temporary directory exists");
+    let config = Config {
+        cache_dir: cache.path().to_owned(),
+        ..Config::default()
+    };
+    let network = Network::Mainnet;
+    let recorded = Version::new(1, 2, 3);
+    let db = DiskDb::new(
+        &config,
+        "state",
+        &recorded,
+        &network,
+        ["test".to_owned()],
+        false,
+    )
+    .expect("fixture database opens");
+    db.put_cf(db.cf_handle("test").unwrap(), b"key", b"value")
+        .unwrap();
+    crate::write_database_format_version_to_disk(&config, "state", 1, &recorded, &network).unwrap();
+    drop(db);
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[2],
+            &Version::new(2, 0, 0),
+            &config,
+            "state",
+            &network
+        ),
+        Some(recorded.clone())
+    );
+    // No migration ran after the first rename.
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[3],
+            &Version::new(3, 0, 0),
+            &config,
+            "state",
+            &network
+        ),
+        None
+    );
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[2, 3],
+            &Version::new(3, 0, 0),
+            &config,
+            "state",
+            &network
+        ),
+        Some(recorded.clone())
+    );
+    assert_eq!(
+        crate::database_format_version_on_disk(&config, "state", 3, &network).unwrap(),
+        Some(recorded)
+    );
+    let db = DiskDb::new(
+        &config,
+        "state",
+        &Version::new(3, 0, 0),
+        &network,
+        ["test".to_owned()],
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        db.get_cf(db.cf_handle("test").unwrap(), b"key").unwrap(),
+        Some(b"value".to_vec())
+    );
+}
 
 // Enable older test code to automatically access the inner database via Deref coercion.
 impl Deref for DiskDb {
@@ -137,4 +302,75 @@ fn zs_iter_opts_increments_key_by_one() {
             assert_eq!(extra_bytes.len(), 0, "there should be no extra bytes");
         }
     }
+}
+
+#[test]
+fn file_limit_success_does_not_retry_or_query() {
+    let limit = DiskDb::increase_open_file_limit_with(
+        |requested| {
+            assert_eq!(requested, DiskDb::IDEAL_OPEN_FILE_LIMIT);
+            Ok(requested)
+        },
+        || panic!("a successful increase must not query again"),
+    );
+    assert_eq!(limit, DiskDb::IDEAL_OPEN_FILE_LIMIT);
+}
+
+#[test]
+fn file_limit_retries_the_minimum() {
+    let attempts = Cell::new(0);
+    let limit = DiskDb::increase_open_file_limit_with(
+        |requested| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                assert_eq!(requested, DiskDb::IDEAL_OPEN_FILE_LIMIT);
+                Err(io::ErrorKind::PermissionDenied.into())
+            } else {
+                assert_eq!(requested, DiskDb::MIN_OPEN_FILE_LIMIT);
+                Ok(requested)
+            }
+        },
+        || panic!("a successful minimum retry must not query again"),
+    );
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(limit, DiskDb::MIN_OPEN_FILE_LIMIT);
+}
+
+#[test]
+fn file_limit_errors_use_actual_capacity() {
+    let attempts = Cell::new(0);
+    let actual_limit = DiskDb::MIN_OPEN_FILE_LIMIT + DiskDb::RESERVED_FILE_COUNT;
+    let limit = DiskDb::increase_open_file_limit_with(
+        |_| {
+            attempts.set(attempts.get() + 1);
+            Err(io::ErrorKind::PermissionDenied.into())
+        },
+        || {
+            assert_eq!(attempts.get(), 2);
+            Ok(actual_limit)
+        },
+    );
+    assert_eq!(limit, actual_limit);
+    assert_eq!(
+        DiskDb::get_db_open_file_limit(limit),
+        DiskDb::MIN_OPEN_FILE_LIMIT / 2
+    );
+}
+
+#[test]
+#[should_panic(expected = "open file limit too low")]
+fn file_limit_errors_cannot_bypass_the_minimum() {
+    DiskDb::increase_open_file_limit_with(
+        |_| Err(io::ErrorKind::PermissionDenied.into()),
+        || Ok(64),
+    );
+}
+
+#[test]
+#[should_panic(expected = "unable to determine the current open file limit")]
+fn file_limit_query_errors_cannot_fabricate_capacity() {
+    DiskDb::increase_open_file_limit_with(
+        |_| Err(io::ErrorKind::PermissionDenied.into()),
+        || Err(io::ErrorKind::PermissionDenied.into()),
+    );
 }

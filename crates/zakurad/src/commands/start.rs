@@ -69,7 +69,6 @@
 //! Zebra also has diagnostic support:
 //! * [metrics](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/metrics.md)
 //! * [tracing](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/tracing.md)
-//! * [progress-bar](https://docs.rs/howudoin/0.1.1/howudoin)
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
@@ -97,7 +96,7 @@ use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
 use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
-use zakura_state::StorageMode;
+use zakura_state::{DatabaseWriterMetadata, StorageMode};
 
 use zakura::{
     drive_block_sync_actions, query_block_sync_frontiers, zakura_header_sync_driver_startup,
@@ -105,7 +104,7 @@ use zakura::{
 };
 
 use crate::{
-    application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
+    application::{build_version, last_known_release_tag, user_agent, LAST_WARN_ERROR_LOG_SENDER},
     components::{
         health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
@@ -332,6 +331,7 @@ impl StartCmd {
         &self,
         config: Arc<ZakuradConfig>,
         custom_services: Vec<zakura_network::zakura::CustomService>,
+        ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
     ) -> Result<(), Report> {
@@ -408,6 +408,35 @@ impl StartCmd {
             &config.network.network,
         );
 
+        if config.network.v2_p2p() {
+            // Report boundaries from this binary's effective network configuration.
+            for (upgrade, metric) in [
+                (
+                    zakura_chain::parameters::NetworkUpgrade::Sapling,
+                    "sync.report.sapling.height",
+                ),
+                (
+                    zakura_chain::parameters::NetworkUpgrade::Nu6_3,
+                    "sync.report.ironwood.height",
+                ),
+            ] {
+                if let Some(height) = upgrade.activation_height(&config.network.network) {
+                    metrics::gauge!(metric).set(f64::from(height.0));
+                }
+            }
+            metrics::gauge!("sync.report.checkpoint.height")
+                .set(f64::from(max_checkpoint_height.0));
+            for metric in [
+                "sync.block.payload.received.bytes",
+                "state.vct.fast.block.count",
+                "state.vct.legacy.block.count",
+            ] {
+                metrics::counter!(metric).increment(0);
+            }
+            #[cfg(feature = "sync-metrics")]
+            metrics::counter!("sync.block.payload.committed.bytes").increment(0);
+        }
+
         info!("opening database, this may take a few minutes");
 
         let mut state_config = config.state.clone();
@@ -417,18 +446,25 @@ impl StartCmd {
         state_config.checkpoint_sync = config.consensus.checkpoint_sync;
         state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
 
+        let database_writer_metadata = DatabaseWriterMetadata::new(
+            "Zakura",
+            build_version().to_string(),
+            last_known_release_tag(),
+        );
+
         let (
             mut state_service,
             read_only_state_service,
             latest_chain_tip,
             chain_tip_change,
             header_chain_body_evidence,
-        ) = zakura_state::init_with_header_chain_body_evidence(
+        ) = zakura_state::init_with_database_writer_metadata(
             state_config,
             &config.network.network,
             max_checkpoint_height,
             config.sync.checkpoint_verify_concurrency_limit
                 * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+            database_writer_metadata,
         )
         .await
         .map_err(|error| eyre!("state initialization failed: {error}"))?;
@@ -524,17 +560,21 @@ impl StartCmd {
             .then(|| config.state.pruning_config())
             .flatten()
             .map(|pruning| pruning.tx_retention);
+        let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
         let inbound = ServiceBuilder::new()
             .load_shed()
             .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
             .timeout(MAX_INBOUND_RESPONSE_TIME)
-            .service(Inbound::new(
-                config.sync.full_verify_concurrency_limit,
-                config.network.expose_peer_addresses,
-                zcashd_compat_pruning_retention,
-                zcashd_compat_block_gossip_peer_ips.clone(),
-                setup_rx,
-            ));
+            .service(
+                Inbound::new(
+                    config.sync.full_verify_concurrency_limit,
+                    config.network.expose_peer_addresses,
+                    zcashd_compat_pruning_retention,
+                    zcashd_compat_block_gossip_peer_ips.clone(),
+                    setup_rx,
+                )
+                .with_pending_blocks(pending_blocks.clone()),
+            );
 
         let advertised_services = Self::advertised_services(&config);
 
@@ -670,6 +710,7 @@ impl StartCmd {
             mempool: mempool.clone(),
             state: state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
+            network: config.network.network.clone(),
             misbehavior_sender,
         };
         setup_tx
@@ -699,9 +740,19 @@ impl StartCmd {
             Some(submit_block_channel.sender()),
         );
         node_tasks.track(&rpc_tx_queue_handle);
-        let rpc_impl = rpc_impl.with_end_of_support_height(
-            sync::end_of_support::end_of_support_height(&config.network.network),
-        );
+        let rpc_impl = rpc_impl
+            .with_pending_blocks(pending_blocks)
+            .with_end_of_support_height(sync::end_of_support::end_of_support_height(
+                &config.network.network,
+            ));
+
+        let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
+            read_state: read_only_state_service.clone(),
+            latest_chain_tip: latest_chain_tip.clone(),
+            chain_tip_change: chain_tip_change.clone(),
+            sync_status: sync_status.clone(),
+            mempool: mempool.clone(),
+        });
 
         let rpc_task_handle = if config.rpc.listen_addr.is_some() {
             RpcServer::start(rpc_impl.clone(), config.rpc.clone())
@@ -949,6 +1000,10 @@ impl StartCmd {
         // await cleanup. Do not add a yield between the spawn and this marker.
         shutdown_cleanup_required.cancel();
 
+        if let Some((ready, services)) = ready.zip(node_services) {
+            let _ = ready.send(services);
+        }
+
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
         // ongoing tasks
@@ -975,6 +1030,10 @@ impl StartCmd {
         let old_databases_task_handle_fused = (&mut old_databases_task_handle).fuse();
         pin!(old_databases_task_handle_fused);
 
+        let writer_health = read_only_state_service.clone();
+        let writer_failure = writer_health.wait_for_writer_failure();
+        tokio::pin!(writer_failure);
+
         // Wait for tasks to finish
         let mut zcashd_compat_task_finished = false;
         let exit_status = {
@@ -986,6 +1045,12 @@ impl StartCmd {
 
                 let result = select! {
                 _ = shutdown.cancelled() => Ok(()),
+
+                failure = &mut writer_failure => {
+                    tracing::error!(%failure, "block writer failed; terminating the node");
+                    shutdown.cancel();
+                    Err(eyre!(failure))
+                },
 
                 header_sync_fatal_event = async {
                     match header_sync_fatal_events.as_mut() {
@@ -1197,7 +1262,21 @@ impl StartCmd {
             "exiting Zakura: all tasks have been asked to stop, waiting for remaining tasks to finish"
         );
 
-        exit_status
+        Self::finish_shutdown(exit_status, writer_health.writer_failure())
+    }
+
+    fn finish_shutdown(
+        exit_status: Result<(), Report>,
+        writer_failure: Option<zakura_state::BoxError>,
+    ) -> Result<(), Report> {
+        // Another ready task can win the select after the writer publishes its failure.
+        exit_status?;
+        if let Some(failure) = writer_failure {
+            tracing::error!(%failure, "block writer failed during shutdown");
+            Err(eyre!(failure))
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns `false` so Zebra keeps running if zcashd-compat supervision exits unexpectedly.
@@ -1280,6 +1359,7 @@ impl Runnable for StartCmd {
                 self.start(
                     APPLICATION.config(),
                     Vec::new(),
+                    None,
                     shutdown,
                     shutdown_cleanup_required,
                 )
@@ -1369,6 +1449,28 @@ mod tests {
     use zakura_network::types::PeerServices;
     use zakura_network::P2pStack;
     use zakura_state::{PruningConfig, StorageMode};
+
+    #[tokio::test]
+    async fn shutdown_cannot_mask_a_ready_writer_failure() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let failure: zakura_state::BoxError = "terminal writer failure".into();
+        // Force the interleaving where shutdown wins even though writer failure is ready.
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Ok(()),
+            _ = std::future::ready(()) => panic!("shutdown wins this interleaving"),
+        };
+        let error = StartCmd::finish_shutdown(result, Some(failure)).unwrap_err();
+        assert!(error.to_string().contains("terminal writer failure"));
+        assert!(StartCmd::finish_shutdown(Ok(()), None).is_ok());
+        assert_eq!(
+            StartCmd::finish_shutdown(Err(eyre!("task failed")), None)
+                .unwrap_err()
+                .to_string(),
+            "task failed"
+        );
+    }
 
     #[test]
     fn zcashd_compat_advertises_node_network_when_pruned() {

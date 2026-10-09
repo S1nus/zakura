@@ -65,7 +65,7 @@ Mainnet → the committer is built in peer mode.
 (2) Header sync requests the per-height roots in-band with the finalized header ranges it already fetches (`want_tree_aux_roots`); each root is stored as an auxiliary delivery on its header's DAG node and authenticated there as soon as the successor header that proves it arrives, far ahead of the committer (§4.2, §6.0). (3) Each checkpoint block: look up its root; verify it (own header now, successor header next block, plus
 the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the frontier (§6, §7).
 (4) At the last checkpoint height, verify and write the embedded frontier and unfreeze.
-(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad/missing root anywhere in the frozen window parks the block and retries in place; it never writes wrong state. Roots are not individually re-requested, so a hole that no in-flight re-delivery of the same header range fills is a fail-closed stall, surfaced loudly by the §8 metrics.
+(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad or missing root anywhere in the frozen window parks the block in place. The writer publishes a bounded selected-range repair request. A header insertion retries the parked block. A repair that cannot fill the gap remains a fail-closed stall that the §8 metrics report.
 
 **Glossary.**
 
@@ -562,11 +562,22 @@ So the committer **fails closed** rather than falling back to recompute (commit 
   region is exactly `tip < last_checkpoint_height` (the last checkpoint height itself carries the real frontier).
 
 Outside the frozen window (legacy), a missing root is
-simply the ordinary legacy recompute — bit-identical to today. Inside the frozen window, a
-missing root parks the current checkpoint block and retries the same commit **in place** —
-**without resetting the block queue**. The write loop also publishes a bounded repair request
-(`VctRootRepairRequested`) back to header sync, which re-fetches the covered range and runs it
-through the root-authentication lane; the retry is satisfied once a verifiable row is stored.
+simply the ordinary legacy recompute — bit-identical to today. The writer also uses
+this path when a root is present but its required successor metadata is unavailable.
+It still attempts fast commits when complete metadata becomes available later.
+Inside the frozen window, a
+missing root parks the current checkpoint block **in place** — **without resetting the block
+queue**. The writer continues to process header-chain control messages while it remains parked.
+An `ApplyHeaderChainInsert` completion retries the parked block immediately. The writer defers
+unrelated block-write messages in their original order. The write loop also publishes a bounded
+repair request (`VctRootRepairRequested`) back to header sync. Header sync fetches a contiguous
+selected prefix through the root-authentication lane. A rooted or judged row at the blocking
+height keeps the existing one-height repair. Otherwise one atomic range covers the gap up to the
+selected tip, checkpoint handoff, 4,000-header transition limit, or first rooted or judged row.
+Rootless rows do not end the range. Suppliers attach roots only to their finalized prefix, so
+every header a node received near the network tip holds one. A handoff that later rises above
+those headers therefore repairs them in one request, not one request per block.
+The retry is satisfied once a verifiable row is stored.
 If no repair delivery fills the hole, the node stays parked
 fail-closed at that height (§8.1). A peer-supplied root that has no buffered successor to
 confirm it against the header
@@ -587,6 +598,9 @@ window is never entered without its roots in hand. Counters:
 `state.vct.root.retry.count` (park-and-retry attempts),
 `state.vct.root.repair.requested` (bounded repair requests published to header sync), and the
 `state.vct.root.stalled.height` gauge (raised once a height is stuck past the warn threshold).
+`state.vct.root.wait.seconds` records the time a block waits for VCT metadata.
+`sync.header.vct.repair.requested.headers` and
+`sync.header.vct.repair.admitted.headers` count range volume.
 
 ### 8.1 Adversarial peer handling
 
@@ -918,7 +932,9 @@ publisher then atomically replaces the mutable `release-state/latest.json` point
 
 The `update-release-state.yml` workflow (manual dispatch plus a weekly cron) and
 `prepare-release-pr.yml` both resolve the pointer once over a pinned HTTPS host with no
-redirects, bounded reads, digest verification at every hop, and a maximum bundle age. They
+redirects, bounded reads, and digest verification at every hop. Bundle age does not invalidate
+the checkpoint/frontier pairing; generation timestamps must still parse and cannot be in the
+future beyond the allowed clock skew. They
 exit green without release-state changes when the bundle does not advance the committed
 list. Otherwise their shared importer verifies the committed `main-checkpoints.txt` is a
 byte-identical prefix of the bundle's list, requires each pool's subtree bytes to retain the
@@ -927,9 +943,9 @@ cover the bundle's own checkpoint, replaces all four artifacts, and writes
 `vct/mainnet-vct-manifest.json` provenance (source `release-state-bundle`, heights, digests,
 entry count, bundle binding).
 
-The standalone update workflow also floors `ESTIMATED_RELEASE_HEIGHT`, validates everything
+The standalone update workflow leaves `ESTIMATED_RELEASE_HEIGHT` unchanged, validates everything
 — including proving the candidate subtree roots against its frontier — restricts the diff to
-exactly those six files, and opens a signed **draft PR** for human review. The grid is the one
+release-state artifacts and Cargo pins, and opens a signed **draft PR** for human review. The grid is the one
 committed artifact large enough to matter to `history-growth.yml`, which raises its packed-growth
 allowance only for a change that touches nothing outside the release-state files. During release
 preparation, the importer leaves that constant unchanged so `prepare-release.sh` remains the

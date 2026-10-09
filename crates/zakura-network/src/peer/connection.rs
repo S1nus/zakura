@@ -1064,7 +1064,7 @@ where
                     .map(|()|
                          Handler::BlocksByHash {
                              blocks: Vec::with_capacity(hashes.len()),
-                             pending_hashes: hashes,
+                             pending_hashes: hashes.into_iter().collect(),
                          }
                     )
             }
@@ -1437,7 +1437,9 @@ where
 
                     self.handle_inbound_overload(req, now, PeerError::Overloaded)
                         .await;
-                } else if e.is::<tower::timeout::error::Elapsed>() {
+                } else if e.is::<tower::timeout::error::Elapsed>()
+                    || e.is::<tokio::time::error::Elapsed>()
+                {
                     // # Security
                     //
                     // Peer requests must have a timeout.

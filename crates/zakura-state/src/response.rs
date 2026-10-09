@@ -39,6 +39,25 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// One block's public inputs for constructing Tachyon synchronization proofs.
+#[cfg(zcash_unstable = "nutachyon")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TachyonBlock {
+    /// The complete block, from the selected best chain.
+    pub block: Arc<Block>,
+    /// The block's chain height.
+    pub height: block::Height,
+    /// NuTachyon activation height; epoch numbering starts here.
+    pub activation_height: block::Height,
+    /// Whether this block was finalized when read.
+    pub finalized: bool,
+    /// Anchor before this block's epoch transition and stamps. At activation this is
+    /// Tachyon's epoch-zero entry anchor, not the inactive pool's zero sentinel.
+    pub anchor_before: tachyon::Anchor,
+    /// Consensus-computed anchor after the block.
+    pub anchor_after: tachyon::Anchor,
+}
+
 /// Best-chain data used to aggregate selected autonome Tachyon transactions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg(zcash_unstable = "nutachyon")]
@@ -54,6 +73,17 @@ pub struct TachyonMiningData {
 
     /// Requested tachygrams already revealed in the candidate block's two-epoch window.
     pub revealed_tachygrams: HashSet<tachyon::Tachygram>,
+}
+
+/// State's decision for a prepared mined block's optimistic relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedMinedRelayEligibility {
+    /// The block proves expected work and extends the selected tip.
+    Authorized,
+    /// The block proves expected work but does not extend the selected tip.
+    CommitFirst,
+    /// State cannot prove expected work from the available context.
+    Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +107,10 @@ pub enum Response {
     /// Response to [`Request::CommitSemanticallyVerifiedBlock`] and [`Request::CommitCheckpointVerifiedBlock`]
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),
+
+    /// Response to [`Request::CheckCheckpointHandoff`] after checking the durable-state
+    /// handoff conditions. Any released semantic blocks can still be awaiting commit.
+    CheckpointHandoffChecked,
 
     /// Response to [`Request::InvalidateBlock`] indicating that a block was found and
     /// invalidated in the state.
@@ -105,8 +139,15 @@ pub enum Response {
     /// Response to [`Request::UnspentBestChainUtxo`] with the UTXO
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
+    /// Response to [`Request::CheckParentInputs`].
+    ParentInputs(ParentInputs),
+
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
+
+    /// Response to [`Request::AwaitBlockInfo`] and [`Request::BlockInfo`] with the
+    /// specified block's chain value pools.
+    BlockInfo(Option<BlockInfo>),
 
     /// The response to a `BlockHeader` request.
     BlockHeader {
@@ -135,6 +176,9 @@ pub enum Response {
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
 
+    /// Response to [`Request::CheckPreparedMinedRelayEligibility`].
+    PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
+
     /// Response to [`Request::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
@@ -147,6 +191,18 @@ pub enum Response {
 
     /// Response to [`Request::CheckBlockProposalValidity`]
     ValidBlockProposal,
+}
+
+/// The result of checking a candidate block's external inputs against its parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParentInputs {
+    /// The parent is committed, and this input is not unspent in the parent's chain.
+    Missing(transparent::OutPoint),
+    /// The parent is neither in a non-finalized chain nor the finalized tip,
+    /// so no chain can accept the candidate now.
+    ParentUnavailable,
+    /// Every input is unspent at the parent, or the parent context changed during the read.
+    Inconclusive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,11 +307,18 @@ const NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE: usize = 2 * MAX_BLOCK_REORG_HEIGHT
 
 /// A listener for changes in the non-finalized state.
 #[derive(Clone, Debug)]
-pub struct NonFinalizedBlocksListener(
-    pub  Arc<
-        tokio::sync::mpsc::Receiver<(zakura_chain::block::Hash, Arc<zakura_chain::block::Block>)>,
-    >,
-);
+pub struct NonFinalizedBlocksListener(pub Arc<tokio::sync::mpsc::Receiver<NonFinalizedBlock>>);
+
+/// A validated block with its primary verifier's optional receipt order.
+#[derive(Clone, Debug)]
+pub struct NonFinalizedBlock {
+    /// Block hash.
+    pub hash: block::Hash,
+    /// Complete block.
+    pub block: Arc<Block>,
+    /// Process-local order, absent for restored blocks or older primaries.
+    pub receipt_order: Option<u64>,
+}
 
 impl NonFinalizedBlocksListener {
     /// Sends the blocks in `non_finalized_state` that satisfy `take_cond` to
@@ -268,22 +331,31 @@ impl NonFinalizedBlocksListener {
     ///
     /// Returns an error if the receiver has been dropped.
     async fn take_and_send_blocks<'a>(
-        sender: &tokio::sync::mpsc::Sender<(block::Hash, Arc<Block>)>,
+        sender: &tokio::sync::mpsc::Sender<NonFinalizedBlock>,
         non_finalized_state: &'a NonFinalizedState,
         take_cond: impl Fn(&&ContextuallyVerifiedBlock) -> bool + Copy + 'a,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<(block::Hash, Arc<Block>)>> {
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<NonFinalizedBlock>> {
         let new_blocks = non_finalized_state
             .chain_iter()
             .flat_map(move |chain| {
                 // Take blocks from the chain in reverse height order until we
                 // reach a block the listener already has, then restore
                 // ascending height order.
-                let mut blocks: Vec<_> =
-                    chain.blocks.values().rev().take_while(take_cond).collect();
+                let mut blocks: Vec<_> = chain
+                    .blocks
+                    .values()
+                    .rev()
+                    .map(Arc::as_ref)
+                    .take_while(take_cond)
+                    .collect();
                 blocks.reverse();
                 blocks
             })
-            .map(|cv_block| (cv_block.hash, cv_block.block.clone()));
+            .map(|cv_block| NonFinalizedBlock {
+                hash: cv_block.hash,
+                block: cv_block.block.clone(),
+                receipt_order: cv_block.receipt_order,
+            });
 
         for new_block_with_hash in new_blocks {
             sender.send(new_block_with_hash).await?;
@@ -379,10 +451,7 @@ impl NonFinalizedBlocksListener {
     /// # Panics
     ///
     /// If the `Arc` has more than one strong reference, this will panic.
-    pub fn unwrap(
-        self,
-    ) -> tokio::sync::mpsc::Receiver<(zakura_chain::block::Hash, Arc<zakura_chain::block::Block>)>
-    {
+    pub fn unwrap(self) -> tokio::sync::mpsc::Receiver<NonFinalizedBlock> {
         Arc::try_unwrap(self.0).unwrap()
     }
 }
@@ -431,6 +500,10 @@ pub enum ReadResponse {
     /// this node holds for the requested range, in ascending height order.
     BlockRoots(Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>),
 
+    /// Response to [`ReadRequest::BlockSizesByHash`]: committed serialized sizes parallel to
+    /// the requested hashes, `None` for hashes that are not committed.
+    BlockSizesByHash(Vec<Option<u32>>),
+
     /// Response to [`ReadRequest::Tip`] with the current best chain tip.
     Tip(Option<(block::Height, block::Hash)>),
 
@@ -452,6 +525,11 @@ pub enum ReadResponse {
     /// no longer current.
     #[cfg(zcash_unstable = "nutachyon")]
     TachyonMiningData(Option<TachyonMiningData>),
+
+    /// Response to [`ReadRequest::TachyonBlock`]. `None` means the block is not in
+    /// the selected best chain; missing historical data is an error instead.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonBlock(Option<TachyonBlock>),
 
     /// Response to [`ReadRequest::BlockInfo`] with
     /// the block info after the specified block.
@@ -551,6 +629,9 @@ pub enum ReadResponse {
     /// _best_ non-finalized chain, or the finalized chain.
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
+    /// Response to [`ReadRequest::CheckParentInputs`].
+    ParentInputs(ParentInputs),
+
     /// The response to an `AnyChainUtxo` request, from verified blocks in
     /// _any_ non-finalized chain, or the finalized chain.
     ///
@@ -605,6 +686,9 @@ pub enum ReadResponse {
     ///
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
+
+    /// Response to [`ReadRequest::CheckPreparedMinedRelayEligibility`].
+    PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
     /// Response to [`ReadRequest::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
@@ -672,6 +756,12 @@ pub struct GetBlockTemplateChainInfo {
     /// The maximum time the miner can use in this block.
     /// Depends on the `tip_hash`, and the local clock on testnet.
     pub max_time: DateTime32,
+
+    /// The chain value pools as of the end of the chain tip block.
+    ///
+    /// The candidate block's ZIP 234 subsidy is derived from the money reserve after its
+    /// parent, which is this tip. Depends on the `tip_hash`.
+    pub value_pools: ValueBalance<NonNegative>,
 }
 
 /// Conversion from read-only [`ReadResponse`]s to read-write [`Response`]s.
@@ -712,6 +802,7 @@ impl TryFrom<ReadResponse> for Response {
                 Err("there is no corresponding Response for this ReadResponse")
             }
             ReadResponse::UnspentBestChainUtxo(utxo) => Ok(Response::UnspentBestChainUtxo(utxo)),
+            ReadResponse::ParentInputs(inputs) => Ok(Response::ParentInputs(inputs)),
 
 
             ReadResponse::AnyChainUtxo(_) => Err("ReadService does not track pending UTXOs. \
@@ -722,12 +813,17 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHeaders(headers) => Ok(Response::BlockHeaders(headers)),
 
             ReadResponse::ValidBestChainTipNullifiersAndAnchors => Ok(Response::ValidBestChainTipNullifiersAndAnchors),
+            ReadResponse::PreparedMinedRelayEligibility(eligibility) => {
+                Ok(Response::PreparedMinedRelayEligibility(eligibility))
+            }
+
+            ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),
 
             ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
+            | ReadResponse::BlockSizesByHash(_)
             | ReadResponse::TipPoolValues { .. }
-            | ReadResponse::BlockInfo(_)
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)
@@ -756,7 +852,7 @@ impl TryFrom<ReadResponse> for Response {
             }
 
             #[cfg(zcash_unstable = "nutachyon")]
-            ReadResponse::TachyonMiningData(_) => {
+            ReadResponse::TachyonMiningData(_) | ReadResponse::TachyonBlock(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 

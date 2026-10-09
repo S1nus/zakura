@@ -38,7 +38,7 @@ use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     error::CommitCheckpointVerifiedError,
     request::{FinalizableBlock, FinalizedBlock, Treestate},
-    service::{check, QueuedCheckpointVerified},
+    service::{check, queued_blocks::CheckpointCommit, QueuedCheckpointVerified},
     CheckpointVerifiedBlock, Config, StateInitError, ValidateContextError,
 };
 
@@ -143,7 +143,7 @@ pub use vct_treestate_audit::{
 pub use zakura_db::commitment_roots_db::{CommitmentRootIndexIssue, COMMITMENT_ROOTS_BY_HEIGHT};
 #[allow(unused_imports)]
 pub use zakura_db::highest_completed_checkpoint::*;
-pub use zakura_db::ZakuraDb;
+pub use zakura_db::{DatabaseWriterMetadata, ZakuraDb};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use disk_format::KV;
@@ -180,6 +180,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     HEADER_VERIFIED,
     HEADER_ELIGIBILITY_ROOT,
     HEADER_AUX_DELIVERY,
+    HEADER_AUX_BODY_SIZE,
     HEADER_DEFERRED,
     HEADER_FINALITY_HISTORY,
     HEADER_FINALITY_WITNESS,
@@ -228,11 +229,20 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
+    // Node software metadata
+    NODE_SOFTWARE_METADATA,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
     VCT_UPGRADE_METADATA,
 ];
+
+/// The name of the column family that records the last node software to write
+/// this database.
+///
+/// This column family is a simple key/value store for operational metadata. It
+/// is not consensus data.
+pub const NODE_SOFTWARE_METADATA: &str = "node_software_metadata";
 
 /// Fork-aware header-chain node rows keyed by canonical hash.
 pub const HEADER_NODE_BY_HASH: &str = "header_node_by_hash_v1";
@@ -250,6 +260,9 @@ pub const HEADER_VERIFIED: &str = "header_verified_v1";
 pub const HEADER_ELIGIBILITY_ROOT: &str = "header_eligibility_root_v1";
 /// Hash-keyed auxiliary deliveries.
 pub const HEADER_AUX_DELIVERY: &str = "header_aux_delivery_v1";
+
+/// Advisory size corrections keyed by the original auxiliary delivery.
+pub const HEADER_AUX_BODY_SIZE: &str = "header_aux_body_size_v1";
 /// Ordered future-time deferral index.
 pub const HEADER_DEFERRED: &str = "header_deferred_v1";
 /// Authoritative append-only finality history.
@@ -336,7 +349,31 @@ impl FinalizedState {
     /// Returns an on-disk database instance for `config` and `network`.
     /// If there is no existing database, creates a new database on disk.
     pub fn new(config: &Config, network: &Network) -> Result<Self, StateInitError> {
-        Self::new_with_debug(config, network, false, false)
+        Self::new_with_database_writer_metadata(
+            config,
+            network,
+            DatabaseWriterMetadata::default_zakura(),
+        )
+    }
+
+    /// Returns an on-disk database instance for `config`, `network`, and the
+    /// supplied database writer metadata.
+    ///
+    /// If there is no existing database, creates a new database on disk.
+    pub fn new_with_database_writer_metadata(
+        config: &Config,
+        network: &Network,
+        database_writer_metadata: DatabaseWriterMetadata,
+    ) -> Result<Self, StateInitError> {
+        Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
+            config,
+            network,
+            database_writer_metadata,
+            false,
+            false,
+            true,
+            true,
+        )
     }
 
     /// Opens (or creates) the on-disk finalized state database read-write, for
@@ -362,9 +399,10 @@ impl FinalizedState {
         debug_skip_format_upgrades: bool,
         read_only: bool,
     ) -> Result<Self, StateInitError> {
-        Self::new_with_debug_and_storage_validation(
+        Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
             config,
             network,
+            DatabaseWriterMetadata::default_zakura(),
             debug_skip_format_upgrades,
             read_only,
             true,
@@ -393,10 +431,32 @@ impl FinalizedState {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::unwrap_in_result)]
     fn new_with_debug_and_storage_validation(
         config: &Config,
         network: &Network,
+        debug_skip_format_upgrades: bool,
+        read_only: bool,
+        validate_storage_mode: bool,
+        enforce_resume_guard: bool,
+    ) -> Result<Self, StateInitError> {
+        Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
+            config,
+            network,
+            DatabaseWriterMetadata::default_zakura(),
+            debug_skip_format_upgrades,
+            read_only,
+            validate_storage_mode,
+            enforce_resume_guard,
+        )
+    }
+
+    #[allow(clippy::unwrap_in_result)]
+    fn new_with_debug_and_database_writer_metadata_and_storage_validation(
+        config: &Config,
+        network: &Network,
+        database_writer_metadata: DatabaseWriterMetadata,
         debug_skip_format_upgrades: bool,
         read_only: bool,
         validate_storage_mode: bool,
@@ -409,7 +469,7 @@ impl FinalizedState {
             }
         }
 
-        let db = ZakuraDb::new(
+        let db = ZakuraDb::new_with_database_writer_metadata(
             config,
             STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
@@ -419,6 +479,7 @@ impl FinalizedState {
                 .iter()
                 .map(ToString::to_string),
             read_only,
+            Some(&database_writer_metadata),
         )?;
 
         let vct = VctState::from_config(config.checkpoint_sync, config.vct_fast_sync, network);
@@ -454,14 +515,17 @@ impl FinalizedState {
         // source to resume. Without it, the legacy committer would refuse every
         // remaining checkpoint block.
         if enforce_resume_guard
+            && !read_only
             && new_state.vct.is_below_last_checkpoint()
-            && new_state.vct.source().is_none()
+            && (new_state.vct.source().is_none()
+                || !config.enable_zakura_header_seed_from_committed_blocks)
         {
             panic!(
                 "this database was previously synced in verified commitment tree mode that was \
                  interrupted below the last checkpoint height. the fast path that supplies \
                  the verified roots needed to resume the VCT sync is disabled. Set \
-                 `consensus.checkpoint_sync = true` and `consensus.vct_fast_sync = true` to \
+                 `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, and \
+                 `network.p2p_stack = \"zakura\"` or `\"dual\"` to \
                  finish the VCT sync, or delete the cache directory and re-sync from genesis"
             );
         }
@@ -625,19 +689,21 @@ impl FinalizedState {
     /// order.
     pub fn commit_finalized(
         &mut self,
-        ordered_block: QueuedCheckpointVerified,
+        ordered_block: CheckpointCommit,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         vct_successor_witness: Option<VctSuccessorWitness>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
-        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+        (CheckpointCommit, CommitCheckpointVerifiedError),
     > {
+        let (block, response) = ordered_block;
         self.commit_finalized_inner(
-            ordered_block,
+            (block, response, 0),
             prev_note_commitment_trees,
             vct_successor_witness,
             None,
         )
+        .map_err(|((block, response, _attempt), error)| ((block, response), error))
     }
 
     /// Commit a checkpoint block and delegate its exact full-state batch to `commit`.
@@ -712,7 +778,7 @@ impl FinalizedState {
             VctAuthenticationProof,
         ) -> Result<(), CommitCheckpointVerifiedError>,
     {
-        let (checkpoint_verified, rsp_tx) = ordered_block;
+        let (checkpoint_verified, rsp_tx, attempt) = ordered_block;
         let result = self.commit_finalized_direct_with_aux(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
@@ -744,7 +810,7 @@ impl FinalizedState {
                 let _ = rsp_tx.send(Ok(hash));
                 Ok((checkpoint_verified, note_commitment_trees))
             }
-            Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
+            Err(error) => Err(((checkpoint_verified, rsp_tx, attempt), error)),
         }
     }
 
@@ -1441,6 +1507,11 @@ impl FinalizedState {
             .is_some_and(|v| v.accepts_exact_roots_at(height))
     }
 
+    /// Whether the saved frontiers can still be advanced when VCT metadata is unavailable.
+    pub(crate) fn vct_can_recompute_trees(&self) -> bool {
+        !self.vct.is_below_last_checkpoint()
+    }
+
     /// Clears any cached successor prevalidation.
     ///
     /// The finalized write loop calls this when it discards checkpoint queue state, so a
@@ -1501,9 +1572,8 @@ impl FinalizedState {
     /// The committer therefore cannot recompute the root locally.
     /// Local recomputation could fold an incorrect root into the history MMR.
     /// The committer leaves the database untouched.
-    /// Header sync does not request individual roots.
-    /// A later delivery of the same header range can fill the missing root.
-    /// Another fanout peer's in-flight response can provide that delivery.
+    /// Header sync requests a bounded selected range that starts at the missing height.
+    /// A later delivery can fill the missing root.
     /// Otherwise, the commit remains parked and the section 8 stall metrics and logs report it.
     /// An incorrect root therefore never corrupts state, at the cost
     /// of stalling the sync at this height.
@@ -1513,6 +1583,14 @@ impl FinalizedState {
         error: ValidateContextError,
         failure: crate::error::VctCommitFailure,
     ) -> CommitCheckpointVerifiedError {
+        if matches!(
+            error,
+            ValidateContextError::HistoryTreeError(ref error)
+                if matches!(error.as_ref(), zakura_chain::history_tree::HistoryTreeError::MissingBranchId { .. })
+        ) {
+            return error.into();
+        }
+
         metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,

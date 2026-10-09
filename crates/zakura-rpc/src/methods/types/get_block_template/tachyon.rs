@@ -272,7 +272,7 @@ fn aggregate_with_data(
             &mut rng,
             &mut transactions,
             &mining_data.blocks,
-            EpochIndex(epoch),
+            EpochIndex::new(epoch),
             &group,
         )?;
     }
@@ -470,7 +470,7 @@ mod tests {
         let intervening_bundle = proof_bundle(&intervening_transaction)
             .expect("intervening transaction has a proof-stamped bundle");
         let target_anchor = start_anchor
-            .next_stamp(EpochIndex(0), &intervening_bundle.stamp.tachygram_set)
+            .next_stamp(EpochIndex::new(0), &intervening_bundle.stamp.tachygram_set)
             .expect("intervening stamp advances the anchor");
         let original = vec![
             verified_transaction(start_anchor),
@@ -623,6 +623,7 @@ mod tests {
             network_upgrade: NetworkUpgrade::NuTachyon,
             lock_time: LockTime::min_lock_time_timestamp(),
             expiry_height: Height(0),
+            zip233_amount: Amount::zero(),
             inputs: Vec::new(),
             outputs: Vec::new(),
             sapling_shielded_data: None,
@@ -648,6 +649,7 @@ mod tests {
             network_upgrade: NetworkUpgrade::NuTachyon,
             lock_time: LockTime::min_lock_time_timestamp(),
             expiry_height: Height(0),
+            zip233_amount: Amount::zero(),
             inputs: vec![transparent::Input::PrevOut {
                 outpoint: transparent::OutPoint {
                     hash: parent,

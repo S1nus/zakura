@@ -8,6 +8,40 @@
 
 mod vectors;
 
+#[cfg(zcash_unstable = "nutachyon")]
+#[test]
+fn tachyon_sync_response_is_public_and_uses_canonical_hex() {
+    use zakura_rpc::client::{GetTachyonBlockResponse, TachyonStampData};
+    let reply = GetTachyonBlockResponse {
+        hash: zakura_chain::block::Hash([1; 32]),
+        previous_block_hash: zakura_chain::block::Hash([2; 32]),
+        height: zakura_chain::block::Height(12),
+        activation_height: zakura_chain::block::Height(10),
+        pool_height: 2,
+        epoch: 0,
+        epoch_length: 4096,
+        finalized: false,
+        anchor_before: [3; 32],
+        epoch_start_anchor: None,
+        anchor_after: [4; 32],
+        stamps: vec![TachyonStampData {
+            transaction_index: 1,
+            txid: zakura_chain::transaction::Hash([5; 32]),
+            tachygram_set: [6; 32],
+            tachygrams: vec![hex::encode([7; 32])],
+        }],
+    };
+    let json = serde_json::to_value(&reply).unwrap();
+    assert_eq!(json["anchorBefore"], hex::encode([3; 32]));
+    assert_eq!(json["epochStartAnchor"], serde_json::Value::Null);
+    assert_eq!(json["stamps"][0]["tachygramSet"], hex::encode([6; 32]));
+    assert_eq!(json["stamps"][0]["tachygrams"][0], hex::encode([7; 32]));
+    assert_eq!(
+        serde_json::from_value::<GetTachyonBlockResponse>(json).unwrap(),
+        reply
+    );
+}
+
 use std::{io::Cursor, ops::Deref};
 
 use vectors::{
@@ -16,6 +50,7 @@ use vectors::{
 };
 
 use zakura_rpc::client::zakura_chain::{
+    amount::Amount,
     sapling::ValueCommitment,
     serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
@@ -1275,6 +1310,7 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
     let bits = template.bits().bytes_in_display_order();
     let height = template.height();
     let max_time = template.max_time();
+    let work_id = template.work_id().clone();
     let submit_old = template.submit_old();
 
     let new_obj = GetBlockTemplateResponse::TemplateMode(Box::new(BlockTemplateResponse::new(
@@ -1298,6 +1334,7 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
         CompactDifficulty::from_bytes_in_display_order(&bits).expect("was just serialized"),
         height,
         max_time,
+        work_id,
         submit_old,
     )));
 
@@ -1660,6 +1697,43 @@ fn test_generate() -> Result<(), Box<dyn std::error::Error>> {
     let hash1 = obj[1].hash();
     let new_obj = vec![Hash::new(hash0), Hash::new(hash1)];
     assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+/// The ZIP 234 NSM counter is reported, survives a round trip, and stays out of the
+/// monetary totals.
+///
+/// It is an accounting counter that funds reissuance, not a pool of spendable value, so
+/// including it in `chainSupply` or `valuePools` would overstate the money supply.
+#[test]
+fn test_nsm_value_balance_is_reported_outside_the_monetary_totals(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let obj: GetBlockchainInfoResponse = serde_json::from_str(GET_BLOCKCHAIN_INFO_RESPONSE)?;
+
+    // A response from a node that does not report the counter is distinguishable from one
+    // reporting zero, because zero is a legitimate balance.
+    assert_eq!(obj.nsm_value_balance_zat(), None);
+
+    // The counter is signed: it carries no non-negativity guarantee before NU7.
+    let nsm = Amount::try_from(-55_768_414_957_i64)?;
+    let with_nsm = obj.clone().with_nsm_value_balance_zat(nsm);
+
+    let json: serde_json::Value = serde_json::to_value(&with_nsm)?;
+    assert_eq!(
+        json["nsmValueBalanceZat"],
+        serde_json::json!(-55_768_414_957_i64)
+    );
+
+    let round_tripped: GetBlockchainInfoResponse = serde_json::from_value(json)?;
+    assert_eq!(round_tripped.nsm_value_balance_zat(), Some(nsm));
+
+    // Setting it changes nothing else, so the reported supply is untouched.
+    assert_eq!(with_nsm.chain_supply(), obj.chain_supply());
+    assert_eq!(with_nsm.value_pools(), obj.value_pools());
+
+    // And it is not smuggled in as an extra pool.
+    assert!(with_nsm.value_pools().iter().all(|pool| pool.id() != "nsm"));
 
     Ok(())
 }

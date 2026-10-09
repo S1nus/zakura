@@ -8,11 +8,15 @@ How and when to update the changelogs in this repository.
 | --- | --- | --- |
 | `docs/changelog/unreleased/<PR>.md` | Unreleased root entries owned by one PR | Reviewers and release tooling |
 | `CHANGELOG.md` (root) | User-visible `zakurad` changes | Node operators |
-| `docs/changelog/params.md` | Parameter re-tunings (constants, defaults, timeouts, limits) | Reviewers and operators |
+| `docs/changelog/params.md` | Node parameter re-tunings (constants, defaults, timeouts, limits) | Reviewers and operators |
 
 `docs/changelog/params.md` is a compact ledger that complements the prose
 changelogs; it stays maintained at all times, including through the pre-1.0.0
 freeze described below.
+
+The parameter ledger covers node behavior and performance. Infrastructure, CI,
+deployment, and notification settings belong in their relevant infrastructure or
+operator documentation instead.
 
 ## The v1.0.0 baseline ("Initial release")
 
@@ -61,8 +65,8 @@ This PR only changes tests and has no operator-visible effect.
 
 Dependabot, release PRs, and automated release-state updates are automated
 exceptions to the one-file check. Release-state PRs (the Mainnet checkpoint and
-VCT frontier refresh) carry `A-release-state`: their only Rust change is the
-generated end-of-support floor, and unlike the release PR they do not consume
+VCT frontier refresh) carry `A-release-state`: their `Cargo.toml` change pins
+the refreshed assets, and unlike the release PR they do not consume
 the pending fragments. The `C-exclude-from-changelog` label remains useful
 release metadata, but does not replace the explicit fragment for Rust or
 `Cargo.toml` PRs.
@@ -87,7 +91,7 @@ is in
   `- Fixed X so that Y ([#123](https://github.com/zakura-core/zakura/pull/123))`.
 - Label PRs accurately (`C-feature`, `C-bug`, `C-security`, …) so repository
   triage agrees with the fragment category.
-- A change to a tunable parameter gets a row in `docs/changelog/params.md` _in
+- A change to a node tunable parameter gets a row in `docs/changelog/params.md` _in
   addition to_ a changelog entry when it is user-visible.
 
 `Added` and `Changed` entries normally require a minor `zakura` release. A
@@ -118,6 +122,16 @@ cargo release version --verbose --execute --allow-branch '*' -p <crate> major # 
 (which also rewrites workspace-internal dependency requirements). Release
 preparation reviews the accumulated bumps — with `cargo public-api diff` and
 the code diff where useful — rather than originating them on release day.
+
+Bump each crate **at most one release step per publish cycle**. Before
+bumping, check the crate's latest stable release on crates.io: if the
+workspace version is already above it, the pending bump covers further
+changes of the same or lower level, and a change needing a bigger bump
+raises the pending bump's level in place (a pending `7.1.0` over a published
+`7.0.0` becomes `8.0.0`, not `7.1.0 -> 8.0.0` stacked as `9.0.0`). The
+`crates.io publish graph` CI job fails versions that skip numbers the
+project never published. Never hand-write `-rcN` suffixes; release
+preparation owns them.
 
 ## Release assembly
 
