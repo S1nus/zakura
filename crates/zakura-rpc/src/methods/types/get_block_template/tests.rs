@@ -240,7 +240,18 @@ fn tachyon_workload_coinbase_outputs() {
         methods::types::get_block_template::{REDEEM_SCRIPT_HASH, TRANSACTIONS_PER_BLOCK},
     };
 
-    let network = Network::new_regtest(Default::default());
+    let network = Network::new_regtest(testnet::RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(2),
+            nu6: Some(3),
+            nu6_1: Some(4),
+            nu6_2: Some(5),
+            nu6_3: Some(6),
+            nu_tachyon: Some(8),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let config = Config {
         internal_miner: true,
         tachyon_workload: true,
@@ -277,7 +288,9 @@ fn tachyon_workload_coinbase_outputs() {
         reserved.max_serialized_size,
         ordinary.max_serialized_size + (TRANSACTIONS_PER_BLOCK - 1) * output_size
     );
-    assert!(reserved.max_serialized_size >= coinbase.zcash_serialized_size());
+    assert_eq!(coinbase.version(), 7);
+    assert_coinbase_resource_usage(&network, height, &miner_params, &coinbase)
+        .expect("V7 workload resource usage matches the serialized coinbase");
 
     assert_eq!(
         coinbase
