@@ -143,6 +143,8 @@ fn transparent_coinbase() -> anyhow::Result<()> {
             nu6: Some(7),
             nu6_1: Some(8),
             nu6_3: Some(9),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: Some(10),
             ..Default::default()
         })?
         .with_funding_streams(vec![
@@ -238,7 +240,18 @@ fn tachyon_workload_coinbase_outputs() {
         methods::types::get_block_template::{REDEEM_SCRIPT_HASH, TRANSACTIONS_PER_BLOCK},
     };
 
-    let network = Network::new_regtest(Default::default());
+    let network = Network::new_regtest(testnet::RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(2),
+            nu6: Some(3),
+            nu6_1: Some(4),
+            nu6_2: Some(5),
+            nu6_3: Some(6),
+            nu_tachyon: Some(8),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     let config = Config {
         internal_miner: true,
         tachyon_workload: true,
@@ -275,7 +288,9 @@ fn tachyon_workload_coinbase_outputs() {
         reserved.max_serialized_size,
         ordinary.max_serialized_size + (TRANSACTIONS_PER_BLOCK - 1) * output_size
     );
-    assert!(reserved.max_serialized_size >= coinbase.zcash_serialized_size());
+    assert_eq!(coinbase.version(), 7);
+    assert_coinbase_resource_usage(&network, height, &miner_params, &coinbase)
+        .expect("V7 workload resource usage matches the serialized coinbase");
 
     assert_eq!(
         coinbase
@@ -300,7 +315,7 @@ fn tachyon_workload_coinbase_outputs() {
     .is_err());
 }
 
-/// A NuTachyon template must convert into a mineable proposal block.
+/// Transaction selection and proposal construction must work across NuTachyon activation.
 #[cfg(zcash_unstable = "nutachyon")]
 #[test]
 fn nu_tachyon_template_converts_to_proposal_block() -> anyhow::Result<()> {
@@ -321,53 +336,76 @@ fn nu_tachyon_template_converts_to_proposal_block() -> anyhow::Result<()> {
             nu6_1: Some(4),
             nu6_2: Some(5),
             nu6_3: Some(6),
-            nu_tachyon: Some(7),
+            nu_tachyon: Some(8),
             ..Default::default()
         })?
         .clear_funding_streams()
         .to_network()?;
-    let height = NetworkUpgrade::NuTachyon
+    let activation_height = NetworkUpgrade::NuTachyon
         .activation_height(&net)
         .ok_or(anyhow!("NuTachyon activation height must be configured"))?;
-    let tip_height = height.previous()?;
-    let miner_params = MinerParams::from(
-        Address::decode(
+    for height in [
+        activation_height.previous()?,
+        activation_height,
+        activation_height.next()?,
+    ] {
+        let tip_height = height.previous()?;
+        let miner_params = MinerParams::from(
+            Address::decode(
+                &net,
+                default_miner_address(net.kind(), &MinerAddressType::Transparent),
+            )
+            .ok_or(anyhow!("hard-coded transparent address must be valid"))?,
+        );
+        let now = DateTime32::now();
+        let chain_info = zakura_state::GetBlockTemplateChainInfo {
+            tip_hash: net.genesis_hash(),
+            tip_height,
+            chain_history_root: Some(ChainHistoryMmrRootHash::default()),
+            expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+            cur_time: now,
+            min_time: now,
+            max_time: now,
+            value_pools: Default::default(),
+        };
+        let long_poll_id =
+            LongPollInput::new(tip_height, chain_info.tip_hash, now, []).generate_id();
+        // Mining reserves coinbase resources even with an empty mempool. Calling
+        // new_internal directly would miss unsupported-version errors in this path.
+        let selected = super::zip317::select_mempool_transactions(
             &net,
-            default_miner_address(net.kind(), &MinerAddressType::Transparent),
-        )
-        .ok_or(anyhow!("hard-coded transparent address must be valid"))?,
-    );
-    let now = DateTime32::now();
-    let chain_info = zakura_state::GetBlockTemplateChainInfo {
-        tip_hash: net.genesis_hash(),
-        tip_height,
-        chain_history_root: Some(ChainHistoryMmrRootHash::default()),
-        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
-        cur_time: now,
-        min_time: now,
-        max_time: now,
-        value_pools: Default::default(),
-    };
-    let long_poll_id = LongPollInput::new(tip_height, chain_info.tip_hash, now, []).generate_id();
-    let template = super::BlockTemplateResponse::new_internal(
-        &net,
-        None,
-        &miner_params,
-        &chain_info,
-        long_poll_id,
-        vec![],
-        None,
-    )?;
+            height,
+            &miner_params,
+            None,
+            vec![],
+            Default::default(),
+        )?;
+        let template = super::BlockTemplateResponse::new_internal(
+            &net,
+            None,
+            &miner_params,
+            &chain_info,
+            long_poll_id,
+            selected,
+            None,
+        )?;
 
-    let block = proposal_block_from_template(&template, None, &net)?;
+        let block = proposal_block_from_template(&template, None, &net)?;
+        let coinbase = &block.transactions[0];
+        assert_eq!(
+            coinbase.version(),
+            if height < activation_height { 6 } else { 7 }
+        );
+        assert_coinbase_resource_usage(&net, height, &miner_params, coinbase)?;
 
-    assert_eq!(
-        block.header.commitment_bytes.0,
-        template
-            .default_roots
-            .block_commitments_hash
-            .bytes_in_serialized_order(),
-    );
+        assert_eq!(
+            block.header.commitment_bytes.0,
+            template
+                .default_roots
+                .block_commitments_hash
+                .bytes_in_serialized_order(),
+        );
+    }
 
     Ok(())
 }
