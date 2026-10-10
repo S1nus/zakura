@@ -8,6 +8,48 @@ use lazy_static::lazy_static;
 
 use super::*;
 
+#[test]
+fn aggregate_messages_roundtrip_and_reject_trailing_bytes() {
+    use tokio_util::codec::{Decoder, Encoder};
+    use zakura_chain::transaction::aggregation::Manifest;
+    let manifest = Manifest {
+        aggregate: [3; 64].into(),
+        originals: vec![[1; 64].into(), [2; 64].into()],
+    };
+    for message in [
+        Message::GetAggregateDependencies(manifest.aggregate),
+        Message::AggregateDependencies(manifest),
+    ] {
+        let mut codec = Codec::builder().finish();
+        let mut bytes = BytesMut::new();
+        codec.encode(message.clone(), &mut bytes).unwrap();
+        assert_eq!(codec.decode(&mut bytes.clone()).unwrap(), Some(message));
+        bytes.extend_from_slice(&[0]);
+        let length = u32::try_from(bytes.len() - HEADER_LEN).unwrap();
+        bytes[16..20].copy_from_slice(&length.to_le_bytes());
+        let checksum = sha256d::Checksum::from(&bytes[HEADER_LEN..]);
+        bytes[20..24].copy_from_slice(&checksum.0);
+        assert!(Codec::builder().finish().decode(&mut bytes).is_err());
+    }
+}
+
+#[test]
+fn aggregate_message_header_rejects_oversized_manifest_without_body() {
+    use tokio_util::codec::{Decoder, Encoder};
+    let manifest = zakura_chain::transaction::aggregation::Manifest {
+        aggregate: [3; 64].into(),
+        originals: vec![],
+    };
+    let mut bytes = BytesMut::new();
+    Codec::builder()
+        .finish()
+        .encode(Message::AggregateDependencies(manifest), &mut bytes)
+        .unwrap();
+    bytes.truncate(HEADER_LEN);
+    bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(Codec::builder().finish().decode(&mut bytes).is_err());
+}
+
 lazy_static! {
     static ref VERSION_TEST_VECTOR: Message = {
         let services = PeerServices::NODE_NETWORK;

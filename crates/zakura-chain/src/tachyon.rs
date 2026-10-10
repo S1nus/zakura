@@ -4,6 +4,8 @@ use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
 
+pub mod aggregation;
+
 use crate::{
     block::Block,
     parameters::{Network, NetworkUpgrade},

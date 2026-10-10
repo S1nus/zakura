@@ -3612,6 +3612,7 @@ where
                 height,
                 chain_info.tip_hash,
                 read_state.clone(),
+                self.mempool.clone(),
                 selected_txs,
             )
             .await;

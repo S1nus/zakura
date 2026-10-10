@@ -1146,6 +1146,14 @@ where
         req: Request,
         hash: InventoryHash,
     ) -> <Self as tower::Service<Request>>::Future {
+        if let Some(crate::PeerSource::LegacySocket(peer)) = req.inventory_source() {
+            let Some(mut service) = self.take_ready_service(&peer) else {
+                return async { Err("requested inventory supplier is unavailable".into()) }.boxed();
+            };
+            let future = service.call(req);
+            self.push_unready(peer, service);
+            return future.map_err(Into::into).boxed();
+        }
         let advertising_peer_list = self
             .inventory_registry
             .advertising_peers(hash)
@@ -1774,6 +1782,10 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         let fut = match req {
+            Request::AggregateDependencies { aggregate, .. } => self.route_inv(
+                req,
+                InventoryHash::from(zakura_chain::transaction::UnminedTxId::Witnessed(aggregate)),
+            ),
             // Only do inventory-aware routing on individual items.
             Request::BlocksByHash(ref hashes) | Request::BlocksByHashFrom { ref hashes, .. }
                 if hashes.len() == 1 =>

@@ -228,6 +228,9 @@ impl UnminedTxId {
 /// [`From`] implementations.
 #[derive(Clone, Eq, PartialEq)]
 pub struct UnminedTx {
+    /// Untrusted flat Tachyon relay dependencies, never included in transaction serialization.
+    #[cfg(zcash_unstable = "nutachyon")]
+    tachyon_dependencies: Arc<Vec<UnminedTx>>,
     /// The unmined transaction itself.
     transaction: Arc<Transaction>,
 
@@ -258,6 +261,18 @@ impl fmt::Display for UnminedTx {
 }
 
 impl UnminedTx {
+    /// Attach untrusted original transactions for aggregate mempool verification.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn with_tachyon_dependencies(mut self, dependencies: Vec<UnminedTx>) -> Self {
+        self.tachyon_dependencies = Arc::new(dependencies);
+        self
+    }
+
+    /// Original transactions supplied with this aggregate; these still require verification.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon_dependencies(&self) -> &[UnminedTx] {
+        &self.tachyon_dependencies
+    }
     /// Returns the unmined transaction.
     pub fn transaction(&self) -> &Arc<Transaction> {
         &self.transaction
@@ -299,6 +314,8 @@ impl From<Transaction> for UnminedTx {
         #[allow(clippy::needless_borrow)]
         Self {
             id: (&transaction).into(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_dependencies: Default::default(),
             size,
             conventional_fee,
             transaction: Arc::new(transaction),
@@ -313,6 +330,8 @@ impl From<&Transaction> for UnminedTx {
 
         Self {
             id: transaction.into(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_dependencies: Default::default(),
             size,
             conventional_fee,
             transaction: Arc::new(transaction.clone()),
@@ -327,6 +346,8 @@ impl From<Arc<Transaction>> for UnminedTx {
 
         Self {
             id: transaction.as_ref().into(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_dependencies: Default::default(),
             size,
             conventional_fee,
             transaction,
@@ -341,6 +362,8 @@ impl From<&Arc<Transaction>> for UnminedTx {
 
         Self {
             id: transaction.as_ref().into(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_dependencies: Default::default(),
             size,
             conventional_fee,
             transaction: transaction.clone(),
@@ -355,6 +378,9 @@ impl From<&Arc<Transaction>> for UnminedTx {
 // This struct can't be `Eq`, because it contains a `f32`.
 #[derive(Clone, PartialEq)]
 pub struct VerifiedUnminedTx {
+    /// Fully verified flat originals of an aggregate, with their mempool UTXO dependencies.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub tachyon_originals: Vec<(VerifiedUnminedTx, Vec<transparent::OutPoint>)>,
     /// The unmined transaction.
     pub transaction: UnminedTx,
 
@@ -449,6 +475,8 @@ impl VerifiedUnminedTx {
         zip317::mempool_checks(unpaid_actions, miner_fee, transaction.size)?;
 
         Ok(Self {
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_originals: Vec::new(),
             transaction,
             miner_fee,
             legacy_sigop_count,

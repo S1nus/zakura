@@ -61,6 +61,9 @@ use crate::components::{
 
 use super::{queue_source_log_label, storage::NonStandardTransactionError, MempoolError};
 
+#[cfg(all(test, zcash_unstable = "nutachyon"))]
+mod aggregation_tests;
+
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource> {
@@ -199,6 +202,12 @@ where
 
     /// The maximum serialized size of a transaction accepted into the mempool.
     max_transaction_bytes: u64,
+    #[cfg(zcash_unstable = "nutachyon")]
+    enable_aggregation: bool,
+    #[cfg(zcash_unstable = "nutachyon")]
+    aggregate_pending: std::sync::Arc<std::sync::Mutex<super::aggregation::Pending>>,
+    #[cfg(zcash_unstable = "nutachyon")]
+    aggregate_known: std::sync::Arc<std::sync::Mutex<super::aggregation::Known>>,
 
     // Internal downloads state
     /// A list of pending transaction download and verify tasks.
@@ -353,6 +362,12 @@ where
         max_transaction_bytes: u64,
     ) -> Self {
         Self {
+            #[cfg(zcash_unstable = "nutachyon")]
+            enable_aggregation: false,
+            #[cfg(zcash_unstable = "nutachyon")]
+            aggregate_pending: Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            aggregate_known: Default::default(),
             network,
             verifier,
             state,
@@ -362,6 +377,18 @@ where
             cancel_handles: HashMap::new(),
             pending_per_peer: HashMap::new(),
         }
+    }
+
+    /// Opt in to aggregate dependency downloads and share recently verified originals.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub(super) fn with_aggregation(
+        mut self,
+        enabled: bool,
+        known: std::sync::Arc<std::sync::Mutex<super::aggregation::Known>>,
+    ) -> Self {
+        self.enable_aggregation = enabled;
+        self.aggregate_known = known;
+        self
     }
 
     /// Queue a transaction for download (if needed) and verification.
@@ -440,8 +467,18 @@ where
         let download_source = source.as_ref().and_then(peer_source_from_queue_source);
         let pushed_advertiser_addr = source.as_ref().and_then(misbehavior_addr_from_queue_source);
         let max_transaction_bytes = self.max_transaction_bytes;
+        #[cfg(zcash_unstable = "nutachyon")]
+        let (enable_aggregation, aggregate_pending, aggregate_source) = (
+            self.enable_aggregation,
+            self.aggregate_pending.clone(),
+            source.clone(),
+        );
+        #[cfg(zcash_unstable = "nutachyon")]
+        let aggregate_known = self.aggregate_known.clone();
 
         let gossiped_tx_req = gossiped_tx.clone();
+        #[cfg(zcash_unstable = "nutachyon")]
+        let aggregate_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
         let fut = async move {
             if let Gossip::Tx(tx) = &gossiped_tx {
@@ -469,7 +506,7 @@ where
             let (tx, advertiser_addr) = match gossiped_tx {
                 Gossip::Id(txid) => {
                     let request_ids = std::iter::once(txid).collect();
-                    let req = match download_source {
+                    let req = match download_source.clone() {
                         Some(source) => zn::Request::TransactionsByIdFrom {
                             ids: request_ids,
                             source,
@@ -477,7 +514,7 @@ where
                         None => zn::Request::TransactionsById(request_ids),
                     };
 
-                    let tx = match network
+                    let tx = match network.clone()
                         .oneshot(req)
                         .await
                         .map_err(CloneError::from)
@@ -518,6 +555,78 @@ where
 
             trace!(?txid, "got tx");
 
+            if tx.id() != txid {
+                return Err(TransactionDownloadVerifyError::DownloadFailed(
+                    BoxError::from("transaction response does not match requested wtxid").into()));
+            }
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            let is_aggregate = zakura_chain::tachyon::aggregation::proof_bundle(tx.transaction())
+                .is_some_and(|bundle| !bundle.is_autonome());
+            let verify = async move {
+            #[cfg(zcash_unstable = "nutachyon")]
+            let (tx, _aggregate_permit, advertiser_addr) = {
+                use zakura_chain::tachyon::aggregation::{proof_bundle, MAX_PACKAGE_BYTES};
+                if is_aggregate {
+                    let unavailable = |message: &str| TransactionDownloadVerifyError::DownloadFailed(BoxError::from(message.to_string()).into());
+                    if !enable_aggregation { return Err(unavailable("aggregate relay is disabled")); }
+                    let permit = super::aggregation::Pending::acquire(&aggregate_pending, aggregate_source)
+                        .ok_or_else(|| unavailable("aggregate pending work limit reached"))?;
+                    let tx = if tx.tachyon_dependencies().is_empty() {
+                        let aggregate = transaction::WtxId::from(tx.transaction().as_ref());
+                        let supplier = download_source.or_else(|| advertiser_addr.map(Into::into));
+                        let manifest = tokio::time::timeout(Duration::from_secs(10), network.clone().oneshot(
+                            zn::Request::AggregateDependencies { aggregate, source: supplier.clone() }
+                        )).await.map_err(|_| unavailable("aggregate manifest timed out"))?
+                            .map_err(|_| unavailable("aggregate manifest unavailable"))?;
+                        let zn::Response::AggregateDependencies(manifest) = manifest else {
+                            return Err(unavailable("unexpected aggregate manifest response"));
+                        };
+                        if manifest.aggregate != aggregate || manifest.originals.is_empty() || manifest.validate().is_err() {
+                            return Err(unavailable("aggregate manifest missing or mismatched"));
+                        }
+                        let mut bytes = tx.size();
+                        let mut originals = Vec::with_capacity(manifest.originals.len());
+                        for id in manifest.originals {
+                            let known = aggregate_known.lock().expect("known cache lock guards only bounded bookkeeping")
+                                .get(UnminedTxId::Witnessed(id));
+                            if let Some(original) = known {
+                                bytes = bytes.checked_add(original.size()).ok_or_else(|| unavailable("package size overflow"))?;
+                                if bytes > MAX_PACKAGE_BYTES { return Err(unavailable("aggregate package too large")); }
+                                originals.push(original);
+                                continue;
+                            }
+                            let ids = HashSet::from([UnminedTxId::Witnessed(id)]);
+                            let request = match supplier.clone() {
+                                Some(source) => zn::Request::TransactionsByIdFrom { ids, source },
+                                None => zn::Request::TransactionsById(ids),
+                            };
+                            let response = tokio::time::timeout(Duration::from_secs(10), network.clone().oneshot(request))
+                                .await.map_err(|_| unavailable("aggregate original timed out"))?
+                                .map_err(|_| unavailable("aggregate original unavailable"))?;
+                            let zn::Response::Transactions(mut transactions) = response else { return Err(unavailable("unexpected dependency response")); };
+                            if transactions.len() != 1 { return Err(unavailable("unexpected dependency response count")); }
+                            let Some(zn::InventoryResponse::Available((original, _supplier))) = transactions.pop() else {
+                                return Err(unavailable("aggregate original was not found"));
+                            };
+                            // Never attribute a dependency responder's data to the aggregate advertiser.
+                            if original.id() != UnminedTxId::Witnessed(id) {
+                                return Err(unavailable("original wtxid mismatch"));
+                            }
+                            Self::check_transaction_size(&original, max_transaction_bytes)
+                                .map_err(|_| unavailable("aggregate original exceeds transaction size policy"))?;
+                            bytes = bytes.checked_add(original.size()).ok_or_else(|| unavailable("package size overflow"))?;
+                            if bytes > MAX_PACKAGE_BYTES || !proof_bundle(original.transaction()).is_some_and(|bundle| bundle.is_autonome()) {
+                                return Err(unavailable("oversized or non-flat aggregate package"));
+                            }
+                            originals.push(original);
+                        }
+                        tx.with_tachyon_dependencies(originals)
+                    } else { tx };
+                    (tx, Some(permit), None)
+                } else { (tx, None, advertiser_addr) }
+            };
+
             let result = verifier
                 .oneshot(tx::Request::Mempool {
                     transaction: tx.clone(),
@@ -535,7 +644,24 @@ where
             // Hide the transaction data to avoid filling the logs
             trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
 
-            result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr, tip_height } )
+            result.map_err(|e| {
+                #[cfg(zcash_unstable = "nutachyon")]
+                if is_aggregate {
+                    // The verifier also checks separately supplied originals. Failure
+                    // is not evidence that this exact aggregate is intrinsically invalid:
+                    // neither ban its advertiser nor poison its rejection-cache entry.
+                    metrics::counter!("mempool.aggregation.validation.failed").increment(1);
+                    return TransactionDownloadVerifyError::DownloadFailed(e.into());
+                }
+                TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr, tip_height }
+            })
+            };
+            #[cfg(zcash_unstable = "nutachyon")]
+            if is_aggregate {
+                return tokio::time::timeout_at(aggregate_deadline, verify).await
+                    .map_err(|error| TransactionDownloadVerifyError::DownloadFailed(BoxError::from(error).into()))?;
+            }
+            verify.await
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
             metrics::counter!(

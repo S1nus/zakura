@@ -751,6 +751,14 @@ impl Service<zn::Request> for Inbound {
                     Ok(zn::Response::Blocks(blocks))
                 }.boxed()
             }
+            zn::Request::AggregateDependencies { aggregate, source } => {
+                mempool.clone().oneshot(mempool::Request::AggregateDependencies {
+                    aggregate, source: source.map(mempool_queue_source),
+                }).map_ok(|response| match response {
+                    mempool::Response::AggregateDependencies(manifest) => zn::Response::AggregateDependencies(manifest),
+                    _ => unreachable!("manifest requests return manifests"),
+                }).boxed()
+            }
             zn::Request::TransactionsById(req_tx_ids)
             | zn::Request::TransactionsByIdFrom {
                 ids: req_tx_ids, ..

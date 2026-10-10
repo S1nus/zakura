@@ -15,7 +15,9 @@ use zakura_chain::{
     tachyon,
     transaction::{Transaction, UnminedTx, VerifiedUnminedTx, WtxId},
 };
+use zakura_node_services::mempool;
 use zakura_state::{ReadRequest, ReadResponse, TachyonMiningData};
+use zcash_tachyon::stamp::StampState as _;
 use zcash_tachyon::{Bundle, EpochIndex, PointerStamp, ProofStamp, TachyonBundle};
 
 const STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,16 +28,22 @@ const AGGREGATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// A Tachyon transaction is omitted unless its anchor and tachygrams are valid for the exact
 /// candidate tip. Proving failures leave the remaining safe transactions autonome, so block
 /// template generation remains available while aggregation is temporarily unavailable.
-pub async fn aggregate_transactions<S>(
+pub async fn aggregate_transactions<S, M>(
     network: Network,
     candidate_height: block::Height,
     tip_hash: block::Hash,
     mut read_state: S,
+    mempool: M,
     transactions: Vec<VerifiedUnminedTx>,
 ) -> Vec<VerifiedUnminedTx>
 where
     S: Service<ReadRequest, Response = ReadResponse, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
+    M: Service<mempool::Request, Response = mempool::Response, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    M::Future: Send + 'static,
 {
     if !transactions
         .iter()
@@ -44,9 +52,25 @@ where
         return transactions;
     }
 
+    let cached_aggregates = match timeout(
+        STATE_QUERY_TIMEOUT,
+        mempool
+            .clone()
+            .oneshot(mempool::Request::TachyonAggregates(tip_hash)),
+    )
+    .await
+    {
+        Ok(Ok(mempool::Response::TachyonAggregates(aggregates))) => aggregates,
+        _ => Vec::new(),
+    };
     let candidates = transactions
         .iter()
         .filter_map(|tx| autonome_bundle(tx.transaction.transaction()))
+        .chain(
+            cached_aggregates
+                .iter()
+                .filter_map(|tx| proof_bundle(tx.transaction())),
+        )
         .collect::<Vec<_>>();
 
     if candidates.is_empty() {
@@ -90,10 +114,18 @@ where
         }
     };
 
-    let transactions = valid_for_candidate(&network, candidate_height, transactions, &mining_data);
+    let mut transactions =
+        valid_for_candidate(&network, candidate_height, transactions, &mining_data);
+    apply_cached_aggregates(
+        &network,
+        candidate_height,
+        &mut transactions,
+        &mining_data,
+        cached_aggregates,
+    );
     if transactions
         .iter()
-        .filter_map(|tx| autonome_bundle(tx.transaction.transaction()))
+        .filter_map(|tx| proof_bundle(tx.transaction.transaction()))
         .count()
         < 2
     {
@@ -101,12 +133,34 @@ where
     }
 
     let fallback_transactions = transactions.clone();
+    static PROVER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let Ok(permit) = PROVER
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .try_acquire_owned()
+    else {
+        return fallback_transactions;
+    };
+    let original_bytes: usize = transactions.iter().map(|tx| tx.transaction.size()).sum();
     let aggregation = tokio::task::spawn_blocking(move || {
+        // Remain charged after a caller's timeout until the non-cancellable proof work ends.
+        let _permit = permit;
         aggregate_with_data(&network, transactions, mining_data)
     });
 
-    match timeout(AGGREGATION_TIMEOUT, aggregation).await {
-        Ok(Ok(Ok(transactions))) => transactions,
+    let transactions = match timeout(AGGREGATION_TIMEOUT, aggregation).await {
+        Ok(Ok(Ok(transactions))) => {
+            if transactions
+                .iter()
+                .map(|tx| tx.transaction.size())
+                .sum::<usize>()
+                <= original_bytes
+            {
+                transactions
+            } else {
+                fallback_transactions
+            }
+        }
         Ok(Ok(Err(error))) => {
             tracing::warn!(%error, "could not aggregate Tachyon transactions");
             fallback_transactions
@@ -118,6 +172,120 @@ where
         Err(_) => {
             tracing::warn!("timed out aggregating Tachyon transactions");
             fallback_transactions
+        }
+    };
+    let publish = transactions
+        .iter()
+        .filter(|tx| !tx.transaction.tachyon_dependencies().is_empty())
+        .map(|tx| mempool::Gossip::Tx(tx.transaction.clone()))
+        .collect::<Vec<_>>();
+    if !publish.is_empty() {
+        // Admission still performs full verification and reserves the serving lease before gossip.
+        let _ = timeout(
+            STATE_QUERY_TIMEOUT,
+            mempool.oneshot(mempool::Request::Queue(publish)),
+        )
+        .await;
+    }
+    transactions
+}
+
+fn apply_cached_aggregates(
+    network: &Network,
+    height: block::Height,
+    transactions: &mut [VerifiedUnminedTx],
+    mining_data: &TachyonMiningData,
+    mut candidates: Vec<UnminedTx>,
+) {
+    use zakura_chain::tachyon::aggregation::check_package;
+    // Prefer broader coverage; exact-ID checks below prevent overlap or double selection.
+    candidates.sort_by_key(|tx| std::cmp::Reverse(tx.tachyon_dependencies().len()));
+    for candidate in candidates {
+        if check_package(&candidate).is_err() {
+            continue;
+        }
+        let bundle =
+            proof_bundle(candidate.transaction()).expect("package check requires proof stamp");
+        let Some(&anchor_height) = mining_data
+            .anchor_heights
+            .get(&tachyon::Anchor::from(bundle.stamp.anchor))
+        else {
+            continue;
+        };
+        if !tachyon::within_scan_window(network, anchor_height, height)
+            || bundle.stamp.tachygrams.iter().any(|gram| {
+                mining_data
+                    .revealed_tachygrams
+                    .contains(&tachyon::Tachygram::from(*gram))
+            })
+        {
+            continue;
+        }
+        let indices: Option<Vec<_>> = candidate
+            .tachyon_dependencies()
+            .iter()
+            .map(|original| {
+                transactions
+                    .iter()
+                    .position(|tx| tx.transaction.id() == original.id())
+            })
+            .collect();
+        let Some(indices) = indices else {
+            continue;
+        };
+        let selected: HashSet<_> = indices.iter().copied().collect();
+        let grams: BTreeSet<_> = bundle.stamp.tachygrams.iter().copied().collect();
+        if transactions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !selected.contains(index))
+            .filter_map(|(_, tx)| proof_bundle(tx.transaction.transaction()))
+            .any(|other| {
+                other
+                    .stamp
+                    .tachygrams
+                    .iter()
+                    .any(|gram| grams.contains(gram))
+            })
+        {
+            continue;
+        }
+        let Some(carrier) = indices.iter().copied().find(|index| {
+            transactions[*index].transaction.id().mined_id() == candidate.id().mined_id()
+        }) else {
+            continue;
+        };
+        let Ok(pointer) =
+            PointerStamp::try_from(WtxId::from(candidate.transaction().as_ref()).as_bytes())
+        else {
+            continue;
+        };
+        let mut replacements = Vec::new();
+        for &index in &indices {
+            let mut tx = transactions[index].clone();
+            if index == carrier {
+                tx.transaction = candidate.clone();
+            } else {
+                let original = autonome_bundle(tx.transaction.transaction())
+                    .expect("exact original IDs refer to autonomes");
+                let adjunct = original.clone().strip(pointer);
+                replace_bundle(&mut tx, TachyonBundle::Adjunct(adjunct));
+            }
+            replacements.push((index, tx));
+        }
+        let old_bytes: usize = indices
+            .iter()
+            .map(|index| transactions[*index].transaction.size())
+            .sum();
+        let new_bytes: usize = replacements
+            .iter()
+            .map(|(_, tx)| tx.transaction.size())
+            .sum();
+        if new_bytes > old_bytes {
+            continue;
+        }
+        for (index, tx) in replacements {
+            transactions[index] = tx;
         }
     }
 }
@@ -248,7 +416,7 @@ fn aggregate_with_data(
     let mut epoch_groups = BTreeMap::<u32, Vec<(usize, block::Height)>>::new();
 
     for (index, transaction) in transactions.iter().enumerate() {
-        let Some(bundle) = autonome_bundle(transaction.transaction.transaction()) else {
+        let Some(bundle) = proof_bundle(transaction.transaction.transaction()) else {
             continue;
         };
         let anchor = tachyon::Anchor::from(bundle.stamp.anchor);
@@ -287,6 +455,37 @@ fn aggregate_epoch_group(
     epoch: EpochIndex,
     group: &[(usize, block::Height)],
 ) -> Result<(), String> {
+    let originals: Vec<_> = group
+        .iter()
+        .flat_map(|(index, _)| {
+            let tx = &transactions[*index].transaction;
+            if tx.tachyon_dependencies().is_empty() {
+                vec![tx.clone()]
+            } else {
+                tx.tachyon_dependencies().to_vec()
+            }
+        })
+        .collect();
+    let targets: HashSet<_> = group
+        .iter()
+        .map(|(index, _)| {
+            WtxId::from(transactions[*index].transaction.transaction().as_ref()).as_bytes()
+        })
+        .collect();
+    let covered_indices: Vec<_> = transactions
+        .iter()
+        .enumerate()
+        .filter_map(
+            |(index, tx)| match &tx.transaction.transaction().tachyon_shielded_data()?.0 {
+                TachyonBundle::Adjunct(bundle)
+                    if targets.contains(&bundle.stamp.stamp_digest()) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            },
+        )
+        .collect();
     let target_height = group
         .iter()
         .map(|(_index, height)| *height)
@@ -296,21 +495,43 @@ fn aggregate_epoch_group(
         .iter()
         .find_map(|(index, height)| {
             (*height == target_height)
-                .then(|| autonome_bundle(transactions[*index].transaction.transaction()))
+                .then(|| proof_bundle(transactions[*index].transaction.transaction()))
                 .flatten()
                 .map(|bundle| bundle.stamp.anchor)
         })
-        .expect("group transactions have autonome bundles");
+        .expect("group transactions have proof stamps");
 
     let mut lifted_stamps = Vec::with_capacity(group.len());
 
     for &(index, start_height) in group {
-        let bundle = autonome_bundle(transactions[index].transaction.transaction())
-            .expect("group transactions have autonome bundles");
+        let bundle = proof_bundle(transactions[index].transaction.transaction())
+            .expect("group transactions have proof stamps");
+        let target = WtxId::from(transactions[index].transaction.transaction().as_ref()).as_bytes();
+        let covered: Vec<_> = covered_indices
+            .iter()
+            .filter_map(|index| {
+                match &transactions[*index]
+                    .transaction
+                    .transaction()
+                    .tachyon_shielded_data()?
+                    .0
+                {
+                    TachyonBundle::Adjunct(bundle) if bundle.stamp.stamp_digest() == target => {
+                        Some(bundle.as_dyn())
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
         let descriptors = bundle
             .actions
             .iter()
             .map(|action| action.descriptor())
+            .chain(
+                covered
+                    .iter()
+                    .flat_map(|bundle| bundle.actions.iter().map(|action| action.descriptor())),
+            )
             .collect::<BTreeSet<_>>();
         let mut lifted_bundle = bundle.clone();
 
@@ -330,7 +551,7 @@ fn aggregate_epoch_group(
             }
 
             lifted_bundle = lifted_bundle
-                .lift(rng, &[], (epoch, &next_bundles))
+                .lift(rng, &covered, (epoch, &next_bundles))
                 .map_err(|error| format!("could not lift Tachyon proof stamp: {error}"))?;
         }
 
@@ -357,8 +578,8 @@ fn aggregate_epoch_group(
 
     let aggregate_index = group[0].0;
     let mut aggregate_bundle =
-        autonome_bundle(transactions[aggregate_index].transaction.transaction())
-            .expect("group transactions have autonome bundles")
+        proof_bundle(transactions[aggregate_index].transaction.transaction())
+            .expect("group transactions have proof stamps")
             .clone();
     aggregate_bundle.stamp = merged_stamp;
     replace_bundle(
@@ -377,11 +598,33 @@ fn aggregate_epoch_group(
         .map_err(|error| format!("invalid Tachyon aggregate wtxid: {error}"))?;
 
     for &(index, _height) in &group[1..] {
-        let adjunct = autonome_bundle(transactions[index].transaction.transaction())
-            .expect("group transactions have autonome bundles")
+        let adjunct = proof_bundle(transactions[index].transaction.transaction())
+            .expect("group transactions have proof stamps")
             .clone()
             .strip(pointer);
         replace_bundle(&mut transactions[index], TachyonBundle::Adjunct(adjunct));
+    }
+    for index in covered_indices {
+        let Some(data) = transactions[index]
+            .transaction
+            .transaction()
+            .tachyon_shielded_data()
+        else {
+            continue;
+        };
+        if let TachyonBundle::Adjunct(bundle) = &data.0 {
+            let mut bundle = bundle.clone();
+            bundle.stamp = pointer;
+            replace_bundle(&mut transactions[index], TachyonBundle::Adjunct(bundle));
+        }
+    }
+
+    let package = transactions[aggregate_index]
+        .transaction
+        .clone()
+        .with_tachyon_dependencies(originals);
+    if zakura_chain::tachyon::aggregation::check_package(&package).is_ok() {
+        transactions[aggregate_index].transaction = package;
     }
 
     Ok(())
@@ -435,6 +678,143 @@ mod tests {
     };
 
     use super::*;
+
+    fn relay_fixture() -> (
+        Network,
+        Vec<VerifiedUnminedTx>,
+        UnminedTx,
+        TachyonMiningData,
+    ) {
+        let network = nutachyon_network();
+        let anchor = Anchor::read(&[0; 32][..]).unwrap();
+        let originals = vec![
+            verified_transaction(anchor),
+            verified_transaction(anchor),
+            verified_transaction(anchor),
+        ];
+        let mining_data = TachyonMiningData {
+            tip_anchor: tachyon::Anchor::from(anchor),
+            anchor_heights: HashMap::from([(tachyon::Anchor::from(anchor), Height(10))]),
+            blocks: BTreeMap::new(),
+            revealed_tachygrams: HashSet::new(),
+        };
+        let mut merged = originals.clone();
+        aggregate_epoch_group(
+            &mut rand_10::rng(),
+            &mut merged,
+            &BTreeMap::new(),
+            EpochIndex::new(0),
+            &[(0, Height(10)), (1, Height(10))],
+        )
+        .unwrap();
+        let aggregate = merged[0].transaction.clone();
+        zakura_chain::tachyon::aggregation::check_package(&aggregate).unwrap();
+        (network, originals, aggregate, mining_data)
+    }
+
+    #[test]
+    fn relay_aggregate_requires_every_exact_original_before_mining() {
+        let (network, original, aggregate, data) = relay_fixture();
+        let mut missing = vec![original[0].clone(), original[2].clone()];
+        apply_cached_aggregates(
+            &network,
+            Height(11),
+            &mut missing,
+            &data,
+            vec![aggregate.clone()],
+        );
+        assert_eq!(missing, vec![original[0].clone(), original[2].clone()]);
+        let mut selected = original.clone();
+        apply_cached_aggregates(
+            &network,
+            Height(11),
+            &mut selected,
+            &data,
+            vec![aggregate.clone()],
+        );
+        assert_eq!(selected[0].transaction.id(), aggregate.id());
+        assert!(matches!(
+            &selected[1]
+                .transaction
+                .transaction()
+                .tachyon_shielded_data()
+                .unwrap()
+                .0,
+            TachyonBundle::Adjunct(_)
+        ));
+        assert_eq!(selected[2], original[2]);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|tx| tx.transaction.id().mined_id())
+                .collect::<Vec<_>>(),
+            original
+                .iter()
+                .map(|tx| tx.transaction.id().mined_id())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn relay_aggregate_can_be_merged_again_and_flattens_manifest() {
+        let (network, originals, aggregate, data) = relay_fixture();
+        let ids = originals
+            .iter()
+            .map(|tx| tx.transaction.id().mined_id())
+            .collect::<Vec<_>>();
+        let mut selected = originals.clone();
+        apply_cached_aggregates(&network, Height(11), &mut selected, &data, vec![aggregate]);
+        let merged = aggregate_with_data(&network, selected, data).unwrap();
+        assert_aggregated(&merged, &ids);
+        assert_eq!(merged[0].transaction.tachyon_dependencies().len(), 3);
+        zakura_chain::tachyon::aggregation::check_package(&merged[0].transaction).unwrap();
+    }
+
+    #[test]
+    fn relay_package_rejects_missing_recursive_and_changed_carrier() {
+        let (_, originals, aggregate, _) = relay_fixture();
+        use zakura_chain::tachyon::aggregation::check_package;
+        assert!(
+            check_package(&aggregate.clone().with_tachyon_dependencies(vec![
+                originals[1].transaction.clone(),
+                originals[2].transaction.clone()
+            ]))
+            .is_err()
+        );
+        assert!(check_package(
+            &aggregate.clone().with_tachyon_dependencies(vec![
+                aggregate.clone(),
+                originals[1].transaction.clone()
+            ])
+        )
+        .is_err());
+        let mut changed = aggregate.transaction().as_ref().clone();
+        let Transaction::V7 {
+            tachyon_shielded_data: Some(data),
+            ..
+        } = &mut changed
+        else {
+            unreachable!()
+        };
+        let TachyonBundle::Proven(bundle) = &mut data.0 else {
+            unreachable!()
+        };
+        bundle.binding_sig = zcash_tachyon::bundle::Signature::read(&[9; 64][..]).unwrap();
+        assert!(check_package(
+            &UnminedTx::from(changed)
+                .with_tachyon_dependencies(aggregate.tachyon_dependencies().to_vec())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn relay_aggregate_with_expired_anchor_is_not_mined() {
+        let (network, originals, aggregate, mut data) = relay_fixture();
+        data.anchor_heights.clear();
+        let mut selected = originals.clone();
+        apply_cached_aggregates(&network, Height(11), &mut selected, &data, vec![aggregate]);
+        assert_eq!(selected, originals);
+    }
 
     #[test]
     fn same_anchor_autonome_transactions_are_aggregated() {
@@ -598,23 +978,27 @@ mod tests {
         else {
             panic!("the first transaction should carry the aggregate proof");
         };
-        let TachyonBundle::Adjunct(adjunct) = &aggregated[1]
-            .transaction
-            .transaction()
-            .tachyon_shielded_data()
-            .expect("adjunct has Tachyon data")
-            .0
-        else {
-            panic!("the second transaction should point to the aggregate");
-        };
-
         assert!(aggregate.is_aggregate());
-        let adjunct_dyn: &Bundle<dyn zcash_tachyon::stamp::StampState> = adjunct;
-        assert!(aggregate.is_covering(&[adjunct_dyn]));
-        assert_eq!(
-            adjunct.stamp.stamp_digest(),
-            WtxId::from(aggregated[0].transaction.transaction().as_ref()).as_bytes(),
-        );
+        let adjuncts: Vec<_> = aggregated[1..]
+            .iter()
+            .map(|tx| {
+                let TachyonBundle::Adjunct(adjunct) = &tx
+                    .transaction
+                    .transaction()
+                    .tachyon_shielded_data()
+                    .expect("adjunct has Tachyon data")
+                    .0
+                else {
+                    panic!("every remaining transaction should point to the aggregate");
+                };
+                assert_eq!(
+                    adjunct.stamp.stamp_digest(),
+                    WtxId::from(aggregated[0].transaction.transaction().as_ref()).as_bytes()
+                );
+                adjunct.as_dyn()
+            })
+            .collect();
+        assert!(aggregate.is_covering(&adjuncts));
     }
 
     fn verified_transaction(anchor: Anchor) -> VerifiedUnminedTx {

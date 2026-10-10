@@ -4,5 +4,7 @@
 
 mod anchors;
 mod nullifier;
+#[cfg(zcash_unstable = "nutachyon")]
+mod tachyon;
 mod utxo;
 mod vectors;
