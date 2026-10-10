@@ -74,6 +74,9 @@ async fn tachyon_sync_rpc_returns_empty_block_data_from_one_state_request() {
         assert!(!reply.finalized);
         assert!(reply.stamps.is_empty());
         assert_eq!(reply.anchor_after, anchor.0);
+        let json = serde_json::to_value(reply).unwrap();
+        assert_eq!(json["hash"], hash.to_string());
+        assert_eq!(json["previousBlockHash"], "0".repeat(64));
         queue.abort();
     })
     .await
