@@ -5,13 +5,15 @@ use zakura_chain::{block, tachyon, transaction};
 use zcash_tachyon::{EpochIndex, TachyonBundle};
 
 /// Response to `gettachyonblock`. Field-element and point encodings are canonical
-/// Tachyon wire bytes in hex; block hashes and txids use conventional display order.
+/// Tachyon wire bytes in hex; block hashes and txids are hex strings in conventional display order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTachyonBlockResponse {
     /// Selected best-chain block hash, to persist as the client's resume cursor.
+    #[serde(with = "hex")]
     pub hash: block::Hash,
     /// Previous block hash, for detecting forks and gaps.
+    #[serde(with = "hex")]
     pub previous_block_hash: block::Hash,
     /// Absolute chain height.
     pub height: block::Height,
@@ -47,6 +49,7 @@ pub struct TachyonStampData {
     /// Position in the block's complete transaction list, including coinbase.
     pub transaction_index: usize,
     /// Transaction containing the proof stamp.
+    #[serde(with = "hex")]
     pub txid: transaction::Hash,
     /// Commitment absorbed by this stamp's anchor step.
     #[serde(with = "hex")]
