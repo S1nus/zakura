@@ -1,14 +1,22 @@
 # zakura (Tachyon internal testnet)
 
-the `cnode-working` branch of this fork tracks the main branch of [upstream Zakura](https://github.com/zakura-core/zakura), with a few extra PRs merged:
+The `cnode-working` branch of this fork tracks the main branch of [upstream Zakura](https://github.com/zakura-core/zakura), with a few extra PRs merged:
+
 - the [Tachyon PR](https://github.com/zakura-core/zakura/pull/795)
+- the [Tachyon workload generator](https://github.com/zakura-core/zakura/pull/921)
 - [a PR](https://github.com/S1nus/zakura/pull/1) to print out upgrades in stdout as they happen
 
+## How to build
 
-## How to build:
-`RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo build --release --bin zakurad --features internal-miner`
+```sh
+ROCKSDB_LIB_DIR="/opt/homebrew/lib" RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo build --locked --release --bin zakurad --features internal-miner
+```
 
-## Sample config:
+The RocksDB path above is for Homebrew on macOS; use your system library location on other hosts, or omit it to build RocksDB from source.
+
+See [Tachyon proof synchronization](docs/tachyon-proof-sync.md) for the chain data RPC used by wallets and sync services.
+
+## Sample config
 
 ```
 [consensus]

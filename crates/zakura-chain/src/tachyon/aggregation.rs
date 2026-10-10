@@ -87,7 +87,7 @@ pub fn check_package(transaction: &UnminedTx) -> Result<(), &'static str> {
             }
             carrier = true;
         } else {
-            covered.push(bundle.as_dyn());
+            covered.extend(bundle.descriptors());
         }
     }
     if !carrier {

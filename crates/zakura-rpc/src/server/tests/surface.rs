@@ -14,7 +14,7 @@ use tower::buffer::Buffer;
 
 use crate::{
     config::rpc::Config,
-    methods::{rpc_method_access, RpcAccess, RpcImpl, RpcSurface, METHODS, RPC_METHOD_ACCESS},
+    methods::{RpcAccess, RpcImpl, RpcSurface, METHODS, RPC_METHOD_ACCESS},
     server::{configure_rpc_methods, primary_rpc_surface},
 };
 use zakura_chain::{chain_sync_status::MockSyncStatus, chain_tip::NoChainTip, parameters::Network};
@@ -40,11 +40,7 @@ fn classified_module() -> RpcModule<()> {
 #[test]
 fn access_policy_matches_the_openrpc_method_set() {
     let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
-    let documented: BTreeSet<_> = METHODS
-        .keys()
-        .copied()
-        .filter(|name| rpc_method_access(name).is_some())
-        .collect();
+    let documented: BTreeSet<_> = METHODS.iter().map(|(name, _)| *name).collect();
 
     assert_eq!(
         classified.len(),
@@ -182,6 +178,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         .await
         .expect("admin RPC listener should start");
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -220,6 +217,38 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
     }
     assert!(!restricted_methods.contains("invalidateblock"));
     assert!(!restricted_methods.contains("reconsiderblock"));
+
+    for method in ["gettachyoninfo", "gettachyonblock"] {
+        assert_eq!(
+            restricted_methods.contains(method),
+            cfg!(zcash_unstable = "nutachyon"),
+            "Tachyscan and proof-sync RPCs must be registered only in Tachyon builds"
+        );
+    }
+
+    let tachyon_enabled = cfg!(zcash_unstable = "nutachyon");
+    assert_eq!(
+        restricted_methods.contains("gettachyonblock"),
+        tachyon_enabled
+    );
+    // An invalid identifier needs no state request: this checks actual method
+    // registration, not just the generated discovery document.
+    let tachyon_call = client
+        .post(format!("http://{restricted_addr}"))
+        .header("content-type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","method":"gettachyonblock","params":["invalid"],"id":8}"#)
+        .send()
+        .await
+        .expect("Tachyon availability request should complete")
+        .text()
+        .await
+        .expect("Tachyon availability response body should be readable");
+    let tachyon_call: serde_json::Value =
+        serde_json::from_str(&tachyon_call).expect("Tachyon availability response should be JSON");
+    assert_eq!(
+        tachyon_call["error"]["code"],
+        if tachyon_enabled { -8 } else { -32601 }
+    );
 
     let blocked_call = client
         .post(format!("http://{restricted_addr}"))

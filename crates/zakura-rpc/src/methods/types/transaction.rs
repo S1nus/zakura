@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::methods::arrayhex;
 use chrono::{DateTime, Utc};
-use derive_getters::Getters;
 use derive_new::new;
+use getset::{CopyGetters, Getters};
 use hex::ToHex;
 use zcash_script::script::Asm;
 
@@ -51,7 +51,9 @@ use super::zec::Zec;
 use super::{super::opthex, get_block_template::MinerParams};
 
 /// Transaction data and fields needed to generate blocks using the `getblocktemplate` RPC.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 #[serde(bound = "FeeConstraint: amount::Constraint + Clone")]
 pub struct TransactionTemplate<FeeConstraint>
 where
@@ -59,17 +61,18 @@ where
 {
     /// The hex-encoded serialized data for this transaction.
     #[serde(with = "hex")]
+    #[getset(get = "pub")]
     pub(crate) data: SerializedTransaction,
 
     /// The transaction ID of this transaction.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) hash: transaction::Hash,
 
     /// The authorizing data digest of a v5 transaction, or a placeholder for older versions.
     #[serde(rename = "authdigest")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) auth_digest: transaction::AuthDigest,
 
     /// The transactions in this block template that this transaction depends upon.
@@ -78,6 +81,7 @@ where
     /// Zebra's mempool does not support transaction dependencies, so this list is always empty.
     ///
     /// We use `u16` because 2 MB blocks are limited to around 39,000 transactions.
+    #[getset(get = "pub")]
     pub(crate) depends: Vec<u16>,
 
     /// The fee for this transaction.
@@ -86,15 +90,17 @@ where
     /// A coinbase reports the negative fees it collects, excluding the block subsidy
     /// and the NU7 NSM contribution. Its fee must be `NegativeOrZero`.
     /// Non-coinbase entries report the full fee before the aggregate NSM split.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) fee: Amount<FeeConstraint>,
 
     /// The number of transparent signature operations in this transaction.
+    #[getset(get_copy = "pub")]
     pub(crate) sigops: u32,
 
     /// Is this transaction required in the block?
     ///
     /// Coinbase transactions are required, all other transactions are not.
+    #[getset(get_copy = "pub")]
     pub(crate) required: bool,
 }
 
@@ -146,7 +152,6 @@ pub(super) struct CoinbaseResourceUsage {
 
 #[derive(Clone, Copy)]
 enum MinerRewardAddress {
-    Orchard(::orchard::Address),
     Ironwood(::orchard::Address),
     Sapling(sapling_crypto::PaymentAddress),
     Transparent(TransparentAddress),
@@ -155,7 +160,7 @@ enum MinerRewardAddress {
 /// Fee-independent outputs that determine a coinbase transaction's shape.
 struct CoinbasePlan {
     miner_reward_address: MinerRewardAddress,
-    transparent_miner_reward_output_count: usize,
+    transparent_miner_outputs: usize,
     funding_stream_outputs: Vec<(Zatoshis, TransparentAddress)>,
 }
 
@@ -177,15 +182,13 @@ impl CoinbasePlan {
                                 .map(|addr| MinerRewardAddress::Transparent(*addr))
                         })
                 };
-                let reward_address = if upgrade >= NetworkUpgrade::Nu5 {
+                // An Orchard receiver is only payable as an Ironwood output:
+                // Orchard-pool coinbase payouts were removed along with
+                // pre-NU6.3 Orchard proving. Before NU6.3 a unified address
+                // falls back to its Sapling or transparent receiver.
+                let reward_address = if upgrade >= NetworkUpgrade::Nu6_3 {
                     addr.orchard()
-                        .map(|addr| {
-                            if upgrade < NetworkUpgrade::Nu6_3 {
-                                MinerRewardAddress::Orchard(*addr)
-                            } else {
-                                MinerRewardAddress::Ironwood(*addr)
-                            }
-                        })
+                        .map(|addr| MinerRewardAddress::Ironwood(*addr))
                         .or_else(fallback)
                 } else {
                     fallback()
@@ -219,24 +222,17 @@ impl CoinbasePlan {
 
         funding_stream_outputs.sort();
 
-        let transparent_miner_reward_output_count =
-            if matches!(miner_reward_address, MinerRewardAddress::Transparent(_)) {
-                #[cfg(zcash_unstable = "nutachyon")]
-                if miner_params.tachyon_workload() {
-                    super::get_block_template::TRANSACTIONS_PER_BLOCK
-                } else {
-                    1
-                }
-
-                #[cfg(not(zcash_unstable = "nutachyon"))]
-                1
-            } else {
-                0
-            };
+        let transparent_miner_outputs = 1;
+        #[cfg(zcash_unstable = "nutachyon")]
+        let transparent_miner_outputs = if miner_params.tachyon_workload() {
+            super::get_block_template::TRANSACTIONS_PER_BLOCK
+        } else {
+            transparent_miner_outputs
+        };
 
         Ok(Self {
             miner_reward_address,
-            transparent_miner_reward_output_count,
+            transparent_miner_outputs,
             funding_stream_outputs,
         })
     }
@@ -272,7 +268,7 @@ impl CoinbasePlan {
         if let MinerRewardAddress::Transparent(addr) = self.miner_reward_address {
             transparent_outputs.extend(std::iter::repeat_n(
                 (Zatoshis::ZERO, addr),
-                self.transparent_miner_reward_output_count,
+                self.transparent_miner_outputs,
             ));
         }
 
@@ -329,10 +325,7 @@ impl CoinbasePlan {
                     MinerRewardAddress::Sapling(_) => sapling_bundle_bytes,
                     _ => compact_size_bytes(0) + compact_size_bytes(0),
                 };
-                let orchard = match self.miner_reward_address {
-                    MinerRewardAddress::Orchard(_) => orchard_bundle_bytes,
-                    _ => compact_size_bytes(0),
-                };
+                let orchard = compact_size_bytes(0);
 
                 (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard)
             }
@@ -366,10 +359,6 @@ impl CoinbasePlan {
             .try_into()
             .expect("coinbase transparent output count fits in u32");
         let shielded_action_counts = match self.miner_reward_address {
-            MinerRewardAddress::Orchard(_) => ShieldedActionCounts {
-                orchard_actions: 1,
-                ..Default::default()
-            },
             MinerRewardAddress::Ironwood(_) => ShieldedActionCounts {
                 ironwood_actions: 1,
                 ..Default::default()
@@ -448,8 +437,9 @@ impl TransactionTemplate<NegativeOrZero> {
             // the derivation in `Builder::build`).
             if let Some(version) = bundle_version_for_branch(branch, ::orchard::ValuePool::Orchard)
             {
-                let prepared =
-                    cached_orchard_proving_key(version.circuit_version()).prepare_proving();
+                let prepared = cached_orchard_proving_key(version.circuit_version())
+                    .expect("coinbase construction requires the current proving circuit")
+                    .prepare_proving();
                 tracing::debug!(
                     ?height,
                     prepared,
@@ -459,21 +449,6 @@ impl TransactionTemplate<NegativeOrZero> {
         };
 
         match plan.miner_reward_address {
-            MinerRewardAddress::Orchard(addr) => {
-                builder
-                    .add_orchard_output::<String>(
-                        Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
-                        addr,
-                        miner_reward,
-                        memo.clone(),
-                    )
-                    .map_err(|error| {
-                        TransactionError::CoinbaseConstruction(format!(
-                            "Failed to add Orchard output: {error}"
-                        ))
-                    })?;
-                arm_shielded_reward_proving_key();
-            }
             MinerRewardAddress::Ironwood(addr) => {
                 builder
                     .add_ironwood_output::<String>(
@@ -504,20 +479,13 @@ impl TransactionTemplate<NegativeOrZero> {
                     })?;
             }
             MinerRewardAddress::Transparent(addr) => {
-                let output_count = plan.transparent_miner_reward_output_count;
-                let output_count_u64 =
-                    u64::try_from(output_count).expect("the fixed reward output count fits in u64");
-                let total = miner_reward.into_u64();
-                let quotient = total / output_count_u64;
-                let remainder = total % output_count_u64;
-
-                for index in 0..output_count {
+                // The count is fixed to one or TRANSACTIONS_PER_BLOCK (three), so it fits in u64.
+                let count = plan.transparent_miner_outputs as u64;
+                let quotient = miner_reward.into_u64() / count;
+                let remainder = miner_reward.into_u64() % count;
+                for index in 0..count {
                     let value = quotient + u64::from(index == 0) * remainder;
-                    builder.add_transparent_output(
-                        &addr,
-                        Zatoshis::from_u64(value)
-                            .expect("parts of a valid miner reward remain valid"),
-                    )?;
+                    builder.add_transparent_output(&addr, Zatoshis::from_u64(value)?)?;
                 }
             }
         }
@@ -558,46 +526,54 @@ impl TransactionTemplate<NegativeOrZero> {
 /// A Transaction object as returned by `getrawtransaction` and `getblock` RPC
 /// requests.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct TransactionObject {
     /// Whether specified block is in the active chain or not (only present with
     /// explicit "blockhash" argument)
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) in_active_chain: Option<bool>,
     /// The raw transaction, encoded as hex bytes.
     #[serde(with = "hex")]
+    #[getset(get = "pub")]
     pub(crate) hex: SerializedTransaction,
     /// The height of the block in the best chain that contains the tx, -1 if
     /// it's in a side chain block, or `None` if the tx is in the mempool.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) height: Option<i32>,
     /// The height diff between the block containing the tx and the best chain
     /// tip + 1, 0 if it's in a side chain, or `None` if the tx is in the
     /// mempool.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) confirmations: Option<i64>,
 
     /// Transparent inputs of the transaction.
     #[serde(rename = "vin")]
+    #[getset(get = "pub")]
     pub(crate) inputs: Vec<Input>,
 
     /// Transparent outputs of the transaction.
     #[serde(rename = "vout")]
+    #[getset(get = "pub")]
     pub(crate) outputs: Vec<Output>,
 
     /// Sapling spends of the transaction.
     #[serde(rename = "vShieldedSpend")]
+    #[getset(get = "pub")]
     pub(crate) shielded_spends: Vec<ShieldedSpend>,
 
     /// Sapling outputs of the transaction.
     #[serde(rename = "vShieldedOutput")]
+    #[getset(get = "pub")]
     pub(crate) shielded_outputs: Vec<ShieldedOutput>,
 
     /// Transparent outputs of the transaction.
     #[serde(rename = "vjoinsplit")]
+    #[getset(get = "pub")]
     pub(crate) joinsplits: Vec<JoinSplit>,
 
     /// Sapling binding signature of the transaction.
@@ -607,7 +583,7 @@ pub struct TransactionObject {
         default,
         rename = "bindingSig"
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) binding_sig: Option<[u8; 64]>,
 
     /// JoinSplit public key of the transaction.
@@ -617,7 +593,7 @@ pub struct TransactionObject {
         default,
         rename = "joinSplitPubKey"
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) joinsplit_pub_key: Option<[u8; 32]>,
 
     /// JoinSplit signature of the transaction.
@@ -627,17 +603,19 @@ pub struct TransactionObject {
         default,
         rename = "joinSplitSig"
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) joinsplit_sig: Option<[u8; ed25519::Signature::BYTE_SIZE]>,
 
     /// Orchard actions of the transaction.
     #[serde(rename = "orchard", skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) orchard: Option<Orchard>,
 
     /// Ironwood actions of the transaction, omitted when the transaction has no
     /// Ironwood shielded data.
     #[serde(rename = "ironwood", skip_serializing_if = "Option::is_none")]
     #[new(default)]
+    #[getset(get = "pub")]
     pub(crate) ironwood: Option<Orchard>,
 
     /// Tachyon actions and stamp data, omitted when the transaction has no
@@ -649,27 +627,27 @@ pub struct TransactionObject {
 
     /// The net value of Sapling Spends minus Outputs in ZEC
     #[serde(rename = "valueBalance", skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) value_balance: Option<f64>,
 
     /// The net value of Sapling Spends minus Outputs in zatoshis
     #[serde(rename = "valueBalanceZat", skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) value_balance_zat: Option<i64>,
 
     /// The size of the transaction in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) size: Option<i64>,
 
     /// The time the transaction was included in a block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) time: Option<i64>,
 
     /// The transaction identifier, encoded as hex bytes.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub txid: transaction::Hash,
 
     /// The transaction's auth digest. For pre-v5 transactions this will be
@@ -680,13 +658,15 @@ pub struct TransactionObject {
         skip_serializing_if = "Option::is_none",
         default
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) auth_digest: Option<transaction::AuthDigest>,
 
     /// Whether the overwintered flag is set
+    #[getset(get_copy = "pub")]
     pub(crate) overwintered: bool,
 
     /// The version of the transaction.
+    #[getset(get_copy = "pub")]
     pub(crate) version: u32,
 
     /// The version group ID.
@@ -696,17 +676,19 @@ pub struct TransactionObject {
         skip_serializing_if = "Option::is_none",
         default
     )]
+    #[getset(get = "pub")]
     pub(crate) version_group_id: Option<Vec<u8>>,
 
     /// The lock time
     #[serde(rename = "locktime")]
+    #[getset(get_copy = "pub")]
     pub(crate) lock_time: u32,
 
     /// The block height after which the transaction expires.
     /// Included for Overwinter+ transactions (matching zcashd), omitted for V1/V2.
     /// See: <https://github.com/zcash/zcash/blob/v6.11.0/src/rpc/rawtransaction.cpp#L224-L226>
     #[serde(rename = "expiryheight", skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) expiry_height: Option<Height>,
 
     /// The block hash
@@ -716,12 +698,12 @@ pub struct TransactionObject {
         skip_serializing_if = "Option::is_none",
         default
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) block_hash: Option<block::Hash>,
 
     /// The block height after which the transaction expires
     #[serde(rename = "blocktime", skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) block_time: Option<i64>,
 }
 
@@ -761,30 +743,50 @@ pub enum Input {
 }
 
 /// The transparent output of a transaction.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct Output {
     /// The value in ZEC.
+    #[getset(get_copy = "pub")]
     value: f64,
     /// The value in zats.
     #[serde(rename = "valueZat")]
+    #[getset(get_copy = "pub")]
     value_zat: i64,
     /// index.
+    #[getset(get_copy = "pub")]
     n: u32,
     /// The scriptPubKey.
     #[serde(rename = "scriptPubKey")]
+    #[getset(get = "pub")]
     script_pub_key: ScriptPubKey,
 }
 
 /// The output object returned by `gettxout` RPC requests.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct OutputObject {
+    /// The best chain tip hash, hex-encoded.
     #[serde(rename = "bestblock")]
+    #[getset(get = "pub")]
     best_block: String,
+    /// The number of confirmations for this output.
+    #[getset(get_copy = "pub")]
     confirmations: u32,
+    /// The value of this output in ZEC.
+    #[getset(get_copy = "pub")]
     value: f64,
+    /// The locking script for this output.
     #[serde(rename = "scriptPubKey")]
+    #[getset(get = "pub")]
     script_pub_key: ScriptPubKey,
+    /// The version of the transaction containing this output.
+    #[getset(get_copy = "pub")]
     version: u32,
+    /// Whether the output was created by a coinbase transaction.
+    #[getset(get_copy = "pub")]
     coinbase: bool,
 }
 impl OutputObject {
@@ -833,24 +835,30 @@ impl OutputObject {
 }
 
 /// The scriptPubKey of a transaction output.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct ScriptPubKey {
     /// the asm.
+    #[getset(get = "pub")]
     asm: String,
     /// the hex.
     #[serde(with = "hex")]
+    #[getset(get = "pub")]
     hex: Script,
     /// The required sigs.
     #[serde(rename = "reqSigs")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     req_sigs: Option<u32>,
     /// The type, eg 'pubkeyhash'.
+    #[getset(get = "pub")]
     r#type: String,
     /// The addresses.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     addresses: Option<Vec<String>>,
 }
 
@@ -858,152 +866,201 @@ pub struct ScriptPubKey {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct ScriptSig {
     /// The asm.
+    #[getset(get = "pub")]
     asm: String,
     /// The hex.
+    #[getset(get = "pub")]
     hex: Script,
 }
 
 /// A Sprout JoinSplit of a transaction.
 #[allow(clippy::too_many_arguments)]
-#[serde_with::serde_as]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct JoinSplit {
     /// Public input value in ZEC.
     #[serde(rename = "vpub_old")]
+    #[getset(get_copy = "pub")]
     old_public_value: f64,
     /// Public input value in zatoshis.
     #[serde(rename = "vpub_oldZat")]
+    #[getset(get_copy = "pub")]
     old_public_value_zat: i64,
     /// Public input value in ZEC.
     #[serde(rename = "vpub_new")]
+    #[getset(get_copy = "pub")]
     new_public_value: f64,
     /// Public input value in zatoshis.
     #[serde(rename = "vpub_newZat")]
+    #[getset(get_copy = "pub")]
     new_public_value_zat: i64,
     /// Merkle root of the Sprout note commitment tree.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     anchor: [u8; 32],
     /// The nullifier of the input notes.
-    #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+    #[serde(
+        serialize_with = "crate::methods::hex_serde::serialize_vec",
+        deserialize_with = "crate::methods::hex_serde::deserialize_vec"
+    )]
+    #[getset(get = "pub")]
     nullifiers: Vec<[u8; 32]>,
     /// The commitments of the output notes.
-    #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+    #[serde(
+        serialize_with = "crate::methods::hex_serde::serialize_vec",
+        deserialize_with = "crate::methods::hex_serde::deserialize_vec"
+    )]
+    #[getset(get = "pub")]
     commitments: Vec<[u8; 32]>,
     /// The onetime public key used to encrypt the ciphertexts
     #[serde(rename = "onetimePubKey")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     one_time_pubkey: [u8; 32],
     /// The random seed
     #[serde(rename = "randomSeed")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     random_seed: [u8; 32],
     /// The input notes MACs.
-    #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+    #[serde(
+        serialize_with = "crate::methods::hex_serde::serialize_vec",
+        deserialize_with = "crate::methods::hex_serde::deserialize_vec"
+    )]
+    #[getset(get = "pub")]
     macs: Vec<[u8; 32]>,
     /// A zero-knowledge proof using the Sprout circuit.
     #[serde(with = "hex")]
+    #[getset(get = "pub")]
     proof: Vec<u8>,
     /// The output notes ciphertexts.
-    #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+    #[serde(
+        serialize_with = "crate::methods::hex_serde::serialize_vec",
+        deserialize_with = "crate::methods::hex_serde::deserialize_vec"
+    )]
+    #[getset(get = "pub")]
     ciphertexts: Vec<Vec<u8>>,
 }
 
 /// A Sapling spend of a transaction.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 pub struct ShieldedSpend {
     /// Value commitment to the input note.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     cv: ValueCommitment,
     /// Merkle root of the Sapling note commitment tree.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     anchor: [u8; 32],
     /// The nullifier of the input note.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     nullifier: [u8; 32],
     /// The randomized public key for spendAuthSig.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     rk: [u8; 32],
     /// A zero-knowledge proof using the Sapling Spend circuit.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     proof: [u8; 192],
     /// A signature authorizing this Spend.
     #[serde(rename = "spendAuthSig", with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     spend_auth_sig: [u8; 64],
 }
 
 /// A Sapling output of a transaction.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 pub struct ShieldedOutput {
     /// Value commitment to the input note.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     cv: ValueCommitment,
     /// The u-coordinate of the note commitment for the output note.
     #[serde(rename = "cmu", with = "hex")]
+    #[getset(get_copy = "pub")]
     cm_u: [u8; 32],
     /// A Jubjub public key.
     #[serde(rename = "ephemeralKey", with = "hex")]
+    #[getset(get_copy = "pub")]
     ephemeral_key: [u8; 32],
     /// The output note encrypted to the recipient.
     #[serde(rename = "encCiphertext", with = "arrayhex")]
+    #[getset(get_copy = "pub")]
     enc_ciphertext: [u8; 580],
     /// A ciphertext enabling the sender to recover the output note.
     #[serde(rename = "outCiphertext", with = "hex")]
+    #[getset(get_copy = "pub")]
     out_ciphertext: [u8; 80],
     /// A zero-knowledge proof using the Sapling Output circuit.
     #[serde(with = "hex")]
+    #[getset(get_copy = "pub")]
     proof: [u8; 192],
 }
 
 /// Object with Orchard or Ironwood action information.
-#[serde_with::serde_as]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct Orchard {
     /// Array of Orchard or Ironwood actions.
+    #[getset(get = "pub")]
     actions: Vec<OrchardAction>,
     /// The net value of Orchard or Ironwood actions in ZEC.
     #[serde(rename = "valueBalance")]
+    #[getset(get_copy = "pub")]
     value_balance: f64,
     /// The net value of Orchard or Ironwood actions in zatoshis.
     #[serde(rename = "valueBalanceZat")]
+    #[getset(get_copy = "pub")]
     value_balance_zat: i64,
     /// The flags.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     flags: Option<OrchardFlags>,
     /// A root of the Orchard or Ironwood note commitment tree at some block height in the past.
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
+    #[serde(
+        default,
+        serialize_with = "crate::methods::hex_serde::serialize_option",
+        deserialize_with = "crate::methods::hex_serde::deserialize_option"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     anchor: Option<[u8; 32]>,
     /// Encoding of aggregated zk-SNARK proofs for Orchard or Ironwood actions.
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
+    #[serde(
+        default,
+        serialize_with = "crate::methods::hex_serde::serialize_option",
+        deserialize_with = "crate::methods::hex_serde::deserialize_option"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     proof: Option<Vec<u8>>,
     /// An Orchard or Ironwood binding signature on the SIGHASH transaction hash.
     #[serde(rename = "bindingSig")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
-    #[getter(copy)]
+    #[serde(
+        default,
+        serialize_with = "crate::methods::hex_serde::serialize_option",
+        deserialize_with = "crate::methods::hex_serde::deserialize_option"
+    )]
+    #[getset(get_copy = "pub")]
     binding_sig: Option<[u8; 64]>,
 }
 
 /// Object with Orchard or Ironwood flag information.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 pub struct OrchardFlags {
     /// Whether Orchard or Ironwood outputs are enabled.
     #[serde(rename = "enableOutputs")]
+    #[getset(get_copy = "pub")]
     enable_outputs: bool,
     /// Whether Orchard or Ironwood spends are enabled.
     #[serde(rename = "enableSpends")]
+    #[getset(get_copy = "pub")]
     enable_spends: bool,
     /// Whether Ironwood cross-address transfers are enabled.
     ///
@@ -1013,7 +1070,7 @@ pub struct OrchardFlags {
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     #[new(default)]
     enable_cross_address: Option<bool>,
 }
@@ -1028,31 +1085,39 @@ impl OrchardFlags {
 
 /// The Orchard or Ironwood action of a transaction.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 pub struct OrchardAction {
     /// A value commitment to the net value of the input note minus the output note.
     #[serde(with = "hex")]
+    #[getset(get_copy = "pub")]
     cv: [u8; 32],
     /// The nullifier of the input note.
     #[serde(with = "hex")]
+    #[getset(get_copy = "pub")]
     nullifier: [u8; 32],
     /// The randomized validating key for spendAuthSig.
     #[serde(with = "hex")]
+    #[getset(get_copy = "pub")]
     rk: [u8; 32],
     /// The x-coordinate of the note commitment for the output note.
     #[serde(rename = "cmx", with = "hex")]
+    #[getset(get_copy = "pub")]
     cm_x: [u8; 32],
     /// An encoding of an ephemeral Pallas public key.
     #[serde(rename = "ephemeralKey", with = "hex")]
+    #[getset(get_copy = "pub")]
     ephemeral_key: [u8; 32],
     /// The output note encrypted to the recipient.
     #[serde(rename = "encCiphertext", with = "arrayhex")]
+    #[getset(get_copy = "pub")]
     enc_ciphertext: [u8; 580],
     /// A ciphertext enabling the sender to recover the output note.
     #[serde(rename = "spendAuthSig", with = "hex")]
+    #[getset(get_copy = "pub")]
     spend_auth_sig: [u8; 64],
     /// A signature authorizing the spend in this Action.
     #[serde(rename = "outCiphertext", with = "hex")]
+    #[getset(get_copy = "pub")]
     out_ciphertext: [u8; 80],
 }
 
@@ -1095,7 +1160,6 @@ pub struct TachyonAction {
 
 /// The state-specific data in a Tachyon bundle stamp.
 #[cfg(zcash_unstable = "nutachyon")]
-#[serde_with::serde_as]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TachyonStamp {
@@ -1111,7 +1175,10 @@ pub enum TachyonStamp {
         #[serde(rename = "tachygramSet", with = "hex")]
         tachygram_set: [u8; 32],
         /// The stamp's canonically ordered tachygrams.
-        #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+        #[serde(
+            serialize_with = "crate::methods::hex_serde::serialize_vec",
+            deserialize_with = "crate::methods::hex_serde::deserialize_vec"
+        )]
         tachygrams: Vec<[u8; 32]>,
         /// The Ragu proof encoding.
         #[serde(with = "hex")]
@@ -1637,8 +1704,8 @@ mod tests {
     #[cfg(zcash_unstable = "nutachyon")]
     use zcash_tachyon::{
         bundle::Plan as BundlePlan, entropy::ActionEntropy, keys::private,
-        note::CommitmentTrapdoor, nullifier, value, Note, PointerStamp, ProofStamp, TachyonBundle,
-        Unproven,
+        note::CommitmentTrapdoor, nullifier, value, Note, PointerStamp, ProofStamp, Tachygram,
+        TachygramSetPoly, TachyonBundle, Unproven,
     };
 
     use super::*;
@@ -1833,11 +1900,17 @@ mod tests {
         let _init_guard = zakura_test::init();
 
         let coverage = [0x42; 32];
+        let tachygrams = [1u64, 2].map(|value| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&value.to_le_bytes());
+            Tachygram::read(&bytes[..]).expect("a small integer is a canonical field element")
+        });
+        let tachygram_set = tachygrams.iter().copied().collect::<TachygramSetPoly>();
         let bundle = signed_tachyon_bundle().stamp(ProofStamp {
             coverage,
             anchor: zcash_tachyon::Anchor::default(),
-            tachygram_set: zcash_tachyon::TachygramSetCommit::default(),
-            tachygrams: Default::default(),
+            tachygram_set: tachygram_set.commit(),
+            tachygrams: tachygrams.into_iter().collect(),
             proof: Box::new(ragu::Proof::trivial()),
         });
         let transaction_object = transaction_object_with_tachyon(TachyonBundle::Proven(bundle));
@@ -1850,8 +1923,11 @@ mod tests {
             hex::encode(coverage)
         );
         assert_eq!(
-            transaction_json["tachyon"]["stamp"]["tachygrams"],
-            serde_json::json!([])
+            transaction_json["tachyon"]["stamp"]["tachygrams"]
+                .as_array()
+                .expect("the Tachygrams are a JSON array")
+                .len(),
+            2
         );
         assert!(
             !transaction_json["tachyon"]["stamp"]["proof"]

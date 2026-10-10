@@ -121,13 +121,6 @@ impl ZakuraDb {
         self.db.zs_get(&ironwood_nullifiers, &ironwood_nullifier)?
     }
 
-    /// Returns `true` if the finalized state contains `sprout_anchor`.
-    #[allow(dead_code)]
-    pub fn contains_sprout_anchor(&self, sprout_anchor: &sprout::tree::Root) -> bool {
-        let sprout_anchors = self.db.cf_handle("sprout_anchors").unwrap();
-        self.db.zs_contains(&sprout_anchors, &sprout_anchor)
-    }
-
     /// Returns `true` if the finalized state contains `sapling_anchor`.
     pub fn contains_sapling_anchor(&self, sapling_anchor: &sapling::tree::Root) -> bool {
         let sapling_anchors = self.db.cf_handle("sapling_anchors").unwrap();
@@ -202,6 +195,20 @@ impl ZakuraDb {
             .zs_last_key_value(&anchors_by_height)
             .map(|(_height, anchor): (Height, tachyon::Anchor)| anchor)
             .unwrap_or_default()
+    }
+
+    /// Returns the end-of-block anchor at `height` from the retained, sparse height index.
+    /// Unlike the anchor validity index, this history survives epoch pruning.
+    #[allow(clippy::unwrap_in_result)] // A missing column family is a schema invariant violation.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon_anchor_by_height(&self, height: Height) -> Option<tachyon::Anchor> {
+        let anchors = self
+            .db
+            .cf_handle("tachyon_anchor_by_height")
+            .expect("NuTachyon databases have the historical anchor column family");
+        self.db
+            .zs_prev_key_value_back_from(&anchors, &height)
+            .map(|(_, anchor): (Height, tachyon::Anchor)| anchor)
     }
 
     /// Returns the finalized height that revealed `tachygram` while it remains retained.
@@ -412,18 +419,6 @@ impl ZakuraDb {
         self.db.zs_forward_range_iter(&sapling_trees, range)
     }
 
-    /// Returns the Sapling note commitment trees in the reversed range, in decreasing height order.
-    pub fn sapling_tree_by_reversed_height_range<R>(
-        &self,
-        range: R,
-    ) -> impl Iterator<Item = (Height, Arc<sapling::tree::NoteCommitmentTree>)> + '_
-    where
-        R: std::ops::RangeBounds<Height>,
-    {
-        let sapling_trees = self.db.cf_handle("sapling_note_commitment_tree").unwrap();
-        self.db.zs_reverse_range_iter(&sapling_trees, range)
-    }
-
     /// Returns the Sapling note commitment subtree at this `index`.
     ///
     /// # Correctness
@@ -565,18 +560,6 @@ impl ZakuraDb {
     {
         let orchard_trees = self.db.cf_handle("orchard_note_commitment_tree").unwrap();
         self.db.zs_forward_range_iter(&orchard_trees, range)
-    }
-
-    /// Returns the Orchard note commitment trees in the reversed range, in decreasing height order.
-    pub fn orchard_tree_by_reversed_height_range<R>(
-        &self,
-        range: R,
-    ) -> impl Iterator<Item = (Height, Arc<orchard::tree::NoteCommitmentTree>)> + '_
-    where
-        R: std::ops::RangeBounds<Height>,
-    {
-        let orchard_trees = self.db.cf_handle("orchard_note_commitment_tree").unwrap();
-        self.db.zs_reverse_range_iter(&orchard_trees, range)
     }
 
     /// Returns the Orchard note commitment subtree at this `index`.
@@ -1378,19 +1361,6 @@ impl DiskWriteBatch {
             .cf_handle("orchard_note_commitment_tree")
             .unwrap();
         self.zs_delete(&orchard_tree_cf, height);
-    }
-
-    /// Deletes the range of Orchard note commitment trees at the given [`Height`]s.
-    /// Doesn't delete anchors from the anchor index. Doesn't delete the upper bound.
-    #[allow(dead_code)]
-    pub fn delete_range_orchard_tree(&mut self, zakura_db: &ZakuraDb, from: &Height, to: &Height) {
-        let orchard_tree_cf = zakura_db
-            .db
-            .cf_handle("orchard_note_commitment_tree")
-            .unwrap();
-
-        // TODO: convert zs_delete_range() to take std::ops::RangeBounds
-        self.zs_delete_range(&orchard_tree_cf, from, to);
     }
 
     /// Deletes the given Orchard note commitment tree `anchor`.

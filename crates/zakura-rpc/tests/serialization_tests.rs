@@ -8,6 +8,40 @@
 
 mod vectors;
 
+#[cfg(zcash_unstable = "nutachyon")]
+#[test]
+fn tachyon_sync_response_is_public_and_uses_canonical_hex() {
+    use zakura_rpc::client::{GetTachyonBlockResponse, TachyonStampData};
+    let reply = GetTachyonBlockResponse {
+        hash: zakura_chain::block::Hash([1; 32]),
+        previous_block_hash: zakura_chain::block::Hash([2; 32]),
+        height: zakura_chain::block::Height(12),
+        activation_height: zakura_chain::block::Height(10),
+        pool_height: 2,
+        epoch: 0,
+        epoch_length: 4096,
+        finalized: false,
+        anchor_before: [3; 32],
+        epoch_start_anchor: None,
+        anchor_after: [4; 32],
+        stamps: vec![TachyonStampData {
+            transaction_index: 1,
+            txid: zakura_chain::transaction::Hash([5; 32]),
+            tachygram_set: [6; 32],
+            tachygrams: vec![hex::encode([7; 32])],
+        }],
+    };
+    let json = serde_json::to_value(&reply).unwrap();
+    assert_eq!(json["anchorBefore"], hex::encode([3; 32]));
+    assert_eq!(json["epochStartAnchor"], serde_json::Value::Null);
+    assert_eq!(json["stamps"][0]["tachygramSet"], hex::encode([6; 32]));
+    assert_eq!(json["stamps"][0]["tachygrams"][0], hex::encode([7; 32]));
+    assert_eq!(
+        serde_json::from_value::<GetTachyonBlockResponse>(json).unwrap(),
+        reply
+    );
+}
+
 use std::{io::Cursor, ops::Deref};
 
 use vectors::{

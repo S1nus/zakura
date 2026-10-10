@@ -1,60 +1,63 @@
 //! Response types for the `gettachyoninfo` RPC.
 
-use derive_getters::Getters;
+use getset::{CopyGetters, Getters};
 use zakura_chain::block::Height;
 
 /// The current selected chain's Tachyon accumulator and retention state.
-#[derive(Clone, Debug, Eq, Getters, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, CopyGetters, Debug, Eq, Getters, PartialEq, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTachyonInfoResponse {
     /// The current best-chain tip height.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
 
     /// The NuTachyon activation height.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     activation_height: Height,
 
     /// The current Tachyon epoch, or `None` before NuTachyon activation.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     epoch: Option<u32>,
 
     /// The number of blocks in a Tachyon epoch.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     epoch_length: u32,
 
     /// The first block height of the next Tachyon epoch.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     next_epoch_height: Height,
 
     /// The Tachyon accumulator after the current best-chain tip.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     tip_anchor: [u8; 32],
 
     /// The number of Tachygrams retained in the current two-epoch scan window.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     retained_tachygram_count: usize,
 
     /// The logical payload size of the retained Tachygrams.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     tachygram_payload_bytes: u64,
 
     /// A bounded sample of the most recently revealed retained Tachygrams.
+    #[getset(get = "pub")]
     recent_tachygrams: Vec<RetainedTachygram>,
 }
 
 /// A Tachygram retained in the selected chain's current scan window.
-#[derive(Clone, Debug, Eq, Getters, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, CopyGetters, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetainedTachygram {
     /// The Tachygram in display byte order.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     tachygram: [u8; 32],
 
     /// The best-chain height that revealed the Tachygram.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     revealed_height: Height,
 }
 

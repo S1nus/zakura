@@ -1,11 +1,11 @@
 ---
-source: zebra-rpc/src/methods/tests/snapshot.rs
+source: crates/zakura-rpc/src/methods/tests/snapshot.rs
 expression: get_network_info
 ---
 {
   "version": 100,
   "subversion": "RPC test",
-  "protocolversion": 170190,
+  "protocolversion": 170210,
   "localservices": "0000000000000001",
   "timeoffset": 0,
   "connections": 1,

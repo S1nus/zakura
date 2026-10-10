@@ -71,7 +71,7 @@ pub use response::{
     ReadResponse, Response,
 };
 #[cfg(zcash_unstable = "nutachyon")]
-pub use response::{TachyonMiningData, TachyonPoolState};
+pub use response::{TachyonBlock, TachyonMiningData, TachyonPoolState};
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub use service::{

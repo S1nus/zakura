@@ -440,7 +440,7 @@ fn aggregate_with_data(
             &mut rng,
             &mut transactions,
             &mining_data.blocks,
-            EpochIndex(epoch),
+            EpochIndex::new(epoch),
             &group,
         )?;
     }
@@ -703,7 +703,7 @@ mod tests {
             &mut rand_10::rng(),
             &mut merged,
             &BTreeMap::new(),
-            EpochIndex(0),
+            EpochIndex::new(0),
             &[(0, Height(10)), (1, Height(10))],
         )
         .unwrap();
@@ -850,7 +850,7 @@ mod tests {
         let intervening_bundle = proof_bundle(&intervening_transaction)
             .expect("intervening transaction has a proof-stamped bundle");
         let target_anchor = start_anchor
-            .next_stamp(EpochIndex(0), &intervening_bundle.stamp.tachygram_set)
+            .next_stamp(EpochIndex::new(0), &intervening_bundle.stamp.tachygram_set)
             .expect("intervening stamp advances the anchor");
         let original = vec![
             verified_transaction(start_anchor),
@@ -981,7 +981,7 @@ mod tests {
         assert!(aggregate.is_aggregate());
         let adjuncts: Vec<_> = aggregated[1..]
             .iter()
-            .map(|tx| {
+            .flat_map(|tx| {
                 let TachyonBundle::Adjunct(adjunct) = &tx
                     .transaction
                     .transaction()
@@ -995,10 +995,10 @@ mod tests {
                     adjunct.stamp.stamp_digest(),
                     WtxId::from(aggregated[0].transaction.transaction().as_ref()).as_bytes()
                 );
-                adjunct.as_dyn()
+                adjunct.descriptors()
             })
             .collect();
-        assert!(aggregate.is_covering(&adjuncts));
+        assert!(aggregate.verify_coverage(&adjuncts).is_ok());
     }
 
     fn verified_transaction(anchor: Anchor) -> VerifiedUnminedTx {
