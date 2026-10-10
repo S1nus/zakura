@@ -306,29 +306,31 @@ impl CoinbasePlan {
             + GROTH_PROOF_SIZE
             + SIGNATURE_BYTES;
 
+        let sapling = match self.miner_reward_address {
+            MinerRewardAddress::Sapling(_) => sapling_bundle_bytes,
+            _ => compact_size_bytes(0) + compact_size_bytes(0),
+        };
+        let orchard = compact_size_bytes(0);
+        let ironwood = match self.miner_reward_address {
+            MinerRewardAddress::Ironwood(_) => orchard_bundle_bytes,
+            _ => compact_size_bytes(0),
+        };
+
         let (fixed_fields_bytes, shielded_bytes) = match version {
-            TxVersion::V6 => {
-                let sapling = match self.miner_reward_address {
-                    MinerRewardAddress::Sapling(_) => sapling_bundle_bytes,
-                    _ => compact_size_bytes(0) + compact_size_bytes(0),
-                };
-                let orchard = compact_size_bytes(0);
-                let ironwood = match self.miner_reward_address {
-                    MinerRewardAddress::Ironwood(_) => orchard_bundle_bytes,
-                    _ => compact_size_bytes(0),
-                };
+            #[cfg(zcash_unstable = "nutachyon")]
+            TxVersion::V7 => {
+                // V7 adds ZIP-233's u64 amount. Generated coinbases have no
+                // Tachyon bundle, encoded with a one-byte NoBundle marker.
+                const ZIP233_AMOUNT_BYTES: usize = 8;
+                const EMPTY_TACHYON_BUNDLE_BYTES: usize = 1;
 
-                (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard + ironwood)
+                (
+                    V5_AND_V6_FIXED_FIELDS_BYTES + ZIP233_AMOUNT_BYTES,
+                    sapling + orchard + ironwood + EMPTY_TACHYON_BUNDLE_BYTES,
+                )
             }
-            TxVersion::V5 => {
-                let sapling = match self.miner_reward_address {
-                    MinerRewardAddress::Sapling(_) => sapling_bundle_bytes,
-                    _ => compact_size_bytes(0) + compact_size_bytes(0),
-                };
-                let orchard = compact_size_bytes(0);
-
-                (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard)
-            }
+            TxVersion::V6 => (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard + ironwood),
+            TxVersion::V5 => (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard),
             TxVersion::V4 => {
                 let sapling = VALUE_BALANCE_BYTES
                     + compact_size_bytes(0)
