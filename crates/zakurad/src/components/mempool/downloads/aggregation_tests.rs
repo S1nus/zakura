@@ -1,4 +1,4 @@
-//! Dependency exchange tests. Deliberately invalid empty bundles exercise the
+//! Dependency exchange tests. Deliberately invalid zero-action bundles exercise the
 //! downloader boundary; the verifier must reject them, never bypass validation.
 
 use super::*;
@@ -16,7 +16,7 @@ use zakura_chain::{
 
 fn fixture(height: u32, aggregate: bool) -> UnminedTx {
     use zcash_tachyon::{
-        bundle::Signature, Anchor, Bundle, ProofStamp, TachygramSetPoly, TachyonBundle,
+        bundle::Signature, Anchor, Bundle, ProofStamp, Tachygram, TachygramSetPoly, TachyonBundle,
     };
     let coverage = if aggregate {
         [1; 32]
@@ -29,6 +29,9 @@ fn fixture(height: u32, aggregate: bool) -> UnminedTx {
             .try_into()
             .unwrap()
     };
+    // The wire parser requires a nonempty set, but one tachygram for zero actions
+    // remains consensus-invalid. These fixtures only exercise dependency fetching.
+    let tachygrams = std::collections::BTreeSet::from([Tachygram::read(&[0; 32][..]).unwrap()]);
     let bundle = Bundle {
         value_balance: 0i64.try_into().unwrap(),
         actions: Vec::new(),
@@ -37,8 +40,12 @@ fn fixture(height: u32, aggregate: bool) -> UnminedTx {
         stamp: ProofStamp {
             coverage,
             anchor: Anchor::read(&[0; 32][..]).unwrap(),
-            tachygram_set: std::iter::empty().collect::<TachygramSetPoly>().commit(),
-            tachygrams: Default::default(),
+            tachygram_set: tachygrams
+                .iter()
+                .copied()
+                .collect::<TachygramSetPoly>()
+                .commit(),
+            tachygrams,
             proof: Box::new(ragu::Proof::trivial()),
         },
     };
