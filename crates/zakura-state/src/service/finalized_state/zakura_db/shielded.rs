@@ -197,6 +197,20 @@ impl ZakuraDb {
             .unwrap_or_default()
     }
 
+    /// Returns the end-of-block anchor at `height` from the retained, sparse height index.
+    /// Unlike the anchor validity index, this history survives epoch pruning.
+    #[allow(clippy::unwrap_in_result)] // A missing column family is a schema invariant violation.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon_anchor_by_height(&self, height: Height) -> Option<tachyon::Anchor> {
+        let anchors = self
+            .db
+            .cf_handle("tachyon_anchor_by_height")
+            .expect("NuTachyon databases have the historical anchor column family");
+        self.db
+            .zs_prev_key_value_back_from(&anchors, &height)
+            .map(|(_, anchor): (Height, tachyon::Anchor)| anchor)
+    }
+
     /// Returns the finalized height that revealed `tachygram` while it remains retained.
     #[allow(clippy::unwrap_in_result)]
     #[cfg(zcash_unstable = "nutachyon")]
