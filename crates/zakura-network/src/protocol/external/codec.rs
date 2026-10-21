@@ -188,6 +188,8 @@ impl Encoder<Message> for Codec {
             NotFound { .. } => b"notfound\0\0\0\0",
             Tx { .. } => b"tx\0\0\0\0\0\0\0\0\0\0",
             Mempool => b"mempool\0\0\0\0\0",
+            GetAggregateDependencies(_) => b"getaggdeps\0\0",
+            AggregateDependencies(_) => b"aggdeps\0\0\0\0\0",
         };
         trace!(?item, len = body_length);
 
@@ -341,6 +343,10 @@ impl Codec {
             Message::NotFound(hashes) => hashes.zcash_serialize(writer)?,
             Message::Tx(transaction) => transaction.transaction().zcash_serialize(writer)?,
             Message::Mempool => { /* Empty payload -- no-op */ }
+            Message::GetAggregateDependencies(id) => {
+                zakura_chain::transaction::aggregation::write_request(*id, writer)?;
+            }
+            Message::AggregateDependencies(manifest) => manifest.zcash_serialize(writer)?,
         }
         Ok(())
     }
@@ -416,6 +422,13 @@ impl Decoder for Codec {
                     }
                     if body_len > self.builder.max_len {
                         return Err(Parse("body length exceeded maximum size"));
+                    }
+                    if (command == *b"getaggdeps\0\0" && body_len != 65)
+                        || (command == *b"aggdeps\0\0\0\0\0"
+                            && !(67..=zakura_chain::transaction::aggregation::MAX_MANIFEST_BYTES)
+                                .contains(&body_len))
+                    {
+                        return Err(Parse("invalid aggregate dependency payload length"));
                     }
                     if command == *crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES
                         && body_len > crate::zakura::MAX_PRELUDE_PAYLOAD_BYTES
@@ -501,6 +514,18 @@ impl Decoder for Codec {
                             b"notfound\0\0\0\0" => self.read_notfound(&mut body_reader),
                             b"tx\0\0\0\0\0\0\0\0\0\0" => self.read_tx(&mut body_reader),
                             b"mempool\0\0\0\0\0" => self.read_mempool(&mut body_reader),
+                            b"getaggdeps\0\0" => {
+                                zakura_chain::transaction::aggregation::read_request(
+                                    &mut body_reader,
+                                )
+                                .map(Message::GetAggregateDependencies)
+                            }
+                            b"aggdeps\0\0\0\0\0" => {
+                                zakura_chain::transaction::aggregation::Manifest::zcash_deserialize(
+                                    &mut body_reader,
+                                )
+                                .map(Message::AggregateDependencies)
+                            }
                             _ => {
                                 // # Security
                                 //
@@ -526,6 +551,15 @@ impl Decoder for Codec {
                         // Bitcoin allows extra data at the end of most messages,
                         // so old nodes can read newer formats and ignore extra fields.
                         let extra_bytes = body_reader.len();
+                        if extra_bytes != 0
+                            && matches!(
+                                msg,
+                                Message::GetAggregateDependencies(_)
+                                    | Message::AggregateDependencies(_)
+                            )
+                        {
+                            return Err(Parse("trailing aggregate dependency payload"));
+                        }
                         if extra_bytes == 0 {
                             trace!(?extra_bytes, %msg, "finished message decoding");
                         } else {
