@@ -310,6 +310,18 @@ pub enum TransactionError {
     #[error("Ironwood proof has a non-canonical size")]
     IronwoodProofSize,
 
+    #[error("Tachyon action value commitment and verification key must not be identity: {0}")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonIdentityAction(String),
+
+    #[error("Tachyon action and binding signatures must verify: {0}")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonSignatureInvalid(String),
+
+    #[error("the mempool only accepts autonome Tachyon transactions")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    NonAutonomeTachyon,
+
     #[error("unexpected error")]
     Other(String),
 }
@@ -521,6 +533,14 @@ impl TransactionError {
             Self::Balance(_) => consensus("transaction.balance"),
             Self::OrchardProofSize => consensus("transaction.orchard_proof_size"),
             Self::IronwoodProofSize => consensus("transaction.ironwood_proof_size"),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::TachyonIdentityAction(_) => consensus("transaction.tachyon_identity_action"),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::TachyonSignatureInvalid(_) => consensus("transaction.tachyon_signature_invalid"),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::NonAutonomeTachyon => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
             Self::ImmatureTransparentCoinbaseSpend { .. } => {
                 consensus("transaction.immature_transparent_coinbase_spend")
             }
@@ -587,6 +607,9 @@ impl TransactionError {
             | ShieldedCostExceedsBlockBudget { .. }
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            TachyonIdentityAction(_) | TachyonSignatureInvalid(_) => 100,
 
             // NU6.2 mempool transactions are invalid under NU6.3 rules, but
             // honest peers can relay them briefly while their chain tips converge.
