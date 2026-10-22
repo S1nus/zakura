@@ -778,6 +778,34 @@ pub enum BlockError {
         source: amount::Error,
     },
 
+    #[error("all Tachygrams in a block must be distinct")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    DuplicateTachygram,
+
+    #[error("a Tachyon pointer stamp must refer to a proof-stamped transaction in the same block")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonAggregateNotFound,
+
+    #[error("a Tachyon proof stamp's covered-actions digest does not match its aggregate")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonCoverageMismatch,
+
+    #[error("action descriptors covered by a Tachyon proof stamp must be distinct")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonDuplicateAction,
+
+    #[error("a Tachyon proof stamp must publish exactly two Tachygrams per covered action")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonTachygramArityMismatch,
+
+    #[error("a Tachyon proof stamp's Tachygram commitment must match its published Tachygrams")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonTachygramSetMismatch,
+
+    #[error("a Tachyon proof stamp must verify: {0}")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonProofInvalid(String),
+
     #[error("unexpected error occurred: {0}")]
     Other(String),
 }
@@ -816,6 +844,14 @@ impl BlockError {
             | BadMerkleRoot { .. }
             | WrongTransactionConsensusBranchId
             | TooManyTransparentSignatureOperations { .. } => 100,
+            #[cfg(zcash_unstable = "nutachyon")]
+            DuplicateTachygram
+            | TachyonAggregateNotFound
+            | TachyonCoverageMismatch
+            | TachyonDuplicateAction
+            | TachyonTachygramArityMismatch
+            | TachyonTachygramSetMismatch
+            | TachyonProofInvalid(_) => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             _other => 0,
         }
