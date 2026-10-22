@@ -217,6 +217,11 @@ proptest-derive = { workspace = true, optional = true }
 derive-new.workspace = true
 hex.workspace = true
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dev-dependencies]
+blake2b_simd = { workspace = true }
+ragu = { workspace = true }
+zcash_tachyon = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 toml = { workspace = true, features = ["display"] }

@@ -34,6 +34,35 @@ use crate::{
     PeerError, PeerSource, Request, Response,
 };
 
+#[test]
+fn aggregate_response_is_bound_to_exact_wtxid_and_pending_request() {
+    use crate::peer::connection::Handler;
+    use zakura_chain::transaction::aggregation::Manifest;
+    let id = [1; 64].into();
+    let mut handler = Handler::AggregateDependencies(id);
+    let mut addrs = Vec::new();
+    handler.process_message(
+        Message::AggregateDependencies(Manifest {
+            aggregate: [2; 64].into(),
+            originals: vec![],
+        }),
+        &mut addrs,
+        None,
+    );
+    assert!(matches!(handler, Handler::AggregateDependencies(pending) if pending == id));
+    handler.process_message(
+        Message::AggregateDependencies(Manifest {
+            aggregate: id,
+            originals: vec![],
+        }),
+        &mut addrs,
+        None,
+    );
+    assert!(
+        matches!(handler, Handler::Finished(Ok(Response::AggregateDependencies(manifest))) if manifest.aggregate == id)
+    );
+}
+
 /// Test that the connection run loop works as a future
 #[tokio::test]
 async fn connection_run_loop_ok() {

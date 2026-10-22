@@ -89,6 +89,27 @@ fn verified_ironwood_v6_tx(
 }
 
 #[test]
+fn exact_transaction_lookup_does_not_substitute_authorization_forms() {
+    let mut storage = Storage::new(&config::Config::default());
+    let transaction = verified_ironwood_v6_tx(Height(100), ironwood_action());
+    let id = transaction.transaction.id();
+    storage
+        .insert(transaction, Vec::new(), None)
+        .expect("fixture fits mempool policy");
+    let mut different = id;
+    different.auth_digest_mut().expect("V6 is witnessed").0[0] ^= 1;
+    assert_eq!(different.mined_id(), id.mined_id());
+    assert_eq!(storage.transactions_exact(HashSet::from([id])).count(), 1);
+    assert_eq!(
+        storage
+            .transactions_exact(HashSet::from([different]))
+            .count(),
+        0
+    );
+    assert!(storage.should_download_or_verify(different).is_ok());
+}
+
+#[test]
 fn oversized_policy_rejection_is_cached_by_exact_id() {
     let mut storage = Storage::new(&config::Config::default());
     let transaction = Network::Mainnet

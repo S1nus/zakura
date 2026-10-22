@@ -97,6 +97,10 @@ pub const MSG_RESPONSE_TRANSACTION_IDS: u16 = 16;
 pub const MSG_RESPONSE_PONG: u16 = 17;
 /// Nil response for fire-and-forget legacy requests.
 pub const MSG_RESPONSE_NIL: u16 = 18;
+/// Experimental flat Tachyon dependency request.
+pub const MSG_REQUEST_AGGREGATE_DEPENDENCIES: u16 = 19;
+/// Experimental flat Tachyon dependency response.
+pub const MSG_RESPONSE_AGGREGATE_DEPENDENCIES: u16 = 20;
 
 const LEGACY_GOSSIP_INBOUND_QUEUE: usize = 256;
 const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
@@ -304,6 +308,8 @@ pub(super) enum RequestedInventory {
 /// A typed legacy inventory request carried by Zakura stream kind 3.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LegacyRequestFrame {
+    /// Request an aggregate's exact-ID dependency manifest.
+    AggregateDependencies(zakura_chain::transaction::WtxId),
     /// Request block contents by hash.
     BlocksByHash(Vec<block::Hash>),
     /// Request transaction contents by unmined transaction id.
@@ -334,6 +340,9 @@ impl LegacyRequestFrame {
     /// Convert a legacy network request into an inventory request frame.
     pub fn from_request(request: Request) -> Result<Self, LegacyGossipError> {
         match request {
+            Request::AggregateDependencies { aggregate, .. } => {
+                Ok(Self::AggregateDependencies(aggregate))
+            }
             Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                 let hashes = truncate_to_inventory_cap(hashes)?;
                 Ok(Self::BlocksByHash(hashes))
@@ -360,6 +369,15 @@ impl LegacyRequestFrame {
     /// Convert this typed request to a Zakura wire frame.
     pub fn encode_frame(&self) -> Result<Frame, LegacyGossipError> {
         match self {
+            Self::AggregateDependencies(id) => {
+                let mut payload = Vec::new();
+                zakura_chain::transaction::aggregation::write_request(*id, &mut payload)?;
+                Ok(Frame {
+                    message_type: MSG_REQUEST_AGGREGATE_DEPENDENCIES,
+                    flags: 0,
+                    payload,
+                })
+            }
             Self::BlocksByHash(hashes) => {
                 let mut payload = Vec::new();
                 write_hash_list(&mut payload, hashes)?;
@@ -421,6 +439,12 @@ impl LegacyRequestFrame {
         }
 
         match frame.message_type {
+            MSG_REQUEST_AGGREGATE_DEPENDENCIES => {
+                let mut reader = Cursor::new(frame.payload.as_slice());
+                let id = zakura_chain::transaction::aggregation::read_request(&mut reader)?;
+                reject_trailing(&reader)?;
+                Ok(Self::AggregateDependencies(id))
+            }
             MSG_REQUEST_BLOCKS_BY_HASH => {
                 let mut reader = Cursor::new(frame.payload.as_slice());
                 let hashes = read_hash_list(&mut reader)?;
@@ -471,6 +495,10 @@ impl LegacyRequestFrame {
 
     fn into_service_request(self, peer_id: ZakuraPeerId) -> Option<Request> {
         match self {
+            Self::AggregateDependencies(aggregate) => Some(Request::AggregateDependencies {
+                aggregate,
+                source: Some(PeerSource::Zakura(peer_id)),
+            }),
             Self::BlocksByHash(hashes) => Some(Request::BlocksByHash(hashes.into_iter().collect())),
             Self::TransactionsById(ids) => {
                 Some(Request::TransactionsById(ids.into_iter().collect()))
@@ -492,6 +520,7 @@ impl LegacyRequestFrame {
 
     fn kind(&self) -> LegacyRequestKind {
         match self {
+            Self::AggregateDependencies(_) => LegacyRequestKind::AggregateDependencies,
             Self::BlocksByHash(_) => LegacyRequestKind::Blocks,
             Self::TransactionsById(_) => LegacyRequestKind::Transactions,
             Self::FindBlocks { .. } => LegacyRequestKind::FindBlocks,
@@ -505,6 +534,7 @@ impl LegacyRequestFrame {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum LegacyRequestKind {
+    AggregateDependencies,
     Blocks,
     Transactions,
     FindBlocks,
@@ -519,7 +549,8 @@ impl LegacyRequestKind {
     fn max_attempts(self) -> usize {
         match self {
             Self::Blocks | Self::Transactions => LEGACY_INVENTORY_REQUEST_ATTEMPTS,
-            Self::FindBlocks
+            Self::AggregateDependencies
+            | Self::FindBlocks
             | Self::FindHeaders
             | Self::MempoolTransactionIds
             | Self::Ping
@@ -529,6 +560,7 @@ impl LegacyRequestKind {
 
     fn command(self) -> &'static str {
         match self {
+            LegacyRequestKind::AggregateDependencies => "AggregateDependencies",
             LegacyRequestKind::Blocks => "BlocksByHash",
             LegacyRequestKind::Transactions => "TransactionsById",
             LegacyRequestKind::FindBlocks => "FindBlocks",
@@ -541,6 +573,7 @@ impl LegacyRequestKind {
 
     fn message_type(self) -> u16 {
         match self {
+            LegacyRequestKind::AggregateDependencies => MSG_REQUEST_AGGREGATE_DEPENDENCIES,
             LegacyRequestKind::Blocks => MSG_REQUEST_BLOCKS_BY_HASH,
             LegacyRequestKind::Transactions => MSG_REQUEST_TRANSACTIONS_BY_ID,
             LegacyRequestKind::FindBlocks => MSG_REQUEST_FIND_BLOCKS,
@@ -568,6 +601,19 @@ impl LegacyResponseCodec {
         // shared across every frame of this response and aborts encoding early.
         let mut budget = ResponseEncodeBudget::default();
         match response {
+            Response::AggregateDependencies(manifest) => {
+                let mut payload = request_id.to_le_bytes().to_vec();
+                manifest.zcash_serialize(&mut payload)?;
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    Frame {
+                        message_type: MSG_RESPONSE_AGGREGATE_DEPENDENCIES,
+                        flags: 0,
+                        payload,
+                    },
+                )?;
+            }
             Response::Blocks(blocks) => {
                 let mut missing = Vec::new();
                 for block in blocks {
@@ -681,6 +727,7 @@ impl LegacyResponseCodec {
         let mut transaction_ids = Vec::new();
         let mut saw_pong = false;
         let mut saw_nil = false;
+        let mut manifest = None;
         let mut reassembler = ResponseReassembler::new(request_id);
 
         for frame in frames {
@@ -689,6 +736,23 @@ impl LegacyResponseCodec {
             }
 
             match frame.message_type {
+                MSG_RESPONSE_AGGREGATE_DEPENDENCIES => {
+                    if request_kind != LegacyRequestKind::AggregateDependencies
+                        || manifest.is_some()
+                    {
+                        return Err(LegacyGossipError::UnexpectedResponse(
+                            "AggregateDependencies",
+                        ));
+                    }
+                    let payload = verify_response_id(request_id, &frame.payload)?;
+                    let mut reader = Cursor::new(payload);
+                    manifest = Some(
+                        zakura_chain::transaction::aggregation::Manifest::zcash_deserialize(
+                            &mut reader,
+                        )?,
+                    );
+                    reject_trailing(&reader)?;
+                }
                 MSG_RESPONSE_BLOCK => {
                     if request_kind != LegacyRequestKind::Blocks {
                         return Err(LegacyGossipError::UnexpectedResponse("Blocks"));
@@ -812,6 +876,7 @@ impl LegacyResponseCodec {
                         | LegacyRequestKind::MempoolTransactionIds
                         | LegacyRequestKind::PushTransaction => {}
                         LegacyRequestKind::Blocks
+                        | LegacyRequestKind::AggregateDependencies
                         | LegacyRequestKind::Transactions
                         | LegacyRequestKind::Ping => {
                             return Err(LegacyGossipError::UnexpectedResponse("Nil"));
@@ -828,6 +893,9 @@ impl LegacyResponseCodec {
         reassembler.finish()?;
 
         match request_kind {
+            LegacyRequestKind::AggregateDependencies => manifest
+                .map(Response::AggregateDependencies)
+                .ok_or(LegacyGossipError::MissingResponse("AggregateDependencies")),
             LegacyRequestKind::Blocks if blocks.is_empty() => {
                 Err(LegacyGossipError::MissingResponse(request_kind.command()))
             }
@@ -2015,6 +2083,7 @@ where
             | Request::BlocksByHashFrom { .. }
             | Request::TransactionsById(..)
             | Request::TransactionsByIdFrom { .. }
+            | Request::AggregateDependencies { .. }
             | Request::FindBlocks { .. }
             | Request::FindHeaders { .. }
             | Request::MempoolTransactionIds
@@ -3339,6 +3408,7 @@ impl fmt::Display for LegacyRequestFrame {
             Self::MempoolTransactionIds => f.write_str("MempoolTransactionIds"),
             Self::Ping => f.write_str("Ping"),
             Self::PushTransaction(_) => f.write_str("PushTransaction"),
+            Self::AggregateDependencies(_) => f.write_str("AggregateDependencies"),
         }
     }
 }
@@ -6048,6 +6118,35 @@ mod tests {
             ),
             Err(LegacyGossipError::OversizedResponse(_))
         ));
+    }
+
+    #[test]
+    fn aggregate_manifest_compatibility_stream_roundtrip_and_correlation() {
+        use zakura_chain::transaction::aggregation::Manifest;
+        let manifest = Manifest {
+            aggregate: [3; 64].into(),
+            originals: vec![[1; 64].into(), [2; 64].into()],
+        };
+        let request = LegacyRequestFrame::AggregateDependencies(manifest.aggregate);
+        let decoded = LegacyRequestFrame::decode_frame(request.encode_frame().unwrap()).unwrap();
+        assert_eq!(decoded.kind(), LegacyRequestKind::AggregateDependencies);
+        let frames = LegacyResponseCodec::encode_response(
+            7,
+            Response::AggregateDependencies(manifest.clone()),
+            4096,
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            LegacyResponseCodec::decode_response(7, request.kind(), frames.clone(), None).unwrap(),
+            Response::AggregateDependencies(manifest)
+        );
+        assert!(
+            LegacyResponseCodec::decode_response(8, request.kind(), frames.clone(), None).is_err()
+        );
+        let mut duplicate = frames.clone();
+        duplicate.extend(frames);
+        assert!(LegacyResponseCodec::decode_response(7, request.kind(), duplicate, None).is_err());
     }
 
     #[test]

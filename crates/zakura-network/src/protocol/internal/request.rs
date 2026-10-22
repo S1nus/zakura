@@ -58,6 +58,13 @@ impl From<PeerSocketAddr> for PeerSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum Request {
+    /// Request a bounded flat manifest from an aggregate's supplier.
+    AggregateDependencies {
+        /// Exact authorization form being resolved.
+        aggregate: zakura_chain::transaction::WtxId,
+        /// Supplier, when known; inbound requests carry the requesting peer.
+        source: Option<PeerSource>,
+    },
     /// Disconnect a legacy peer without changing its misbehavior score or ban status.
     /// The peer set handles this request locally and returns [`super::Response::Nil`].
     DisconnectPeer(PeerSocketAddr),
@@ -290,6 +297,7 @@ impl fmt::Display for Request {
         f.write_str(&match self {
             Request::DisconnectPeer(_) => "DisconnectPeer".to_string(),
             Request::Peers => "Peers".to_string(),
+            Request::AggregateDependencies { .. } => "AggregateDependencies".to_string(),
             Request::Ping(_) => "Ping".to_string(),
 
             Request::BlocksByHash(hashes) => {
@@ -333,6 +341,7 @@ impl Request {
         match self {
             Request::DisconnectPeer(_) => "DisconnectPeer",
             Request::Peers => "Peers",
+            Request::AggregateDependencies { .. } => "AggregateDependencies",
             Request::Ping(_) => "Ping",
 
             Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. } => "BlocksByHash",
@@ -391,6 +400,7 @@ impl Request {
     /// Returns the source attached to a source-aware inventory request.
     pub fn inventory_source(&self) -> Option<PeerSource> {
         match self {
+            Request::AggregateDependencies { source, .. } => source.clone(),
             Request::BlocksByHashFrom { source, .. }
             | Request::TransactionsByIdFrom { source, .. } => Some(source.clone()),
             _ => None,

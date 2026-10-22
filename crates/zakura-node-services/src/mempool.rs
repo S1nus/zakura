@@ -79,6 +79,16 @@ impl From<SocketAddr> for QueueSource {
 /// because all mempool transactions must be verified.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Request {
+    /// Resolve an exact aggregate manifest, subject to serving limits.
+    AggregateDependencies {
+        /// Exact aggregate authorization form.
+        aggregate: transaction::WtxId,
+        /// Requesting peer for resource accounting.
+        source: Option<QueueSource>,
+    },
+    /// Verified aggregate alternatives for the requested mining tip.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonAggregates(block::Hash),
     /// Query all [`UnminedTxId`]s in the mempool.
     TransactionIds,
 
@@ -184,6 +194,11 @@ pub enum Request {
 /// confirm that the mempool has been checked for newly verified transactions.
 #[derive(Debug)]
 pub enum Response {
+    /// A flat exact-ID manifest, empty when unavailable or refused.
+    AggregateDependencies(transaction::aggregation::Manifest),
+    /// Tip-validated alternatives; ordinary mempool selection still chooses the originals.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonAggregates(Vec<UnminedTx>),
     /// Returns all [`UnminedTxId`]s from the mempool.
     TransactionIds(HashSet<UnminedTxId>),
 
