@@ -7,7 +7,9 @@ mod tests;
 
 use std::{collections::BTreeMap, io, sync::Arc};
 
-pub use zakura_mmr_tree::{V1, V2, V3};
+#[cfg(zcash_unstable = "nutachyon")]
+pub use zakura_mmr_tree::V4;
+pub use zakura_mmr_tree::{MAX_ENTRY_SIZE, V1, V2, V3};
 
 use crate::{
     block::{Block, ChainHistoryMmrRootHash, Header, Height},

@@ -274,6 +274,21 @@ pub enum StateInitError {
     )]
     VctSproutHistoryUnrepairable,
 
+    /// The selected database requires a newer major format than this build supports.
+    #[error(
+        "database at {path:?} uses format {disk_version}, but this build supports {running_version}. \
+         Use a build that supports this database format, or restore a compatible database. \
+         Do not rename database directories or edit the version file to bypass this check"
+    )]
+    UnsupportedDatabaseFormat {
+        /// Database directory whose format is incompatible.
+        path: PathBuf,
+        /// Format recorded by the database writer.
+        disk_version: semver::Version,
+        /// Format supported by this build.
+        running_version: semver::Version,
+    },
+
     /// A database that stopped building transparent address indexes was opened in archive storage mode.
     ///
     /// Archive nodes serve address balances, UTXOs, and histories, which this database cannot
