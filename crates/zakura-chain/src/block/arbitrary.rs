@@ -575,6 +575,11 @@ where
                 sapling_shielded_data,
                 ..
             } => *sapling_shielded_data = None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 {
+                sapling_shielded_data,
+                ..
+            } => *sapling_shielded_data = None,
             Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {}
         }
     }

@@ -113,6 +113,8 @@ fn parameters(checkpoint_blocks: Option<&[Arc<Block>]>) -> Network {
             nu6_2: Some(NU6_2),
             nu6_3: Some(NU6_3),
             nu7: Some(NU7),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("the compressed activation schedule is ordered")
         .with_disable_pow(true)
@@ -198,6 +200,16 @@ fn generate_chain(network: &Network) -> Vec<Arc<Block>> {
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
             | NetworkUpgrade::Nu7 => Transaction::V5 {
+                network_upgrade: upgrade,
+                lock_time: LockTime::unlocked(),
+                expiry_height: height,
+                inputs: vec![input],
+                outputs: Vec::new(),
+                sapling_shielded_data: None,
+                orchard_shielded_data: None,
+            },
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => Transaction::V5 {
                 network_upgrade: upgrade,
                 lock_time: LockTime::unlocked(),
                 expiry_height: height,

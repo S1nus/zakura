@@ -54,7 +54,10 @@ pub enum HistoryTreeDecodeError {
 }
 
 impl IntoDisk for ValueBalance<NonNegative> {
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     type Bytes = [u8; 56];
+    #[cfg(zcash_unstable = "nutachyon")]
+    type Bytes = [u8; 64];
 
     fn as_bytes(&self) -> Self::Bytes {
         self.to_bytes()

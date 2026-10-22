@@ -674,6 +674,9 @@ where
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
                 )?,
+                // V7 remains fail-closed until its complete validation path is present.
+                #[cfg(zcash_unstable = "nutachyon")]
+                Transaction::V7 { .. } => return Err(TransactionError::WrongVersion),
             };
 
             if let Some(unmined_tx) = mempool_transaction {
@@ -1112,6 +1115,12 @@ where
                 transaction.version(),
                 network_upgrade,
             )),
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            )),
         }
     }
 
@@ -1195,6 +1204,9 @@ where
             | NetworkUpgrade::Nu6_2
             | NetworkUpgrade::Nu6_3
             | NetworkUpgrade::Nu7 => Ok(()),
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),

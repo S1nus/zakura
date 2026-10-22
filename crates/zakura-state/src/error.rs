@@ -152,6 +152,10 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// This intermediate commit does not yet implement the Tachyon database layout.
+    #[error("Tachyon database support is incomplete at this intermediate commit")]
+    TachyonIntegrationIncomplete,
+
     /// The configured historical frontier artifact could not be read or decoded.
     ///
     /// Only nodes that derive historical trees reach this. A node that does not derive ignores an

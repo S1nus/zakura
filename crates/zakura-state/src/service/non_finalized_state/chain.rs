@@ -1811,6 +1811,23 @@ impl Chain {
                     orchard_shielded_data,
                     ironwood_shielded_data,
                 ),
+                #[cfg(zcash_unstable = "nutachyon")]
+                V7 {
+                    inputs,
+                    outputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                    ..
+                } => (
+                    inputs,
+                    outputs,
+                    &None,
+                    &None,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                ),
 
                 V1 { .. } | V2 { .. } | V3 { .. } => unreachable!(
                     "older transaction versions only exist in finalized blocks, because of the mandatory canopy checkpoint",
@@ -2005,6 +2022,23 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     &None::<ironwood::ShieldedData>,
                 ),
                 V6 {
+                    inputs,
+                    outputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                    ..
+                } => (
+                    inputs,
+                    outputs,
+                    &None,
+                    &None,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                ),
+                #[cfg(zcash_unstable = "nutachyon")]
+                V7 {
                     inputs,
                     outputs,
                     sapling_shielded_data,

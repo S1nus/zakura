@@ -125,6 +125,14 @@ impl NonEmptyHistoryTree {
 
         let network_upgrade = NetworkUpgrade::current(network, current_height);
         let inner = match network_upgrade {
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "NuTachyon history support is incomplete at this intermediate commit",
+                )
+                .into());
+            }
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
@@ -224,6 +232,14 @@ impl NonEmptyHistoryTree {
         let height = parts.height;
         let network_upgrade = NetworkUpgrade::current(network, height);
         let (tree, entry) = match network_upgrade {
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "NuTachyon history support is incomplete at this intermediate commit",
+                )
+                .into());
+            }
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
