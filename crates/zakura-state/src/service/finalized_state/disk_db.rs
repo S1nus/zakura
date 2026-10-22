@@ -1146,11 +1146,6 @@ impl DiskDb {
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
     ) -> Result<DiskDb, StateInitError> {
-        // Fail closed until the following execution and contextual checks are present.
-        if cfg!(zcash_unstable = "nutachyon") {
-            return Err(StateInitError::TachyonIntegrationIncomplete);
-        }
-
         // `ephemeral` and `read_only` describe mutually-exclusive modes: an ephemeral
         // database is a read-write primary this process owns and deletes on drop, while
         // a read-only secondary follows another process's primary and must never delete

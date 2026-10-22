@@ -1431,8 +1431,18 @@ impl Chain {
             return Ok(());
         }
 
+        let network = self.network.clone();
         for &tachygram in &tachygrams {
             let revealed_heights = self.tachyon_tachygrams.entry(tachygram).or_default();
+            if revealed_heights
+                .iter()
+                .any(|&revealed| tachyon::within_scan_window(&network, revealed, height))
+            {
+                return Err(ValidateContextError::DuplicateTachyonTachygram {
+                    tachygram,
+                    in_finalized_state: false,
+                });
+            }
             revealed_heights.push(height);
         }
         self.tachyon_tachygrams_by_height.insert(height, tachygrams);
@@ -1918,8 +1928,8 @@ impl Chain {
                     );
                 }
             }
-            // Add this block's tachygrams to the epoch working set. Contextual rejection
-            // is added by the next commit, before Tachyon database startup is enabled.
+            // Add this block's tachygrams to the epoch working set, rejecting same-epoch
+            // duplicates within this chain.
             let block_tachygrams: Vec<_> = contextually_valid
                 .block
                 .transactions
@@ -2993,6 +3003,58 @@ mod tachyon_tests {
     /// (NuTachyon activates at chain height 10).
     fn epoch_first_height(epoch: u32) -> Height {
         Height(10 + epoch * tachyon::EPOCH_LENGTH)
+    }
+
+    #[test]
+    fn same_epoch_duplicate_tachygram_is_rejected() {
+        let mut chain = nutachyon_chain();
+
+        chain
+            .add_tachyon_tachygrams(Height(20), vec![tachygram(1), tachygram(2)])
+            .expect("distinct tachygrams are accepted");
+
+        let result = chain.add_tachyon_tachygrams(Height(30), vec![tachygram(2)]);
+        assert!(
+            matches!(
+                result,
+                Err(ValidateContextError::DuplicateTachyonTachygram {
+                    in_finalized_state: false,
+                    ..
+                })
+            ),
+            "expected DuplicateTachyonTachygram, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn duplicate_tachygram_scan_window_spans_two_epochs() {
+        let mut chain = nutachyon_chain();
+
+        // Epoch 0 (chain heights 10..10+EPOCH_LENGTH).
+        chain
+            .add_tachyon_tachygrams(Height(20), vec![tachygram(1)])
+            .expect("first reveal is accepted");
+
+        // The same tachygram in the immediately following epoch is still within the
+        // two-epoch scan window: a repeat there is exactly what a double spend's
+        // next-epoch nullifier would look like.
+        let result = chain.add_tachyon_tachygrams(epoch_first_height(1), vec![tachygram(1)]);
+        assert!(
+            result.is_err(),
+            "adjacent-epoch duplicate must be rejected: {result:?}",
+        );
+
+        // Two epochs later the tachygram has left the scan window. (An honest repeat
+        // out here would imply a nullifier-derivation collision, but consensus no
+        // longer tracks it.)
+        chain
+            .add_tachyon_tachygrams(epoch_first_height(2), vec![tachygram(1)])
+            .expect("a tachygram outside the two-epoch window is accepted again");
+
+        // And the fresh reveal re-arms the window.
+        let result =
+            chain.add_tachyon_tachygrams(Height(epoch_first_height(2).0 + 1), vec![tachygram(1)]);
+        assert!(result.is_err(), "same-epoch duplicate must be rejected");
     }
 
     #[test]

@@ -160,11 +160,6 @@ impl ZakuraDb {
         read_only: bool,
         database_writer_metadata: Option<&DatabaseWriterMetadata>,
     ) -> Result<ZakuraDb, StateInitError> {
-        // Do not even migrate a database before execution and contextual checks are complete.
-        if cfg!(zcash_unstable = "nutachyon") {
-            return Err(StateInitError::TachyonIntegrationIncomplete);
-        }
-
         // A read-only secondary follows another process's primary database and must never delete
         // it, whereas an ephemeral database deletes its files on drop, so the two modes are
         // mutually exclusive. Reject the combination up front, before the read-only branch below
