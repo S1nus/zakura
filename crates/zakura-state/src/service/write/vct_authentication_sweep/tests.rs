@@ -268,6 +268,8 @@ fn generate_chain(network: &Network) -> Vec<Arc<Block>> {
                 &sapling_root,
                 &orchard_root,
                 &ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                &Default::default(),
             )
             .expect("the deterministic history tree advances");
         blocks.push(block);
@@ -690,6 +692,8 @@ impl Fixture {
                 &empty_sapling_root(),
                 &empty_orchard_root(),
                 &empty_ironwood_root(),
+                #[cfg(zcash_unstable = "nutachyon")]
+                &Default::default(),
             )
             .expect("the generated history tree advances");
         }
@@ -715,6 +719,8 @@ impl Fixture {
         verify_commitment_roots(
             &self.network,
             self.history_tree_through(parent),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Default::default(),
             vec![
                 CommitmentRootVerification::with_roots(
                     block.clone(),
@@ -1299,6 +1305,8 @@ fn fold_placement_is_checked_before_every_history_tree_push() {
         &empty_sapling_root(),
         &empty_orchard_root(),
         &empty_ironwood_root(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )
     .expect("the activation block creates the tree");
 

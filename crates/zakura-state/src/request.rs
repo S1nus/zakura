@@ -504,6 +504,10 @@ impl Treestate {
         sapling_subtree: Option<NoteCommitmentSubtree<sapling_crypto::Node>>,
         orchard_subtree: Option<NoteCommitmentSubtree<orchard::tree::Node>>,
         ironwood_subtree: Option<NoteCommitmentSubtree<ironwood::tree::Node>>,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: zakura_chain::tachyon::Anchor,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_epoch_anchor: Option<
+            zakura_chain::tachyon::Anchor,
+        >,
         history_tree: Arc<HistoryTree>,
     ) -> Self {
         Self {
@@ -515,6 +519,10 @@ impl Treestate {
                 orchard_subtree,
                 ironwood,
                 ironwood_subtree,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_anchor,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_epoch_anchor,
             },
             history_tree,
         }

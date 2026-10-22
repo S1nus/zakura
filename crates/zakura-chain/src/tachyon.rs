@@ -5,6 +5,7 @@ use std::{fmt, io};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    block::Block,
     parameters::{Network, NetworkUpgrade},
     serialization::{
         ReadZcashExt, SerializationError, ZcashDeserialize, ZcashReader, ZcashSerialize,
@@ -143,6 +144,60 @@ impl From<zcash_tachyon::Tachygram> for Tachygram {
             .expect("a 32-byte buffer always fits a serialized Tachygram");
         Self(bytes)
     }
+}
+
+impl Anchor {
+    fn to_tachyon(self) -> zcash_tachyon::Anchor {
+        zcash_tachyon::Anchor::read(&self.0[..])
+            .expect("stored Tachyon anchors are canonical field-element encodings")
+    }
+
+    /// Computes the Tachyon pool anchor after `block`.
+    pub fn advance_with_block(
+        &self,
+        pool_height: u32,
+        block: &Block,
+    ) -> Result<AnchorAdvance, zcash_tachyon::AnchorError> {
+        use zcash_tachyon::TachyonBundle;
+
+        let epoch = zcash_tachyon::EpochIndex::new(epoch_of_pool_height(pool_height));
+        let mut anchor = if pool_height == 0 {
+            zcash_tachyon::Anchor::default()
+        } else {
+            self.to_tachyon()
+        };
+        let epoch_boundary = if pool_height == 0 {
+            Some(Anchor::from(anchor))
+        } else if is_epoch_first(pool_height) {
+            anchor = anchor.next_epoch(epoch)?;
+            Some(Anchor::from(anchor))
+        } else {
+            None
+        };
+
+        for transaction in &block.transactions {
+            let Some(shielded_data) = transaction.tachyon_shielded_data() else {
+                continue;
+            };
+            if let TachyonBundle::Proven(bundle) = &shielded_data.0 {
+                anchor = anchor.next_stamp(epoch, &bundle.stamp.tachygram_set)?;
+            }
+        }
+
+        Ok(AnchorAdvance {
+            post_block: Anchor::from(anchor),
+            epoch_boundary,
+        })
+    }
+}
+
+/// The result of advancing the Tachyon anchor through a block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnchorAdvance {
+    /// The anchor after the block.
+    pub post_block: Anchor,
+    /// The anchor immediately after an epoch lift, if this block starts an epoch.
+    pub epoch_boundary: Option<Anchor>,
 }
 
 #[cfg(test)]

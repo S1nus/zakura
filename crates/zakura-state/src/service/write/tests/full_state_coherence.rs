@@ -464,6 +464,8 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
                     &sapling_root,
                     &orchard_root,
                     &ironwood_root,
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    &Default::default(),
                 )
                 .expect("the deterministic history tree advances");
             blocks.push(block);

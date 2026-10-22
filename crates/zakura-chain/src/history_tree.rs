@@ -24,6 +24,8 @@ use crate::{
     },
     sapling,
 };
+#[cfg(zcash_unstable = "nutachyon")]
+use crate::{primitives::zcash_history::V4 as TachyonOnward, tachyon};
 
 /// An error describing why a history tree operation failed.
 #[derive(Error)]
@@ -85,6 +87,9 @@ enum InnerHistoryTree {
     OrchardOnward(Tree<OrchardOnward>),
     /// An Ironwood-onward tree.
     IronwoodOnward(Tree<IronwoodOnward>),
+    /// A Tachyon-onward tree.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonOnward(Tree<TachyonOnward>),
 }
 
 /// History tree (Merkle mountain range) structure that contains information about
@@ -125,14 +130,6 @@ impl NonEmptyHistoryTree {
 
         let network_upgrade = NetworkUpgrade::current(network, current_height);
         let inner = match network_upgrade {
-            #[cfg(zcash_unstable = "nutachyon")]
-            NetworkUpgrade::NuTachyon => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "NuTachyon history support is incomplete at this intermediate commit",
-                )
-                .into());
-            }
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
@@ -179,6 +176,17 @@ impl NonEmptyHistoryTree {
                 )?;
                 InnerHistoryTree::IronwoodOnward(tree)
             }
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => {
+                let tree = Tree::<TachyonOnward>::new_from_cache(
+                    network,
+                    network_upgrade,
+                    size,
+                    &peaks,
+                    &Default::default(),
+                )?;
+                InnerHistoryTree::TachyonOnward(tree)
+            }
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => {
@@ -216,10 +224,18 @@ impl NonEmptyHistoryTree {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: &tachyon::Anchor,
     ) -> Result<Self, HistoryTreeError> {
         Self::from_parts(
             network,
-            HistoryTreeBlockParts::from_block(&block, sapling_root, orchard_root, ironwood_root),
+            HistoryTreeBlockParts::from_block(
+                &block,
+                sapling_root,
+                orchard_root,
+                ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_anchor,
+            ),
         )
     }
 
@@ -232,14 +248,6 @@ impl NonEmptyHistoryTree {
         let height = parts.height;
         let network_upgrade = NetworkUpgrade::current(network, height);
         let (tree, entry) = match network_upgrade {
-            #[cfg(zcash_unstable = "nutachyon")]
-            NetworkUpgrade::NuTachyon => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "NuTachyon history support is incomplete at this intermediate commit",
-                )
-                .into());
-            }
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
@@ -280,6 +288,11 @@ impl NonEmptyHistoryTree {
                 let (tree, entry) = Tree::<IronwoodOnward>::new_from_parts(network, parts)?;
                 (InnerHistoryTree::IronwoodOnward(tree), entry)
             }
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => {
+                let (tree, entry) = Tree::<TachyonOnward>::new_from_parts(network, parts)?;
+                (InnerHistoryTree::TachyonOnward(tree), entry)
+            }
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => {
@@ -317,12 +330,15 @@ impl NonEmptyHistoryTree {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: &tachyon::Anchor,
     ) -> Result<(), HistoryTreeError> {
         self.push_from_parts(HistoryTreeBlockParts::from_block(
             &block,
             sapling_root,
             orchard_root,
             ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_anchor,
         ))
     }
 
@@ -376,6 +392,10 @@ impl NonEmptyHistoryTree {
             InnerHistoryTree::IronwoodOnward(tree) => tree
                 .append_leaf_parts(parts)
                 .map_err(|e| HistoryTreeError::InnerError { inner: e })?,
+            #[cfg(zcash_unstable = "nutachyon")]
+            InnerHistoryTree::TachyonOnward(tree) => tree
+                .append_leaf_parts(parts)
+                .map_err(|e| HistoryTreeError::InnerError { inner: e })?,
         };
         for entry in new_entries {
             // Not every entry is a peak; those will be trimmed later
@@ -388,6 +408,36 @@ impl NonEmptyHistoryTree {
     }
 
     /// Extend the history tree with the given blocks.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn try_extend<
+        'a,
+        T: IntoIterator<
+            Item = (
+                Arc<Block>,
+                &'a sapling::tree::Root,
+                &'a orchard::tree::Root,
+                &'a ironwood::tree::Root,
+                &'a tachyon::Anchor,
+            ),
+        >,
+    >(
+        &mut self,
+        iter: T,
+    ) -> Result<(), HistoryTreeError> {
+        for (block, sapling_root, orchard_root, ironwood_root, tachyon_anchor) in iter {
+            self.push(
+                block,
+                sapling_root,
+                orchard_root,
+                ironwood_root,
+                tachyon_anchor,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Extend the history tree with the given blocks.
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     pub fn try_extend<
         'a,
         T: IntoIterator<
@@ -510,6 +560,16 @@ impl NonEmptyHistoryTree {
                     &Default::default(),
                 )?)
             }
+            #[cfg(zcash_unstable = "nutachyon")]
+            InnerHistoryTree::TachyonOnward(_) => {
+                InnerHistoryTree::TachyonOnward(Tree::<TachyonOnward>::new_from_cache(
+                    &self.network,
+                    self.network_upgrade,
+                    self.size,
+                    &self.peaks,
+                    &Default::default(),
+                )?)
+            }
         };
         Ok(())
     }
@@ -520,6 +580,8 @@ impl NonEmptyHistoryTree {
             InnerHistoryTree::PreOrchard(tree) => tree.hash(),
             InnerHistoryTree::OrchardOnward(tree) => tree.hash(),
             InnerHistoryTree::IronwoodOnward(tree) => tree.hash(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            InnerHistoryTree::TachyonOnward(tree) => tree.hash(),
         }
     }
 
@@ -577,6 +639,17 @@ impl Clone for NonEmptyHistoryTree {
                 )
                 .expect("rebuilding an existing tree should always work"),
             ),
+            #[cfg(zcash_unstable = "nutachyon")]
+            InnerHistoryTree::TachyonOnward(_) => InnerHistoryTree::TachyonOnward(
+                Tree::<TachyonOnward>::new_from_cache(
+                    &self.network,
+                    self.network_upgrade,
+                    self.size,
+                    &self.peaks,
+                    &Default::default(),
+                )
+                .expect("rebuilding an existing tree should always work"),
+            ),
         };
         NonEmptyHistoryTree {
             network: self.network.clone(),
@@ -605,10 +678,18 @@ impl HistoryTree {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: &tachyon::Anchor,
     ) -> Result<Self, HistoryTreeError> {
         Self::from_parts(
             network,
-            HistoryTreeBlockParts::from_block(&block, sapling_root, orchard_root, ironwood_root),
+            HistoryTreeBlockParts::from_block(
+                &block,
+                sapling_root,
+                orchard_root,
+                ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_anchor,
+            ),
         )
     }
 
@@ -643,10 +724,18 @@ impl HistoryTree {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
+        #[cfg(zcash_unstable = "nutachyon")] tachyon_anchor: &tachyon::Anchor,
     ) -> Result<(), HistoryTreeError> {
         self.push_from_parts(
             network,
-            HistoryTreeBlockParts::from_block(&block, sapling_root, orchard_root, ironwood_root),
+            HistoryTreeBlockParts::from_block(
+                &block,
+                sapling_root,
+                orchard_root,
+                ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_anchor,
+            ),
         )
     }
 
