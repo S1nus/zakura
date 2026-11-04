@@ -61,6 +61,11 @@ same epoch, lifting within that epoch as needed. All affected adjunct pointers
 are updated to the final carrier's `wtxid`. Non-cancellable local proving is
 limited to one worker, and failure or timeout preserves the safe candidate set.
 
+Coverage includes each original's action descriptors and fee descriptor. Merging or lifting
+keeps those fee descriptors, and repointing an adjunct changes only its aggregate ID, preserving
+its selected fee. Proof arity includes one fee-change tachygram per covered bundle in addition
+to the two tachygrams per action.
+
 New locally mined aggregates within the relay limits are queued for normal
 mempool verification and publication with their original dependency data.
 Publication does not delay the block template until peer relay completes. The
