@@ -507,6 +507,15 @@ where
             Request::Block { .. } | Request::Mempool { .. } => None,
         };
 
+        #[cfg(zcash_unstable = "nutachyon")]
+        let mut dependency_verifier = Self {
+            network: network.clone(),
+            state: state.clone(),
+            mempool: mempool.clone(),
+            script_verifier,
+            mempool_setup_rx: oneshot::channel().1,
+        };
+
         async move {
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
@@ -567,8 +576,25 @@ where
             #[cfg(zcash_unstable = "nutachyon")]
             check::tachyon_actions_have_valid_digests(&tx)?;
             #[cfg(zcash_unstable = "nutachyon")]
-            if req.is_mempool() {
-                check::tachyon_bundle_is_autonome(&tx)?;
+            let mut verified_originals = Vec::new();
+            #[cfg(zcash_unstable = "nutachyon")]
+            if let Some(unmined) = req.mempool_transaction() {
+                if unmined.tachyon_dependencies().is_empty() {
+                    check::tachyon_bundle_is_autonome(&tx)?;
+                } else {
+                    zakura_chain::tachyon::aggregation::check_package(&unmined)
+                        .map_err(|error| TransactionError::Other(error.into()))?;
+                    // Flatness was checked above, so these calls cannot recurse again.
+                    for original in unmined.tachyon_dependencies() {
+                        let response = dependency_verifier.ready().await?.call(Request::Mempool {
+                            transaction: original.clone(), height: req.height(),
+                        }).await?;
+                        let Response::Mempool { transaction, spent_mempool_outpoints } = response else {
+                            unreachable!("mempool verification returns a mempool response")
+                        };
+                        verified_originals.push((transaction, spent_mempool_outpoints));
+                    }
+                }
             }
 
             // Validate the coinbase input consensus rules
@@ -733,6 +759,15 @@ where
             }?;
             drop(queueing);
 
+            #[cfg(zcash_unstable = "nutachyon")]
+            let mut async_checks = async_checks;
+            #[cfg(zcash_unstable = "nutachyon")]
+            if let Some(unmined) = req.mempool_transaction() {
+                async_checks.push(async move {
+                    primitives::tachyon::verify_mempool_stamp(unmined).await.map_err(Into::into)
+                });
+            }
+
             tracing::trace!(?tx_id, "awaiting async checks...");
 
             async_checks.check().await?;
@@ -773,6 +808,12 @@ where
                         cached_ffi_transaction.p2sh_sigops(),
                         spent_outputs.into(),
                     )?;
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    let transaction = {
+                        let mut transaction = transaction;
+                        transaction.tachyon_originals = verified_originals;
+                        transaction
+                    };
 
                     Response::Mempool { transaction, spent_mempool_outpoints }
                 },

@@ -3077,6 +3077,7 @@ dependencies = [
 name = "zakura"
 version = "1.8.2"
 dependencies = [
+ "blake2b_simd",
  "bytes",
  "chrono",
  "clap",
@@ -3095,6 +3096,7 @@ dependencies = [
  "pin-project",
  "proptest",
  "proptest-derive",
+ "ragu",
  "rand 0.10.2",
  "rayon",
  "regex",
@@ -3127,6 +3129,7 @@ dependencies = [
  "zakura-test",
  "zakura-utils",
  "zakura-zcash-script",
+ "zcash_tachyon",
 ]
 
 [[package]]
