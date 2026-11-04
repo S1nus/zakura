@@ -24,30 +24,30 @@ fn fixture(height: u32, aggregate: bool) -> UnminedTx {
         Tachygram::read(&bytes[..]).expect("a small integer is a canonical field element")
     });
     let tachygram_set = tachygrams.iter().copied().collect::<TachygramSetPoly>();
-    let coverage = if aggregate {
-        [1; 32]
-    } else {
-        blake2b_simd::Params::new()
-            .hash_length(32)
-            .personal(b"Tachyon-Actions")
-            .hash(&[])
-            .as_bytes()
-            .try_into()
-            .unwrap()
-    };
-    let bundle = Bundle {
+    let coverage = [1; 32];
+    let mut bundle = Bundle {
+        fee_max_commitment: zcash_tachyon::value::Trapdoor::random(&mut rand_10::rng())
+            .commit(zcash_tachyon::value::Positive::ZERO),
         value_balance: 0i64.try_into().unwrap(),
         actions: Vec::new(),
         binding_sig: Signature::read(&[0; 64][..]).unwrap(),
         memo: Vec::new(),
         stamp: ProofStamp {
+            fee: zcash_tachyon::value::Positive::ZERO,
             coverage,
             anchor: Anchor::read(&[0; 32][..]).unwrap(),
             tachygram_set: tachygram_set.commit(),
             tachygrams: tachygrams.into_iter().collect(),
-            proof: Box::new(ragu::Proof::trivial()),
+            proof: Box::new(ragu::Proof::bootstrap()),
         },
     };
+    if !aggregate {
+        use zcash_tachyon::digest::blake2b;
+        bundle.stamp.coverage = blake2b::stamp_coverage_digest(
+            &blake2b::action_descriptor_digest(&[]),
+            &blake2b::stamp_fees_digest(&[bundle.fee_descriptor().into()]),
+        );
+    }
     Transaction::V7 {
         network_upgrade: NetworkUpgrade::NuTachyon,
         lock_time: LockTime::unlocked(),
@@ -58,7 +58,7 @@ fn fixture(height: u32, aggregate: bool) -> UnminedTx {
         sapling_shielded_data: None,
         orchard_shielded_data: None,
         ironwood_shielded_data: None,
-        tachyon_shielded_data: Some(TachyonBundle::Proven(bundle).into()),
+        tachyon_shielded_data: Some(Box::new(TachyonBundle::Proven(bundle).into())),
     }
     .into()
 }
@@ -189,6 +189,7 @@ async fn aggregate_downloads_bind_originals_and_do_not_poison_rejection_cache() 
             false,
             u64::MAX,
             peer_cooldowns.clone(),
+            Arc::new(tokio::sync::Notify::new()),
         )
         .with_aggregation(scenario != Scenario::Disabled, known_cache);
         downloads

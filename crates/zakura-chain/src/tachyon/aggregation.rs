@@ -41,6 +41,7 @@ pub fn check_package(transaction: &UnminedTx) -> Result<(), &'static str> {
     let mut ironwood = HashSet::new();
     let mut carrier = false;
     let mut covered = Vec::new();
+    let mut covered_fees = Vec::new();
     for original in originals {
         bytes = bytes
             .checked_add(original.size())
@@ -73,12 +74,16 @@ pub fn check_package(transaction: &UnminedTx) -> Result<(), &'static str> {
             else {
                 return Err("carrier is not V7");
             };
-            *tachyon_shielded_data = transaction.transaction().tachyon_shielded_data().cloned();
+            *tachyon_shielded_data = transaction
+                .transaction()
+                .tachyon_shielded_data()
+                .cloned()
+                .map(Box::new);
             if restamped != *transaction.transaction().as_ref() {
                 return Err("carrier differs outside its Tachyon bundle");
             }
             // Replacing the whole bundle above also requires equality of its non-stamp data.
-            let pointer = zcash_tachyon::PointerStamp::try_from(
+            let pointer = zcash_tachyon::AggregateId::try_from(
                 crate::transaction::WtxId::from(transaction.transaction().as_ref()).as_bytes(),
             )
             .map_err(|_| "invalid aggregate pointer")?;
@@ -88,16 +93,17 @@ pub fn check_package(transaction: &UnminedTx) -> Result<(), &'static str> {
             carrier = true;
         } else {
             covered.extend(bundle.descriptors());
+            covered_fees.push(bundle.fee_descriptor());
         }
     }
     if !carrier {
         return Err("manifest is missing the carrier original");
     }
-    let covered = aggregate
-        .verify_coverage(&covered)
+    let (covered, covered_fees) = aggregate
+        .verify_coverage(&covered, &covered_fees)
         .map_err(|_| "aggregate coverage mismatch")?;
     aggregate
-        .verify_tachygrams(covered.len())
+        .verify_tachygrams(covered.len(), covered_fees.len())
         .map_err(|_| "aggregate Tachygrams mismatch")?;
     check_tachygrams(aggregate)
 }

@@ -57,16 +57,19 @@ fn tachyon_mempool_context_enforces_epoch_boundary() {
     let gram = Tachygram::read(&[0; 32][..]).unwrap();
     let grams = BTreeSet::from([gram]);
     let bundle = Bundle {
+        fee_max_commitment: zcash_tachyon::value::Trapdoor::random(&mut rand_10::rng())
+            .commit(zcash_tachyon::value::Positive::ZERO),
         value_balance: 0i64.try_into().unwrap(),
         actions: Vec::new(),
         binding_sig: Signature::read(&[0; 64][..]).unwrap(),
         memo: Vec::new(),
         stamp: ProofStamp {
+            fee: zcash_tachyon::value::Positive::ZERO,
             coverage: [0; 32],
             anchor,
             tachygram_set: grams.iter().copied().collect::<TachygramSetPoly>().commit(),
             tachygrams: grams,
-            proof: Box::new(ragu::Proof::trivial()),
+            proof: Box::new(ragu::Proof::bootstrap()),
         },
     };
     let tx: UnminedTx = Transaction::V7 {
@@ -79,7 +82,7 @@ fn tachyon_mempool_context_enforces_epoch_boundary() {
         sapling_shielded_data: None,
         orchard_shielded_data: None,
         ironwood_shielded_data: None,
-        tachyon_shielded_data: Some(TachyonBundle::Proven(bundle).into()),
+        tachyon_shielded_data: Some(Box::new(TachyonBundle::Proven(bundle).into())),
     }
     .into();
     let mut chain = Chain::new(
